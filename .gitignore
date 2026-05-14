@@ -1,0 +1,24 @@
+# Supervisor / autonomous loop state
+.supervisor/
+
+# Swift / Xcode
+.build/
+.swiftpm/
+Packages/*/.build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+.DS_Store
+
+# macOS
+.AppleDouble
+.LSOverride
+Icon?
+
+# Build outputs
+build/
+*.app
+*.dSYM
+
+# Test fixtures larger than 1 MB should use Git LFS
+# Tests/NTFSCoreTests/Fixtures/*.img  (uncomment once LFS is configured)
