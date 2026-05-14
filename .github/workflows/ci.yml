@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ntfscore-test:
+    name: NTFSCore (swift test)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: Packages/NTFSCore
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.3+
+        run: sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer || sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        run: swift test
