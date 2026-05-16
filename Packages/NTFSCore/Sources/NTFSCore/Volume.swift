@@ -9,7 +9,7 @@ import Foundation
 //
 // Later phases extend Volume with: $Bitmap queries, (Phase 5) write.
 public actor Volume {
-    public nonisolated let device: BlockDevice
+    public nonisolated let device: any BlockDevice
     public nonisolated let boot: BootSector
     public nonisolated let bytesPerCluster: UInt32
     public nonisolated let mftRecordSizeBytes: UInt32
@@ -17,7 +17,7 @@ public actor Volume {
 
     private var _mft: MFT?
 
-    public init(device: BlockDevice) async throws {
+    public init(device: any BlockDevice) async throws {
         self.device = device
 
         let firstSector = try await device.read(offset: 0, length: BootSector.onDiskSize)

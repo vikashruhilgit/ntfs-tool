@@ -22,3 +22,8 @@ build/
 
 # Test fixtures larger than 1 MB should use Git LFS
 # Tests/NTFSCoreTests/Fixtures/*.img  (uncomment once LFS is configured)
+
+# Xcode build artifacts (the .xcodeproj is committed but its build outputs aren't)
+NTFSMountManager.xcodeproj/xcuserdata/
+NTFSMountManager.xcodeproj/project.xcworkspace/xcuserdata/
+NTFSMountManager.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/

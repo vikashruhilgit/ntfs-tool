@@ -1,0 +1,346 @@
+import FSKit
+import Foundation
+import NTFSCore
+import os.log
+
+// FSVolume adapter that bridges FSKit's read-side operations onto an
+// `NTFSCore.Volume`. Read-only (v1): every mutating operation returns
+// EROFS via the standard POSIX-error idiom FSKit recognizes. Write
+// support arrives in Phase 5 (Block G of the multi-iteration plan).
+@available(macOS 15.4, *)
+final class NTFSVolume: FSVolume,
+                       FSVolume.Operations,
+                       FSVolume.PathConfOperations,
+                       FSVolume.ReadWriteOperations,
+                       FSVolume.OpenCloseOperations {
+
+    private let log = Logger(subsystem: "com.ntfs-tool.fskit", category: "NTFSVolume")
+
+    private let coreVolume: NTFSCore.Volume
+    private let isReadOnly: Bool
+
+    /// Cache items by MFT record number so repeated lookups don't allocate.
+    /// FSKit hands the same FSItem back through callbacks, so we map by
+    /// recordNumber to keep memory bounded.
+    private var itemCache: [UInt64: NTFSItem] = [:]
+    private let cacheQueue = DispatchQueue(label: "com.ntfs-tool.fskit.NTFSVolume.cache")
+
+    init(coreVolume: NTFSCore.Volume, volumeName: FSFileName, isReadOnly: Bool) {
+        self.coreVolume = coreVolume
+        self.isReadOnly = isReadOnly
+        super.init(
+            volumeID: FSVolume.Identifier(uuid: UUID()),
+            volumeName: volumeName
+        )
+    }
+
+    // MARK: - FSVolume.PathConfOperations
+
+    var maximumLinkCount: Int { 1024 }
+    var maximumNameLength: Int { 255 }
+    var restrictsOwnershipChanges: Bool { true }
+    var truncatesLongNames: Bool { false }
+    var maximumXattrSize: Int { 65_536 }
+    var maximumXattrSizeInBits: Int { 16 }
+    var maximumFileSize: UInt64 { UInt64.max / 2 }
+    var maximumFileSizeInBits: Int { 63 }
+
+    // MARK: - FSVolume.Operations
+
+    var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
+        let caps = FSVolume.SupportedCapabilities()
+        caps.supportsHardLinks = false
+        caps.supportsSymbolicLinks = false
+        caps.supportsPersistentObjectIDs = true
+        caps.supportsHiddenFiles = true
+        caps.supportsSparseFiles = true
+        caps.supports64BitObjectIDs = true
+        caps.supports2TBFiles = true
+        return caps
+    }
+
+    var volumeStatistics: FSStatFSResult {
+        let stats = FSStatFSResult(fileSystemTypeName: "ntfs")
+        stats.blockSize = Int(coreVolume.bytesPerCluster)
+        stats.ioSize = Int(coreVolume.bytesPerCluster)
+        let totalSectors = coreVolume.boot.totalSectors
+        let bytesPerSector = UInt64(coreVolume.boot.bytesPerSector)
+        let totalBytes = totalSectors * bytesPerSector
+        stats.totalBytes = totalBytes
+        // Free / used numbers require $Bitmap parsing (Block G); for now
+        // report "unknown" via zeros — Finder displays the volume but
+        // accurate capacity awaits Phase 5.
+        stats.availableBytes = 0
+        stats.freeBytes = 0
+        stats.usedBytes = totalBytes
+        stats.totalFiles = 0
+        stats.freeFiles = 0
+        return stats
+    }
+
+    func mount(options: FSTaskOptions, replyHandler reply: @escaping @Sendable (Error?) -> Void) {
+        log.info("NTFSVolume.mount: read-only=\(self.isReadOnly, privacy: .public)")
+        reply(nil)
+    }
+
+    func unmount(replyHandler reply: @escaping @Sendable () -> Void) {
+        log.info("NTFSVolume.unmount")
+        reply()
+    }
+
+    func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping @Sendable (Error?) -> Void) {
+        reply(nil)   // read-only — nothing to flush
+    }
+
+    func activate(
+        options: FSTaskOptions,
+        replyHandler reply: @escaping @Sendable (FSItem?, Error?) -> Void
+    ) {
+        Task {
+            let root = NTFSItem.root()
+            self.cache(root)
+            log.info("NTFSVolume.activate: returning root item (MFT record 5)")
+            reply(root, nil)
+        }
+    }
+
+    func deactivate(options: FSDeactivateOptions, replyHandler reply: @escaping @Sendable (Error?) -> Void) {
+        log.info("NTFSVolume.deactivate")
+        cacheQueue.sync { itemCache.removeAll() }
+        reply(nil)
+    }
+
+    func getAttributes(
+        _ desiredAttributes: FSItem.GetAttributesRequest,
+        of item: FSItem,
+        replyHandler reply: @escaping @Sendable (FSItem.Attributes?, Error?) -> Void
+    ) {
+        guard let ntfsItem = item as? NTFSItem else {
+            reply(nil, posixError(EBADF))
+            return
+        }
+        reply(ntfsItem.makeAttributes(volume: self), nil)
+    }
+
+    func setAttributes(
+        _ newAttributes: FSItem.SetAttributesRequest,
+        on item: FSItem,
+        replyHandler reply: @escaping @Sendable (FSItem.Attributes?, Error?) -> Void
+    ) {
+        reply(nil, posixError(EROFS))
+    }
+
+    func lookupItem(
+        named name: FSFileName,
+        inDirectory directory: FSItem,
+        replyHandler reply: @escaping @Sendable (FSItem?, FSFileName?, Error?) -> Void
+    ) {
+        guard let parent = directory as? NTFSItem, parent.isDirectory else {
+            reply(nil, nil, posixError(ENOTDIR))
+            return
+        }
+        let needle = name.string ?? ""
+
+        Task {
+            do {
+                let entries = try await self.coreVolume.enumerate(directory: parent.recordNumber)
+                if let match = entries.first(where: { $0.name == needle && $0.fileName.namespace != .dos }) {
+                    let item = NTFSItem.from(match)
+                    self.cache(item)
+                    reply(item, FSFileName(string: match.name), nil)
+                } else {
+                    reply(nil, nil, self.posixError(ENOENT))
+                }
+            } catch {
+                reply(nil, nil, error)
+            }
+        }
+    }
+
+    func reclaimItem(_ item: FSItem, replyHandler reply: @escaping @Sendable (Error?) -> Void) {
+        if let ntfsItem = item as? NTFSItem {
+            cacheQueue.sync { _ = itemCache.removeValue(forKey: ntfsItem.recordNumber) }
+        }
+        reply(nil)
+    }
+
+    func readSymbolicLink(
+        _ item: FSItem,
+        replyHandler reply: @escaping @Sendable (FSFileName?, Error?) -> Void
+    ) {
+        reply(nil, posixError(EINVAL))   // v1 doesn't expose reparse points
+    }
+
+    func createItem(
+        named name: FSFileName,
+        type: FSItem.ItemType,
+        inDirectory directory: FSItem,
+        attributes newAttributes: FSItem.SetAttributesRequest,
+        replyHandler reply: @escaping @Sendable (FSItem?, FSFileName?, Error?) -> Void
+    ) {
+        reply(nil, nil, posixError(EROFS))
+    }
+
+    func createSymbolicLink(
+        named name: FSFileName,
+        inDirectory directory: FSItem,
+        attributes newAttributes: FSItem.SetAttributesRequest,
+        linkContents contents: FSFileName,
+        replyHandler reply: @escaping @Sendable (FSItem?, FSFileName?, Error?) -> Void
+    ) {
+        reply(nil, nil, posixError(EROFS))
+    }
+
+    func createLink(
+        to item: FSItem,
+        named name: FSFileName,
+        inDirectory directory: FSItem,
+        replyHandler reply: @escaping @Sendable (FSFileName?, Error?) -> Void
+    ) {
+        reply(nil, posixError(EROFS))
+    }
+
+    func removeItem(
+        _ item: FSItem,
+        named name: FSFileName,
+        fromDirectory directory: FSItem,
+        replyHandler reply: @escaping @Sendable (Error?) -> Void
+    ) {
+        reply(posixError(EROFS))
+    }
+
+    func renameItem(
+        _ item: FSItem,
+        inDirectory sourceDirectory: FSItem,
+        named sourceName: FSFileName,
+        to destinationName: FSFileName,
+        inDirectory destinationDirectory: FSItem,
+        overItem: FSItem?,
+        replyHandler reply: @escaping @Sendable (FSFileName?, Error?) -> Void
+    ) {
+        reply(nil, posixError(EROFS))
+    }
+
+    func enumerateDirectory(
+        _ directory: FSItem,
+        startingAt cookie: FSDirectoryCookie,
+        verifier: FSDirectoryVerifier,
+        attributes: FSItem.GetAttributesRequest?,
+        packer: FSDirectoryEntryPacker,
+        replyHandler reply: @escaping @Sendable (FSDirectoryVerifier, Error?) -> Void
+    ) {
+        guard let dir = directory as? NTFSItem, dir.isDirectory else {
+            reply(verifier, posixError(ENOTDIR))
+            return
+        }
+
+        Task {
+            do {
+                let entries = try await self.coreVolume.enumerate(directory: dir.recordNumber)
+                // FSKit asks us to skip already-yielded entries via `cookie`. Use
+                // the entry index as cookie (stable within one enumerate response;
+                // proper cookie-based pagination across calls is future work).
+                let startIdx = Int(cookie.rawValue)
+                for (i, entry) in entries.enumerated() where i >= startIdx {
+                    // Skip DOS-namespace aliases; we present only the Win32 / POSIX
+                    // canonical name so Finder doesn't see "HELLO~1.TXT" twice.
+                    guard entry.fileName.namespace != .dos else { continue }
+                    let item = NTFSItem.from(entry)
+                    self.cache(item)
+                    let cookieValue = FSDirectoryCookie(rawValue: UInt64(i + 1))
+                    let entryItemType: FSItem.ItemType = entry.isDirectory ? .directory : .file
+                    let itemID = FSItem.Identifier(rawValue: entry.recordNumber) ?? .invalid
+                    let kept = packer.packEntry(
+                        name: FSFileName(string: entry.name),
+                        itemType: entryItemType,
+                        itemID: itemID,
+                        nextCookie: cookieValue,
+                        attributes: item.makeAttributes(volume: self)
+                    )
+                    if !kept { break }
+                }
+                reply(verifier, nil)
+            } catch {
+                reply(verifier, error)
+            }
+        }
+    }
+
+    // MARK: - FSVolume.ReadWriteOperations
+
+    func read(
+        from item: FSItem,
+        at offset: off_t,
+        length: Int,
+        into buffer: FSMutableFileDataBuffer,
+        replyHandler reply: @escaping @Sendable (Int, Error?) -> Void
+    ) {
+        guard let ntfsItem = item as? NTFSItem, !ntfsItem.isDirectory else {
+            reply(0, posixError(EISDIR))
+            return
+        }
+        Task {
+            do {
+                let content = try await self.coreVolume.readFile(at: ntfsItem.recordNumber)
+                let fileSize = content.count
+                if offset >= fileSize {
+                    reply(0, nil)
+                    return
+                }
+                let startOffset = Int(offset)
+                let take = min(length, fileSize - startOffset)
+                buffer.withUnsafeMutableBytes { dest in
+                    content.copyBytes(
+                        to: dest.bindMemory(to: UInt8.self).baseAddress!,
+                        from: startOffset..<(startOffset + take)
+                    )
+                }
+                reply(take, nil)
+            } catch {
+                reply(0, error)
+            }
+        }
+    }
+
+    func write(
+        contents: Data,
+        to item: FSItem,
+        at offset: off_t,
+        replyHandler reply: @escaping @Sendable (Int, Error?) -> Void
+    ) {
+        reply(0, posixError(EROFS))
+    }
+
+    // MARK: - FSVolume.OpenCloseOperations
+
+    func openItem(
+        _ item: FSItem,
+        modes: FSVolume.OpenModes,
+        replyHandler reply: @escaping @Sendable (Error?) -> Void
+    ) {
+        // Read-only: reject any open with write intent.
+        if modes.contains(.write) {
+            reply(posixError(EROFS))
+        } else {
+            reply(nil)
+        }
+    }
+
+    func closeItem(
+        _ item: FSItem,
+        modes: FSVolume.OpenModes,
+        replyHandler reply: @escaping @Sendable (Error?) -> Void
+    ) {
+        reply(nil)
+    }
+
+    // MARK: - Helpers
+
+    private func cache(_ item: NTFSItem) {
+        cacheQueue.sync { itemCache[item.recordNumber] = item }
+    }
+
+    private func posixError(_ code: Int32) -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: nil)
+    }
+}

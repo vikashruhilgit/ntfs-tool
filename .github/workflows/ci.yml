@@ -28,3 +28,43 @@ jobs:
 
       - name: swift test
         run: swift test
+
+  fskit-extension-build:
+    name: FSKit extension + containing app (xcodebuild)
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.3+
+        run: sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer || sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Regenerate Xcode project from project.yml
+        run: xcodegen generate
+
+      - name: Build NTFSFileSystem (system extension)
+        run: |
+          xcodebuild -project NTFSMountManager.xcodeproj \
+            -scheme NTFSFileSystem \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath .build/Xcode \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build NTFSMountManager (containing app)
+        run: |
+          xcodebuild -project NTFSMountManager.xcodeproj \
+            -scheme NTFSMountManager \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath .build/Xcode \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build

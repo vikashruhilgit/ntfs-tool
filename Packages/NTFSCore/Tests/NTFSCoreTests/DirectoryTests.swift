@@ -20,7 +20,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
 
         let entries = try await volume.enumerate(directory: 5)
@@ -41,7 +41,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
 
         let entries = try await volume.enumerate(directory: 5)
@@ -84,7 +84,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let entries = try await volume.enumerate(directory: 5)
 
@@ -108,7 +108,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let rootEntries = try await volume.enumerate(directory: 5)
 
@@ -132,7 +132,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
 
         let rootEntries = try await volume.enumerate(directory: 5)

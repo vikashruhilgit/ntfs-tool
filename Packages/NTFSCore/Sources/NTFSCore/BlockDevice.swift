@@ -2,11 +2,22 @@ import Foundation
 
 // A minimal async byte-range reader for a block device or disk image.
 //
-// Phase 1.5: signature is `async throws -> Data` (per the brief). The actor
-// boundary serializes concurrent reads against a single FileHandle so callers
-// from any task can share one BlockDevice without manual locking. Phase 5
-// will extend this with write support.
-public actor BlockDevice {
+// NTFSCore consumes anything that can satisfy `read(offset:length:)` — the
+// real disk goes through `FileHandleBlockDevice`, the FSKit extension wraps
+// an `FSBlockDeviceResource` in its own adapter, and tests construct an
+// `InMemoryBlockDevice` over a `Data` buffer.
+
+public protocol BlockDevice: Sendable {
+    func read(offset: UInt64, length: Int) async throws -> Data
+}
+
+// A BlockDevice backed by a Foundation FileHandle. Used for the CLI and for
+// unit tests against committed `.img` fixtures.
+//
+// The actor boundary serializes concurrent reads against the underlying
+// FileHandle so callers from any task can share one device without manual
+// locking. Phase 5 will extend this with write support.
+public actor FileHandleBlockDevice: BlockDevice {
     public let path: String
     private let handle: FileHandle
 
@@ -49,5 +60,14 @@ public actor BlockDevice {
             throw NTFSError.shortRead(expected: length, got: data?.count ?? 0)
         }
         return data
+    }
+}
+
+// Convenience initializer keeping source compatibility with prior call-sites
+// that used `BlockDevice(openingFileAt:)` before the protocol-extraction
+// refactor. New code should prefer `FileHandleBlockDevice` directly.
+public extension BlockDevice where Self == FileHandleBlockDevice {
+    static func openingFile(at path: String) throws -> FileHandleBlockDevice {
+        try FileHandleBlockDevice(openingFileAt: path)
     }
 }

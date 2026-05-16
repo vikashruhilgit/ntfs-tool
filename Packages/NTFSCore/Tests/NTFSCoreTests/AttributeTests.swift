@@ -113,7 +113,7 @@ final class AttributeTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let mft = await volume.mft()
 
@@ -141,7 +141,7 @@ final class AttributeTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let mft = await volume.mft()
 
@@ -165,7 +165,7 @@ final class AttributeTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let mft = await volume.mft()
 
