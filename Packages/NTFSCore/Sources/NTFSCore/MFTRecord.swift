@@ -51,6 +51,17 @@ public struct MFTRecord: Equatable, Sendable {
     /// MFT-record size if the parse succeeded.
     public let bytes: Data
 
+    /// Iterate the attributes embedded in this record. The result is cached only
+    /// implicitly by the caller; call repeatedly only if cheap (parsing is O(N)
+    /// in the record size).
+    public func attributes() throws -> [Attribute] {
+        try Attribute.iterate(
+            recordBytes: bytes,
+            firstAttributeOffset: Int(firstAttributeOffset),
+            usedSize: Int(usedSize)
+        )
+    }
+
     // Magic constants read as little-endian u32 from the first 4 bytes on disk.
     // "FILE" on disk = bytes 0x46 0x49 0x4C 0x45 → LE u32 = 0x454C4946.
     // "BAAD" on disk = bytes 0x42 0x41 0x41 0x44 → LE u32 = 0x44414142.
@@ -64,7 +75,11 @@ public struct MFTRecord: Equatable, Sendable {
     /// Parse one MFT record. The input must be exactly the record's allocated size
     /// (typically 1024 bytes); USA fix-ups are applied in-place to the returned
     /// `bytes` so that the post-fix-up content is what attribute parsers will see.
-    public static func parse(_ raw: Data, expectedSize: Int) throws -> MFTRecord {
+    ///
+    /// `sectorSize` defaults to 512 — the NTFS standard logical sector size — but
+    /// must be passed as `Int(volume.boot.bytesPerSector)` for 4Kn drives or any
+    /// volume formatted with a non-default sector size.
+    public static func parse(_ raw: Data, expectedSize: Int, sectorSize: Int = 512) throws -> MFTRecord {
         guard raw.count == expectedSize else {
             throw NTFSError.corruptOnDisk(
                 description: "MFT record size mismatch: expected \(expectedSize), got \(raw.count)"
@@ -91,7 +106,7 @@ public struct MFTRecord: Equatable, Sendable {
             recordBytes: raw,
             usaOffset: Int(usaOffset),
             usaCount: Int(usaCount),
-            blockSize: 512
+            blockSize: sectorSize
         )
 
         return MFTRecord(

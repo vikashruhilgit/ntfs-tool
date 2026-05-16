@@ -1,13 +1,12 @@
 import Foundation
 
-// Reader for the Master File Table. Phase 1.6 surface: read one record at a
-// given record number, assuming the MFT is contiguous starting at the cluster
-// recorded in the boot sector. This holds for freshly-formatted volumes (our
-// test fixture) and small volumes where the MFT hasn't been fragmented yet.
+// Reader for the Master File Table.
 //
-// Phase 1.7 / Block C will lift the contiguous-MFT assumption by reading
-// $MFT's own $DATA attribute and decoding its runlist via DataRun, replacing
-// the linear `byteOffset` math below with a real virtual-to-physical mapping.
+// Phase 1.6: contiguous-MFT assumption starting at boot.mftCluster.
+// Phase 1.7 (this iteration): still contiguous for non-zero record numbers
+// (lifted properly in Block D once we can resolve the $MFT $DATA runlist
+// from a parsed attribute), but the USA fix-up now honors the volume's
+// `bytesPerSector` instead of a hardcoded 512.
 public final class MFT: Sendable {
     public let volume: Volume
 
@@ -18,8 +17,18 @@ public final class MFT: Sendable {
     /// Read and parse the MFT record at `recordNumber`.
     public func record(at recordNumber: UInt64) async throws -> MFTRecord {
         let recordSize = UInt64(volume.mftRecordSizeBytes)
-        let byteOffset = volume.mftByteOffset + recordNumber * recordSize
+        let sectorSize = Int(volume.boot.bytesPerSector)
+        guard recordSize > 0 else {
+            throw NTFSError.corruptOnDisk(description: "volume MFT record size is zero")
+        }
+        let (offsetProduct, overflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
+        guard !overflow else {
+            throw NTFSError.corruptOnDisk(
+                description: "MFT record number \(recordNumber) overflows when multiplied by record size \(recordSize)"
+            )
+        }
+        let byteOffset = volume.mftByteOffset + offsetProduct
         let raw = try await volume.device.read(offset: byteOffset, length: Int(recordSize))
-        return try MFTRecord.parse(raw, expectedSize: Int(recordSize))
+        return try MFTRecord.parse(raw, expectedSize: Int(recordSize), sectorSize: sectorSize)
     }
 }
