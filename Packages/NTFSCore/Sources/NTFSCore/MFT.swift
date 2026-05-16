@@ -21,13 +21,18 @@ public final class MFT: Sendable {
         guard recordSize > 0 else {
             throw NTFSError.corruptOnDisk(description: "volume MFT record size is zero")
         }
-        let (offsetProduct, overflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
-        guard !overflow else {
+        let (offsetProduct, mulOverflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
+        guard !mulOverflow else {
             throw NTFSError.corruptOnDisk(
                 description: "MFT record number \(recordNumber) overflows when multiplied by record size \(recordSize)"
             )
         }
-        let byteOffset = volume.mftByteOffset + offsetProduct
+        let (byteOffset, addOverflow) = volume.mftByteOffset.addingReportingOverflow(offsetProduct)
+        guard !addOverflow else {
+            throw NTFSError.corruptOnDisk(
+                description: "MFT byte offset overflows UInt64 at record \(recordNumber)"
+            )
+        }
         let raw = try await volume.device.read(offset: byteOffset, length: Int(recordSize))
         return try MFTRecord.parse(raw, expectedSize: Int(recordSize), sectorSize: sectorSize)
     }

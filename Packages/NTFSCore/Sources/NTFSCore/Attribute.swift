@@ -25,8 +25,8 @@ import Foundation
 //    16  u64 starting VCN
 //    24  u64 last VCN
 //    32  u16 data runs offset (relative to attribute start)
-//    34  u16 compression unit (0 for uncompressed)
-//    36  u32 padding
+//    34  u8  compression unit (0 for uncompressed; actual cluster count is 1 << value)
+//    35  u8  reserved[5] — 5 bytes of zero padding through offset 39
 //    40  u64 allocated size
 //    48  u64 real size
 //    56  u64 initialized size
@@ -67,7 +67,7 @@ public enum AttributeValue: Sendable, Equatable {
         startingVCN: UInt64,
         lastVCN: UInt64,
         dataRunsOffset: UInt16,
-        compressionUnit: UInt16,
+        compressionUnit: UInt8,
         allocatedSize: UInt64,
         realSize: UInt64,
         initializedSize: UInt64,
@@ -135,6 +135,11 @@ public extension Attribute {
             let name: String?
             if nameLength > 0 {
                 let nameByteCount = Int(nameLength) * 2  // UTF-16 chars
+                guard Int(nameOffset) >= 16 else {
+                    throw NTFSError.corruptOnDisk(
+                        description: "attribute name offset \(nameOffset) overlaps the 16-byte common header"
+                    )
+                }
                 guard Int(nameOffset) + nameByteCount <= Int(length) else {
                     throw NTFSError.corruptOnDisk(
                         description: "attribute name at offset \(cursor + Int(nameOffset)) length \(nameByteCount) exceeds attribute body"
@@ -213,7 +218,7 @@ public extension Attribute {
         let startingVCN     = try data.readU64LE(at: attributeStart + 16)
         let lastVCN         = try data.readU64LE(at: attributeStart + 24)
         let dataRunsOffset  = try data.readU16LE(at: attributeStart + 32)
-        let compressionUnit = try data.readU16LE(at: attributeStart + 34)
+        let compressionUnit = try data.readU8(at: attributeStart + 34)
         let allocatedSize   = try data.readU64LE(at: attributeStart + 40)
         let realSize        = try data.readU64LE(at: attributeStart + 48)
         let initializedSize = try data.readU64LE(at: attributeStart + 56)
@@ -241,27 +246,4 @@ public extension Attribute {
         )
     }
 
-    private static func decodeUTF16LE<S: Sequence>(_ bytes: S) -> String? where S.Element == UInt8 {
-        var codeUnits: [UInt16] = []
-        var i = 0
-        var pair: UInt8 = 0
-        for byte in bytes {
-            if i % 2 == 0 {
-                pair = byte
-            } else {
-                codeUnits.append(UInt16(pair) | (UInt16(byte) << 8))
-            }
-            i += 1
-        }
-        var decoder = UTF16()
-        var iterator = codeUnits.makeIterator()
-        var scalars: [Unicode.Scalar] = []
-        while true {
-            switch decoder.decode(&iterator) {
-            case .scalarValue(let s): scalars.append(s)
-            case .emptyInput: return String(String.UnicodeScalarView(scalars))
-            case .error: return nil
-            }
-        }
-    }
 }
