@@ -94,27 +94,4 @@ public struct FileName: Sendable, Equatable {
         return Date(timeIntervalSince1970: seconds)
     }
 
-    private static func decodeUTF16LE<S: Sequence>(_ bytes: S) -> String? where S.Element == UInt8 {
-        var codeUnits: [UInt16] = []
-        var i = 0
-        var pair: UInt8 = 0
-        for byte in bytes {
-            if i % 2 == 0 {
-                pair = byte
-            } else {
-                codeUnits.append(UInt16(pair) | (UInt16(byte) << 8))
-            }
-            i += 1
-        }
-        var decoder = UTF16()
-        var iterator = codeUnits.makeIterator()
-        var scalars: [Unicode.Scalar] = []
-        while true {
-            switch decoder.decode(&iterator) {
-            case .scalarValue(let s): scalars.append(s)
-            case .emptyInput: return String(String.UnicodeScalarView(scalars))
-            case .error: return nil
-            }
-        }
-    }
 }
