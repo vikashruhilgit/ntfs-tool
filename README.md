@@ -27,7 +27,16 @@ Requires Swift 6.0+ (Xcode 16.3+) targeting macOS 15+.
 
 ## Generating test fixtures
 
-Phase 1.5 will use [`scripts/make_test_images.sh`](scripts/make_test_images.sh) to call `mkntfs` inside a Linux container/VM and emit NTFS `.img` fixtures into `Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/`. For Phase 1 boot-sector tests, fixtures are not yet required — tests use hand-crafted 512-byte byte literals in source.
+`scripts/make_test_images.sh` regenerates the committed NTFS fixture used by the test suite. It runs `mkntfs` + `ntfs-3g` inside a Debian Docker container so the host doesn't need `ntfsprogs`:
+
+```bash
+./scripts/make_test_images.sh         # regenerate Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+./scripts/make_test_images.sh --check # verify Docker is reachable without generating
+```
+
+The output `small.img` (~4 MiB) is committed to the repo so CI does not need Docker — only the unit tests reading the fixture run there. Regenerate only when the fixture's contents need to change (new in-image test files, new sizes, etc) and commit the new `small.img` alongside the test code that depends on it. Requires Docker Desktop (`open -a Docker`) running on macOS.
+
+Hand-crafted 512-byte boot-sector literals in `BootSectorTests` continue to cover the parser's corruption-rejection cases — those tests never touch disk.
 
 ## License
 

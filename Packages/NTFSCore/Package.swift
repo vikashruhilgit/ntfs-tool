@@ -15,7 +15,11 @@ let package = Package(
         .target(name: "NTFSCore"),
         .testTarget(
             name: "NTFSCoreTests",
-            dependencies: ["NTFSCore"]
+            dependencies: ["NTFSCore"],
+            // Fixtures are loaded directly via #filePath; declaring them as
+            // resources would force Bundle.module lookups that don't work
+            // identically across `swift test` and Xcode-driven test runs.
+            exclude: ["Fixtures"]
         )
     ]
 )
