@@ -95,6 +95,10 @@ enum IndexEntryParser {
             let recordNumber = fileRef & 0x0000_FFFF_FFFF_FFFF
             let sequenceNumber = UInt16(truncatingIfNeeded: (fileRef >> 48) & 0xFFFF)
 
+            // Skip the LAST sentinel — its key is empty by design, callers
+            // don't want to see it. Stop iteration after handling it.
+            if flags.contains(.last) { break }
+
             entries.append(IndexEntry(
                 fileReference: fileRef,
                 recordNumber: recordNumber,
@@ -105,8 +109,6 @@ enum IndexEntryParser {
                 fileName: fileName,
                 subnodeVCN: subnodeVCN
             ))
-
-            if flags.contains(.last) { break }
             pos += Int(entryLength)
         }
 

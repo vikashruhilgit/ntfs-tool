@@ -11,9 +11,12 @@ public struct DirectoryEntry: Sendable, Equatable {
 
     public var name: String { fileName.name }
     public var isDirectory: Bool {
-        // The DIRECTORY bit (0x10000000) of $FILE_NAME.fileAttributes signals
-        // a directory entry. Useful for callers that don't want to chase the
-        // MFT record's flags themselves.
+        // The NTFS-specific FILE_NAME_INDEX_PRESENT bit (0x10000000) of
+        // $FILE_NAME.fileAttributes is set when the entry refers to a
+        // directory. Note: this is NOT the Win32 FILE_ATTRIBUTE_DIRECTORY
+        // constant (0x00000010) — the NTFS-internal high-bit flag is what
+        // the on-disk $FILE_NAME records use. See ntfs-3g's FILE_NAME_ATTR
+        // layout.
         (fileName.fileAttributes & 0x1000_0000) != 0
     }
 }

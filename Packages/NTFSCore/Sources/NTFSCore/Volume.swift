@@ -81,19 +81,24 @@ public actor Volume {
         }
 
         let root = try IndexRoot.parse(rootBytes)
-        var collected = root.entries.compactMap { Self.directoryEntry(from: $0) }
+        var collected: [DirectoryEntry] = []
+        var seenReferences: Set<UInt64> = []
+        for indexEntry in root.entries {
+            if let de = Self.directoryEntry(from: indexEntry),
+               seenReferences.insert(de.fileReference).inserted {
+                collected.append(de)
+            }
+        }
 
         // If the index spills into $INDEX_ALLOCATION, walk those blocks too.
-        // For the v1.8 surface we read every block linearly (no proper subnode
-        // descent) — small directories that fit in one or two INDX blocks are
-        // exact; larger trees with sibling pointers will still see every entry
-        // because every entry appears at some level. Duplicate-suppression by
-        // fileReference would be needed for strict correctness but the small
-        // fixture never exercises it; deferred.
+        // The linear walk over every INDX block can double-count entries that
+        // appear in both interior nodes and their leaves; the dedup set built
+        // above carries through so each fileReference is yielded at most once.
         if root.isLargeIndex {
             collected.append(contentsOf: try await readIndexAllocation(
                 attributes: attrs,
-                directoryRecord: recordNumber
+                directoryRecord: recordNumber,
+                seenReferences: &seenReferences
             ))
         }
 
@@ -104,10 +109,23 @@ public actor Volume {
     /// attribute's runlist. Returns the full file payload up to $DATA's
     /// `realSize`. Resident $DATA (small files) is returned as-is. Sparse
     /// extents inside non-resident $DATA expand to zero-filled regions.
+    ///
+    /// Rejects records that carry $ATTRIBUTE_LIST (type 0x20) — those split
+    /// $DATA across multiple MFT records, and silently picking the first
+    /// fragment would truncate the file. Block G will wire up the proper
+    /// $ATTRIBUTE_LIST follower; until then `NTFSError.unsupportedFeature`
+    /// is preferable to silently-wrong reads.
     public func readFile(at recordNumber: UInt64) async throws -> Data {
         let mft = self.mft()
         let record = try await mft.record(at: recordNumber)
         let attrs = try record.attributes()
+
+        if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
+            throw NTFSError.unsupportedFeature(
+                description: "MFT record \(recordNumber) has $ATTRIBUTE_LIST — multi-record attributes are not yet supported"
+            )
+        }
+
         guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
             throw NTFSError.corruptOnDisk(
                 description: "MFT record \(recordNumber) has no unnamed $DATA attribute"
@@ -117,8 +135,18 @@ public actor Volume {
         switch dataAttr.value {
         case let .resident(bytes, _):
             return bytes
-        case let .nonResident(_, _, _, _, _, realSize, _, extents):
-            return try await readNonResidentData(extents: extents, realSize: realSize)
+        case let .nonResident(startingVCN, lastVCN, _, _, _, realSize, _, extents):
+            // Single-fragment guarantee: $DATA must cover startingVCN == 0 through
+            // the full file. If it doesn't, this record only carries a slice and
+            // the rest lives via $ATTRIBUTE_LIST — which we've already rejected.
+            // This guard is belt-and-braces for fixtures or volumes that for some
+            // reason carry a non-zero startingVCN without an $ATTRIBUTE_LIST.
+            guard startingVCN == 0 else {
+                throw NTFSError.unsupportedFeature(
+                    description: "$DATA fragment starts at VCN \(startingVCN); multi-fragment $DATA not supported"
+                )
+            }
+            return try await readNonResidentData(extents: extents, realSize: realSize, lastVCN: lastVCN)
         }
     }
 
@@ -137,14 +165,15 @@ public actor Volume {
 
     private func readIndexAllocation(
         attributes: [Attribute],
-        directoryRecord: UInt64
+        directoryRecord: UInt64,
+        seenReferences: inout Set<UInt64>
     ) async throws -> [DirectoryEntry] {
         guard let allocAttr = attributes.first(where: {
             $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
         }) else {
-            // LARGE_INDEX flag set but no $INDEX_ALLOCATION present — treat as
-            // a fixture quirk; the entries we already have from $INDEX_ROOT
-            // are still valid.
+            // LARGE_INDEX flag set but no $INDEX_ALLOCATION present in
+            // directory record \(directoryRecord) — treat as a fixture quirk;
+            // the entries we already have from $INDEX_ROOT are still valid.
             return []
         }
         guard case let .nonResident(_, _, _, _, _, _, _, extents) = allocAttr.value else {
@@ -154,15 +183,30 @@ public actor Volume {
         let blockSize = Int(indexRecordSizeBytes)
         let sectorSize = Int(boot.bytesPerSector)
         var collected: [DirectoryEntry] = []
+        let clusterBytes = UInt64(bytesPerCluster)
 
         for extent in extents {
             guard let startLCN = extent.startLCN else { continue } // skip sparse
             for cluster in 0..<extent.clusterCount {
-                let byteOffset = UInt64(startLCN + cluster) * UInt64(bytesPerCluster)
+                let (clusterLCN, addOverflow) = startLCN.addingReportingOverflow(cluster)
+                guard !addOverflow else {
+                    throw NTFSError.corruptOnDisk(description: "$INDEX_ALLOCATION extent cluster index overflows UInt64")
+                }
+                let (byteOffset, mulOverflow) = clusterLCN.multipliedReportingOverflow(by: clusterBytes)
+                guard !mulOverflow else {
+                    throw NTFSError.corruptOnDisk(description: "$INDEX_ALLOCATION byte offset overflows UInt64")
+                }
                 let raw = try await device.read(offset: byteOffset, length: blockSize)
                 let block = try IndexAllocationBlock.parse(raw, sectorSize: sectorSize)
                 for entry in block.entries {
-                    if let de = Self.directoryEntry(from: entry) {
+                    // The B-tree's interior nodes contain the same fileReferences
+                    // as the leaves below them (each interior key = smallest key
+                    // of the right subtree). A linear sweep over every INDX block
+                    // therefore double-counts. Dedup by fileReference is strictly
+                    // safer than the naive walk; proper subnode-VCN descent is
+                    // future work but not on Block D's critical path.
+                    if let de = Self.directoryEntry(from: entry),
+                       seenReferences.insert(de.fileReference).inserted {
                         collected.append(de)
                     }
                 }
@@ -173,16 +217,59 @@ public actor Volume {
 
     /// Read non-resident $DATA via its extents. Sparse extents → zero fill.
     /// Truncates to `realSize`.
-    private func readNonResidentData(extents: [Extent], realSize: UInt64) async throws -> Data {
-        var out = Data(capacity: Int(realSize))
+    ///
+    /// Guards every arithmetic step against UInt64 overflow and Int cast trap.
+    /// A corrupt or adversarial runlist (huge clusterCount, large startLCN, or
+    /// a realSize larger than addressable on a 64-bit Int) should produce a
+    /// typed NTFSError, never a process crash. This matters because Block E
+    /// will feed user-supplied disk images through this path.
+    ///
+    /// 1 GiB hard cap on the returned buffer is a temporary safety net for
+    /// the eager-load API: a streaming variant lands with Block G. Until then
+    /// readFile refuses to materialize multi-GB files in memory.
+    private static let maxEagerReadSize: UInt64 = 1 << 30  // 1 GiB
+
+    private func readNonResidentData(extents: [Extent], realSize: UInt64, lastVCN: UInt64) async throws -> Data {
+        guard realSize <= UInt64(Int.max) else {
+            throw NTFSError.corruptOnDisk(
+                description: "$DATA realSize \(realSize) exceeds Int.max — refusing to allocate"
+            )
+        }
+        guard realSize <= Self.maxEagerReadSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "$DATA realSize \(realSize) > 1 GiB — eager readFile cap. Streaming API lands in Phase 5."
+            )
+        }
+
+        var out = Data()
+        out.reserveCapacity(Int(realSize))
         var remaining = Int(realSize)
 
+        let clusterBytes = UInt64(bytesPerCluster)
+
         for extent in extents where remaining > 0 {
-            let extentBytes = Int(extent.clusterCount * UInt64(bytesPerCluster))
+            // extent.clusterCount * bytesPerCluster — overflow check.
+            let (extentBytesRaw, extentMulOverflow) = extent.clusterCount.multipliedReportingOverflow(by: clusterBytes)
+            guard !extentMulOverflow else {
+                throw NTFSError.corruptOnDisk(
+                    description: "extent clusterCount \(extent.clusterCount) * \(clusterBytes) overflows UInt64"
+                )
+            }
+            guard extentBytesRaw <= UInt64(Int.max) else {
+                throw NTFSError.corruptOnDisk(
+                    description: "extent byte length \(extentBytesRaw) exceeds Int.max"
+                )
+            }
+            let extentBytes = Int(extentBytesRaw)
             let takeBytes = min(extentBytes, remaining)
 
             if let startLCN = extent.startLCN {
-                let byteOffset = startLCN * UInt64(bytesPerCluster)
+                let (byteOffset, lcnMulOverflow) = startLCN.multipliedReportingOverflow(by: clusterBytes)
+                guard !lcnMulOverflow else {
+                    throw NTFSError.corruptOnDisk(
+                        description: "extent startLCN \(startLCN) * \(clusterBytes) overflows UInt64"
+                    )
+                }
                 let chunk = try await device.read(offset: byteOffset, length: takeBytes)
                 out.append(chunk)
             } else {
@@ -191,6 +278,9 @@ public actor Volume {
             }
             remaining -= takeBytes
         }
+
+        // lastVCN is informational here; track that we honored realSize.
+        _ = lastVCN
 
         return out
     }
