@@ -87,10 +87,21 @@ final class NTFSItem: FSItem {
     }
 
     /// Convert this item's metadata into an FSItem.Attributes wrapper for FSKit.
+    ///
+    /// FSKit reserves three `FSItem.Identifier` rawValues:
+    ///   0 = .invalid
+    ///   1 = .parentOfRoot
+    ///   2 = .rootDirectory
+    /// Our root (NTFS MFT record 5) must be presented as `.rootDirectory` so
+    /// vfs/Finder can recognize it; its parent must be `.parentOfRoot`; and
+    /// any child whose NTFS parentRecordNumber is 5 must report
+    /// `.rootDirectory` as its parent (NOT raw 5). Without this mapping FSKit
+    /// can't identify the root for mount/traversal, producing the
+    /// "Finder shows the volume but won't browse it" failure mode.
     func makeAttributes(volume: NTFSVolume) -> FSItem.Attributes {
         let attrs = FSItem.Attributes()
-        attrs.fileID = FSItem.Identifier(rawValue: recordNumber) ?? .invalid
-        attrs.parentID = FSItem.Identifier(rawValue: parentRecordNumber) ?? .invalid
+        attrs.fileID = Self.fskitFileID(forRecordNumber: recordNumber)
+        attrs.parentID = Self.fskitParentID(forRecordNumber: parentRecordNumber, selfRecordNumber: recordNumber)
         attrs.type = isDirectory ? .directory : .file
         attrs.linkCount = 1
         // Read-only mount: every file is read-execute for everyone, every
@@ -110,6 +121,29 @@ final class NTFSItem: FSItem {
         attrs.backupTime = timespec(tv_sec: 0, tv_nsec: 0)
         _ = volume  // currently unused; kept for future per-volume metadata enrichment
         return attrs
+    }
+
+    /// MFT record number of NTFS's root directory. Static for use from
+    /// `enumerateDirectory` where we don't have an NTFSItem instance yet.
+    static let rootRecordNumber: UInt64 = 5
+
+    /// Map an NTFS MFT record number to an FSItem.Identifier honoring the
+    /// FSKit reserved values (.rootDirectory for record 5).
+    static func fskitFileID(forRecordNumber recordNumber: UInt64) -> FSItem.Identifier {
+        if recordNumber == rootRecordNumber { return .rootDirectory }
+        return FSItem.Identifier(rawValue: recordNumber) ?? .invalid
+    }
+
+    /// Map a parent's NTFS MFT record number to an FSItem.Identifier. The
+    /// root's parent is `.parentOfRoot`; root's children report `.rootDirectory`
+    /// for their parent.
+    static func fskitParentID(
+        forRecordNumber parentRecordNumber: UInt64,
+        selfRecordNumber: UInt64
+    ) -> FSItem.Identifier {
+        if selfRecordNumber == rootRecordNumber { return .parentOfRoot }
+        if parentRecordNumber == rootRecordNumber { return .rootDirectory }
+        return FSItem.Identifier(rawValue: parentRecordNumber) ?? .invalid
     }
 
     private func timespecOrZero(_ date: Date?) -> timespec {

@@ -249,7 +249,8 @@ final class NTFSVolume: FSVolume,
                     self.cache(item)
                     let cookieValue = FSDirectoryCookie(rawValue: UInt64(i + 1))
                     let entryItemType: FSItem.ItemType = entry.isDirectory ? .directory : .file
-                    let itemID = FSItem.Identifier(rawValue: entry.recordNumber) ?? .invalid
+                    // Honor FSKit's reserved IDs — root is .rootDirectory.
+                    let itemID = NTFSItem.fskitFileID(forRecordNumber: entry.recordNumber)
                     let kept = packer.packEntry(
                         name: FSFileName(string: entry.name),
                         itemType: entryItemType,
@@ -279,23 +280,37 @@ final class NTFSVolume: FSVolume,
             reply(0, posixError(EISDIR))
             return
         }
+        // POSIX: negative offset is EINVAL. Reject before any UInt cast trap.
+        if offset < 0 {
+            reply(0, posixError(EINVAL))
+            return
+        }
+        if length <= 0 {
+            reply(0, nil)
+            return
+        }
+
         Task {
             do {
-                let content = try await self.coreVolume.readFile(at: ntfsItem.recordNumber)
-                let fileSize = content.count
-                if offset >= fileSize {
+                // Slice the file by offset+length instead of re-reading the
+                // whole file on every kernel callback. Earlier versions did
+                // a full readFile per call — quadratic IO that stalled even
+                // moderate-size Finder opens. NTFSCore.Volume.readFileSlice
+                // walks only the extents that overlap the requested window.
+                let slice = try await self.coreVolume.readFileSlice(
+                    at: ntfsItem.recordNumber,
+                    offset: UInt64(offset),
+                    length: length
+                )
+                if slice.isEmpty {
                     reply(0, nil)
                     return
                 }
-                let startOffset = Int(offset)
-                let take = min(length, fileSize - startOffset)
+                let copyCount = slice.count
                 buffer.withUnsafeMutableBytes { dest in
-                    content.copyBytes(
-                        to: dest.bindMemory(to: UInt8.self).baseAddress!,
-                        from: startOffset..<(startOffset + take)
-                    )
+                    _ = slice.copyBytes(to: dest.bindMemory(to: UInt8.self))
                 }
-                reply(take, nil)
+                reply(copyCount, nil)
             } catch {
                 reply(0, error)
             }

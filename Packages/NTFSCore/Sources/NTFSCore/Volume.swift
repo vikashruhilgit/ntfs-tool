@@ -105,6 +105,57 @@ public actor Volume {
         return collected
     }
 
+    /// Read a byte range from the file at `recordNumber` without
+    /// materializing the whole file. Used by the FSKit adapter so kernel
+    /// read callbacks don't pay O(N) per chunk.
+    ///
+    /// `offset` is the file-relative byte offset; `length` is the maximum
+    /// number of bytes to return. The returned `Data` may be shorter if
+    /// the request extends past the file's `realSize`.
+    public func readFileSlice(
+        at recordNumber: UInt64,
+        offset: UInt64,
+        length: Int
+    ) async throws -> Data {
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        let attrs = try record.attributes()
+
+        if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
+            throw NTFSError.unsupportedFeature(
+                description: "MFT record \(recordNumber) has $ATTRIBUTE_LIST — multi-record attributes are not yet supported"
+            )
+        }
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "MFT record \(recordNumber) has no unnamed $DATA attribute"
+            )
+        }
+
+        switch dataAttr.value {
+        case let .resident(bytes, _):
+            guard length >= 0 else {
+                throw NTFSError.ioFailure(description: "negative length \(length)")
+            }
+            if offset >= UInt64(bytes.count) { return Data() }
+            let start = Int(offset)
+            let end = min(start + length, bytes.count)
+            return bytes.subdata(in: start..<end)
+        case let .nonResident(startingVCN, _, _, _, _, realSize, _, extents):
+            guard startingVCN == 0 else {
+                throw NTFSError.unsupportedFeature(
+                    description: "$DATA fragment starts at VCN \(startingVCN); multi-fragment $DATA not supported"
+                )
+            }
+            return try await readNonResidentSlice(
+                extents: extents,
+                realSize: realSize,
+                offset: offset,
+                length: length
+            )
+        }
+    }
+
     /// Read the byte content of the file at `recordNumber` using its $DATA
     /// attribute's runlist. Returns the full file payload up to $DATA's
     /// `realSize`. Resident $DATA (small files) is returned as-is. Sparse
@@ -228,6 +279,83 @@ public actor Volume {
     /// the eager-load API: a streaming variant lands with Block G. Until then
     /// readFile refuses to materialize multi-GB files in memory.
     private static let maxEagerReadSize: UInt64 = 1 << 30  // 1 GiB
+
+    /// Read a byte range from a non-resident $DATA runlist. Walks the
+    /// extents until the offset falls inside one, then copies up to
+    /// `length` bytes (truncated to `realSize`). Sparse extents inside the
+    /// slice expand to zero-fill. This is the streaming entry point Block E
+    /// and Block G both use; the eager `readFile` is built on top.
+    private func readNonResidentSlice(
+        extents: [Extent],
+        realSize: UInt64,
+        offset: UInt64,
+        length: Int
+    ) async throws -> Data {
+        guard length >= 0 else {
+            throw NTFSError.ioFailure(description: "negative length \(length)")
+        }
+        if length == 0 || offset >= realSize { return Data() }
+
+        let clusterBytes = UInt64(bytesPerCluster)
+        let endRequested = min(offset.addingReportingOverflow(UInt64(length)).0, realSize)
+        // Cap the eventual buffer size by Int.max so the Data allocation can't trap.
+        let desired = endRequested - offset
+        guard desired <= UInt64(Int.max) else {
+            throw NTFSError.corruptOnDisk(
+                description: "slice length \(desired) exceeds Int.max"
+            )
+        }
+        var out = Data()
+        out.reserveCapacity(Int(desired))
+
+        var cursorBytes: UInt64 = 0   // byte offset at the start of the current extent
+
+        for extent in extents {
+            let (extentBytesRaw, mulOverflow) = extent.clusterCount.multipliedReportingOverflow(by: clusterBytes)
+            guard !mulOverflow else {
+                throw NTFSError.corruptOnDisk(
+                    description: "extent clusterCount \(extent.clusterCount) * \(clusterBytes) overflows UInt64"
+                )
+            }
+            let extentEnd = cursorBytes.addingReportingOverflow(extentBytesRaw)
+            guard !extentEnd.overflow else {
+                throw NTFSError.corruptOnDisk(description: "extent end offset overflows UInt64")
+            }
+            let extentEndBytes = extentEnd.0
+
+            // Skip extents entirely before the requested offset.
+            if extentEndBytes <= offset {
+                cursorBytes = extentEndBytes
+                continue
+            }
+            // Stop once we've crossed the requested end.
+            if cursorBytes >= endRequested { break }
+
+            let sliceStartInExtent = (offset > cursorBytes) ? (offset - cursorBytes) : 0
+            let sliceEndInExtent = min(extentBytesRaw, endRequested - cursorBytes)
+            let takeBytes = Int(sliceEndInExtent - sliceStartInExtent)
+
+            if let startLCN = extent.startLCN {
+                let (extentByteOffset, ovf) = startLCN.multipliedReportingOverflow(by: clusterBytes)
+                guard !ovf else {
+                    throw NTFSError.corruptOnDisk(
+                        description: "extent startLCN \(startLCN) * \(clusterBytes) overflows UInt64"
+                    )
+                }
+                let chunk = try await device.read(
+                    offset: extentByteOffset + sliceStartInExtent,
+                    length: takeBytes
+                )
+                out.append(chunk)
+            } else {
+                out.append(Data(repeating: 0, count: takeBytes))
+            }
+
+            cursorBytes = extentEndBytes
+        }
+
+        return out
+    }
 
     private func readNonResidentData(extents: [Extent], realSize: UInt64, lastVCN: UInt64) async throws -> Data {
         guard realSize <= UInt64(Int.max) else {
