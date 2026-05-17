@@ -79,4 +79,75 @@ enum UpdateSequenceArray {
 
         return fixed
     }
+
+    /// Apply USA on the WRITE path — inverse of `applyFixup`.
+    ///
+    /// Caller supplies the post-fix-up record bytes (the form attribute
+    /// parsers see). This function (a) increments the sequence number in
+    /// USA[0] by 1, (b) copies the original last-2-bytes of every block
+    /// into USA[1..N], and (c) overwrites those block tails with the new
+    /// sentinel value. The returned Data is ready to write to disk.
+    ///
+    /// - parameter recordBytes: the post-fix-up record (with original
+    ///   block tails intact).
+    /// - parameter usaOffset: byte offset (from record start) of the USA.
+    /// - parameter usaCount: total u16 entries in USA (1 sentinel + N
+    ///   fix-ups).
+    /// - parameter blockSize: multi-sector unit, typically 512.
+    /// - returns: bytes ready to write to disk.
+    static func reverseFixup(
+        recordBytes raw: Data,
+        usaOffset: Int,
+        usaCount: Int,
+        blockSize: Int
+    ) throws -> Data {
+        guard usaCount >= 1 else {
+            throw NTFSError.corruptOnDisk(description: "USA count must be >= 1 (got \(usaCount))")
+        }
+        guard blockSize > 2, blockSize.nonzeroBitCount == 1 else {
+            throw NTFSError.corruptOnDisk(description: "USA block size must be a power of two > 2 (got \(blockSize))")
+        }
+        let expectedFixups = raw.count / blockSize
+        let actualFixups = usaCount - 1
+        guard actualFixups == expectedFixups else {
+            throw NTFSError.corruptOnDisk(
+                description: "USA fix-up count mismatch on write: header says \(actualFixups), record size implies \(expectedFixups)"
+            )
+        }
+        guard usaOffset >= 0,
+              usaOffset + (usaCount * 2) <= raw.count else {
+            throw NTFSError.corruptOnDisk(
+                description: "USA range (offset \(usaOffset), count \(usaCount)) exceeds record size \(raw.count)"
+            )
+        }
+
+        var out = raw
+
+        // Bump the sentinel. NTFS wraps from 0xFFFF back to 1 (0 is reserved
+        // as the freshly-formatted sentinel).
+        let oldSentinel = try out.readU16LE(at: usaOffset)
+        var newSentinel = oldSentinel &+ 1
+        if newSentinel == 0 { newSentinel = 1 }
+
+        // Write the new sentinel into USA[0].
+        out[out.startIndex + usaOffset]     = UInt8(newSentinel & 0xFF)
+        out[out.startIndex + usaOffset + 1] = UInt8((newSentinel >> 8) & 0xFF)
+
+        for i in 0..<expectedFixups {
+            let blockTail = (i + 1) * blockSize - 2
+
+            // Save the original block-tail bytes into USA[i+1].
+            let originalLow  = try out.readU8(at: blockTail)
+            let originalHigh = try out.readU8(at: blockTail + 1)
+            let fixupBytePosition = usaOffset + 2 * (i + 1)
+            out[out.startIndex + fixupBytePosition]     = originalLow
+            out[out.startIndex + fixupBytePosition + 1] = originalHigh
+
+            // Overwrite the block tail with the new sentinel.
+            out[out.startIndex + blockTail]     = UInt8(newSentinel & 0xFF)
+            out[out.startIndex + blockTail + 1] = UInt8((newSentinel >> 8) & 0xFF)
+        }
+
+        return out
+    }
 }

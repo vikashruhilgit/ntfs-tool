@@ -135,6 +135,105 @@ public actor Volume {
         )
     }
 
+    /// Create a new file or directory in MFT (Stage 3a — MFT-level only).
+    ///
+    /// Allocates a free MFT slot, builds a fresh record via MFTRecordBuilder
+    /// with $STANDARD_INFORMATION + $FILE_NAME(parentRef) + empty $DATA, and
+    /// writes it back to disk. **Does NOT yet update the parent directory's
+    /// $I30 index** — the file is reachable by record number (via the
+    /// MFT.record(at:) API or ntfsctl `cat`) but not by name through
+    /// enumerate(). Stage 3b adds the $I30 wiring.
+    ///
+    /// Returns the assigned record number.
+    public func createFile(
+        named name: String,
+        inDirectory parentRecordNumber: UInt64 = 5,
+        isDirectory: Bool = false
+    ) async throws -> UInt64 {
+        let mft = self.mft()
+        let recordNumber = try await mft.findFreeRecordNumber()
+
+        // For a slot that's been used before, the existing record's
+        // sequenceNumber + 1 should be the new one (NTFS recycles MFT slots
+        // by bumping the sequence). For never-used slots, start at 1.
+        var newSequence: UInt16 = 1
+        if let existing = try? await mft.record(at: recordNumber) {
+            newSequence = existing.sequenceNumber &+ 1
+            if newSequence == 0 { newSequence = 1 }
+        }
+
+        // Build the parent reference: 48 bits record number + 16 bits seq.
+        let parent = try await mft.record(at: parentRecordNumber)
+        let parentRef = (UInt64(parent.sequenceNumber) << 48) | (parentRecordNumber & 0x0000_FFFF_FFFF_FFFF)
+
+        let builder = MFTRecordBuilder(
+            recordSize: Int(mftRecordSizeBytes),
+            sectorSize: Int(boot.bytesPerSector),
+            recordNumber: UInt32(recordNumber & 0xFFFF_FFFF),
+            sequenceNumber: newSequence,
+            isDirectory: isDirectory,
+            fileName: name,
+            parentReference: parentRef
+        )
+        let recordBytes = try builder.build()
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: recordBytes)
+
+        return recordNumber
+    }
+
+    /// Delete a file (Stage 3a — MFT-level only).
+    ///
+    /// Reads the file's MFT record, frees any non-resident clusters via the
+    /// $Bitmap allocator, marks the record IN_USE=0 + bumps the sequence
+    /// number, and writes it back. **Does NOT yet update the parent
+    /// directory's $I30 index** (Stage 3b).
+    public func deleteFile(at recordNumber: UInt64) async throws {
+        // Don't allow deleting NTFS system records.
+        guard recordNumber >= MFT.firstUserRecord else {
+            throw NTFSError.unsupportedFeature(
+                description: "deleteFile: refusing to delete reserved MFT record \(recordNumber)"
+            )
+        }
+
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else { return }  // already deleted — idempotent
+
+        // Free non-resident clusters.
+        let attrs = try record.attributes()
+        for attr in attrs {
+            if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
+                for extent in extents {
+                    try await freeClusters(extent)
+                }
+            }
+        }
+
+        // Flip IN_USE off, bump sequence number for next reuse.
+        var newFlags = record.flags
+        newFlags.remove(.inUse)
+        var newSeq = record.sequenceNumber &+ 1
+        if newSeq == 0 { newSeq = 1 }
+
+        let updated = MFTRecord(
+            magic: record.magic,
+            usaOffset: record.usaOffset,
+            usaCount: record.usaCount,
+            logFileSequenceNumber: record.logFileSequenceNumber,
+            sequenceNumber: newSeq,
+            hardLinkCount: record.hardLinkCount,
+            firstAttributeOffset: record.firstAttributeOffset,
+            flags: newFlags,
+            usedSize: record.usedSize,
+            allocatedSize: record.allocatedSize,
+            baseFileReference: record.baseFileReference,
+            nextAttributeID: record.nextAttributeID,
+            mftRecordNumber: record.mftRecordNumber,
+            bytes: record.bytes
+        )
+        try await mft.writeRecord(at: recordNumber, updated)
+    }
+
     /// Allocate a contiguous run of `count` clusters from $Bitmap, persist
     /// the updated $Bitmap back to disk, and return the granted Extent.
     /// Throws `outOfSpace` if no run of the requested length exists.
