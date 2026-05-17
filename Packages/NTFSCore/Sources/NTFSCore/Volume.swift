@@ -562,6 +562,446 @@ public actor Volume {
         return MFTRecordBuilder.windowsFiletime(from: date)
     }
 
+    // MARK: — Block G stage 4: file write + truncate
+
+    /// Threshold for keeping $DATA resident. Below this we keep it inline in
+    /// the MFT record; at or above, we promote to non-resident with cluster
+    /// allocation. The exact value is conventional — NTFS picks based on
+    /// available record slack; we use a fixed 700-byte ceiling which fits
+    /// every test fixture with room to spare. Larger values would let more
+    /// files stay resident (faster reads) but risk overflowing the record.
+    private static let residentDataThreshold = 700
+
+    /// Replace the file's `$DATA` content with `bytes` (writing at offset 0).
+    /// If the file was non-resident, frees its old clusters first. If the new
+    /// bytes fit under the resident threshold, $DATA stays resident; else
+    /// promotes to non-resident with newly allocated clusters.
+    ///
+    /// Stage 4 scope: rewrite-from-offset-0 only. Append via the offset
+    /// parameter (must equal the current size). Partial overwrites at
+    /// arbitrary middle offsets are stage 4b.
+    public func write(at recordNumber: UInt64, offset: UInt64, bytes: Data) async throws {
+        guard recordNumber >= MFT.firstUserRecord else {
+            throw NTFSError.unsupportedFeature(
+                description: "write: refusing to mutate reserved MFT record \(recordNumber)"
+            )
+        }
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else {
+            throw NTFSError.corruptOnDisk(description: "write: MFT record \(recordNumber) is not in use")
+        }
+        if record.isDirectory {
+            throw NTFSError.unsupportedFeature(description: "write: target is a directory")
+        }
+
+        let attrs = try record.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(description: "write: MFT record \(recordNumber) lacks unnamed $DATA")
+        }
+
+        // Existing file size for the offset check.
+        let existingSize: UInt64
+        switch dataAttr.value {
+        case .resident(let v, _):
+            existingSize = UInt64(v.count)
+        case .nonResident(_, _, _, _, _, let realSize, _, _):
+            existingSize = realSize
+        }
+
+        // For Stage 4 we accept offset == 0 (rewrite) or offset == existingSize (append).
+        guard offset == 0 || offset == existingSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "write: Stage 4 supports offset == 0 OR offset == existingSize \(existingSize); got \(offset)"
+            )
+        }
+
+        // Compose the new full $DATA content.
+        let finalContent: Data
+        if offset == 0 {
+            finalContent = bytes
+        } else {
+            // Append: existingSize == offset; read existing content via readFile.
+            let existing = try await readFile(at: recordNumber)
+            finalContent = existing + bytes
+        }
+
+        // Free any old non-resident extents — we're rewriting.
+        if case let .nonResident(_, _, _, _, _, _, _, oldExtents) = dataAttr.value {
+            for extent in oldExtents {
+                try await freeClusters(extent)
+            }
+        }
+
+        // Decide resident vs non-resident.
+        let newDataAttr: Data    // serialized attribute (header + value/runlist + alignment)
+        if finalContent.count <= Self.residentDataThreshold {
+            newDataAttr = serializeResidentDataAttribute(
+                attrID: dataAttr.header.attributeID,
+                flags: dataAttr.header.flags,
+                value: finalContent
+            )
+        } else {
+            // Allocate clusters and write the bytes.
+            let clusterBytes = UInt64(bytesPerCluster)
+            let clustersNeeded = (UInt64(finalContent.count) + clusterBytes - 1) / clusterBytes
+            let extent = try await allocateClusters(clustersNeeded)
+            try await writeContentToExtent(extent: extent, content: finalContent)
+            newDataAttr = serializeNonResidentDataAttribute(
+                attrID: dataAttr.header.attributeID,
+                flags: dataAttr.header.flags,
+                realSize: UInt64(finalContent.count),
+                allocatedSize: clustersNeeded * clusterBytes,
+                extent: extent
+            )
+        }
+
+        // Replace the attribute in the MFT record.
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: AttributeType.data.rawValue,
+            attributeName: "",
+            replacementBytes: newDataAttr
+        )
+        let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
+        guard let newUsedSize = newUsedSize else {
+            throw NTFSError.corruptOnDisk(description: "write: rewritten record has no end marker")
+        }
+        var updatedBytes = newRecordBytes
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+    }
+
+    /// Truncate a file to `newSize`. Stage 4 supports two patterns:
+    ///  - newSize == 0 → free all clusters, $DATA becomes empty resident.
+    ///  - newSize <= existingSize, cluster-aligned → free trailing clusters,
+    ///    update realSize/allocatedSize.
+    public func truncate(at recordNumber: UInt64, newSize: UInt64) async throws {
+        guard recordNumber >= MFT.firstUserRecord else {
+            throw NTFSError.unsupportedFeature(
+                description: "truncate: refusing to mutate reserved MFT record \(recordNumber)"
+            )
+        }
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        let attrs = try record.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(description: "truncate: record \(recordNumber) lacks unnamed $DATA")
+        }
+
+        if newSize == 0 {
+            // Free everything, write empty resident $DATA.
+            if case let .nonResident(_, _, _, _, _, _, _, extents) = dataAttr.value {
+                for extent in extents {
+                    try await freeClusters(extent)
+                }
+            }
+            try await write(at: recordNumber, offset: 0, bytes: Data())
+            return
+        }
+
+        // For non-zero sizes, only support cluster-aligned shrinks on
+        // non-resident $DATA for now.
+        let clusterBytes = UInt64(bytesPerCluster)
+        guard newSize % clusterBytes == 0 else {
+            throw NTFSError.unsupportedFeature(
+                description: "truncate: Stage 4 requires newSize to be cluster-aligned (multiple of \(clusterBytes)) — got \(newSize)"
+            )
+        }
+        guard case let .nonResident(_, _, _, _, _, oldRealSize, _, extents) = dataAttr.value else {
+            throw NTFSError.unsupportedFeature(
+                description: "truncate: Stage 4 shrink path is non-resident-only — promote first via write()"
+            )
+        }
+        guard newSize <= oldRealSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "truncate: extending via truncate() not yet supported (use write())"
+            )
+        }
+
+        // Walk extents, keep the leading ones that fit in newSize bytes,
+        // free the rest (and partial-free the boundary extent).
+        let keepClusters = newSize / clusterBytes
+        var keptExtents: [Extent] = []
+        var clustersKept: UInt64 = 0
+        for extent in extents {
+            if clustersKept >= keepClusters { break }
+            let needed = keepClusters - clustersKept
+            if extent.clusterCount <= needed {
+                keptExtents.append(extent)
+                clustersKept += extent.clusterCount
+            } else {
+                // Split: keep first `needed` clusters, free the rest of THIS extent.
+                let trimmed = Extent(startLCN: extent.startLCN, clusterCount: needed)
+                keptExtents.append(trimmed)
+                if let lcn = extent.startLCN {
+                    let toFree = Extent(startLCN: lcn + needed, clusterCount: extent.clusterCount - needed)
+                    try await freeClusters(toFree)
+                }
+                clustersKept = keepClusters
+                break
+            }
+        }
+        // Free any tail extents that the loop didn't reach.
+        var tailIndex = 0
+        var processedClusters: UInt64 = 0
+        for extent in extents {
+            tailIndex += 1
+            processedClusters += extent.clusterCount
+            if processedClusters >= keepClusters { break }
+        }
+        for extent in extents.suffix(from: tailIndex) {
+            try await freeClusters(extent)
+        }
+
+        let allocatedSize = clustersKept * clusterBytes
+        let newDataAttr = serializeNonResidentDataAttribute(
+            attrID: dataAttr.header.attributeID,
+            flags: dataAttr.header.flags,
+            realSize: newSize,
+            allocatedSize: allocatedSize,
+            extentList: keptExtents
+        )
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: AttributeType.data.rawValue,
+            attributeName: "",
+            replacementBytes: newDataAttr
+        )
+        let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
+        guard let newUsedSize = newUsedSize else {
+            throw NTFSError.corruptOnDisk(description: "truncate: rewritten record has no end marker")
+        }
+        var updatedBytes = newRecordBytes
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+    }
+
+    // MARK: — Stage 4 helpers
+
+    private func writeContentToExtent(extent: Extent, content: Data) async throws {
+        guard let startLCN = extent.startLCN else {
+            throw NTFSError.corruptOnDisk(description: "writeContentToExtent: sparse extent passed to writer")
+        }
+        let byteOffset = startLCN * UInt64(bytesPerCluster)
+        try await device.write(offset: byteOffset, bytes: content)
+        // Pad to cluster boundary so we don't leave junk in the trailing partial cluster.
+        let clusterBytes = Int(bytesPerCluster)
+        let tailBytes = content.count % clusterBytes
+        if tailBytes != 0 {
+            let padBytes = clusterBytes - tailBytes
+            let pad = Data(repeating: 0, count: padBytes)
+            try await device.write(offset: byteOffset + UInt64(content.count), bytes: pad)
+        }
+    }
+
+    private func serializeResidentDataAttribute(attrID: UInt16, flags: UInt16, value: Data) -> Data {
+        let bodyLen = value.count
+        let rawLen = 16 + 8 + bodyLen
+        let alignedLen = ((rawLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: AttributeType.data.rawValue)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 0          // resident
+        data[data.startIndex + 9] = 0          // nameLength
+        MFTRecord.writeU16LE(into: &data, at: 10, value: 0)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: flags)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        MFTRecord.writeU32LE(into: &data, at: 16, value: UInt32(bodyLen))
+        MFTRecord.writeU16LE(into: &data, at: 20, value: 24)   // valueOffset
+        for (i, byte) in value.enumerated() {
+            data[data.startIndex + 24 + i] = byte
+        }
+        return data
+    }
+
+    private func serializeNonResidentDataAttribute(
+        attrID: UInt16,
+        flags: UInt16,
+        realSize: UInt64,
+        allocatedSize: UInt64,
+        extent: Extent
+    ) -> Data {
+        serializeNonResidentDataAttribute(
+            attrID: attrID,
+            flags: flags,
+            realSize: realSize,
+            allocatedSize: allocatedSize,
+            extentList: [extent]
+        )
+    }
+
+    private func serializeNonResidentDataAttribute(
+        attrID: UInt16,
+        flags: UInt16,
+        realSize: UInt64,
+        allocatedSize: UInt64,
+        extentList: [Extent]
+    ) -> Data {
+        // Build runlist bytes from extents.
+        let runlist = encodeRunlist(extents: extentList)
+        // Header (16) + non-resident ext (48) + runlist + terminator (0) + padding to 8.
+        let bodyLen = 64 + runlist.count
+        let alignedLen = ((bodyLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        let clusterBytes = UInt64(bytesPerCluster)
+        let totalClusters = extentList.reduce(0) { $0 + $1.clusterCount }
+        let lastVCN = totalClusters > 0 ? totalClusters - 1 : 0
+
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: AttributeType.data.rawValue)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 1          // non-resident
+        data[data.startIndex + 9] = 0          // nameLength
+        MFTRecord.writeU16LE(into: &data, at: 10, value: 0)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: flags)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        // Non-resident extension
+        MFTRecord.writeU64LE(into: &data, at: 16, value: 0)                          // startingVCN
+        MFTRecord.writeU64LE(into: &data, at: 24, value: lastVCN)                    // lastVCN
+        MFTRecord.writeU16LE(into: &data, at: 32, value: 64)                          // dataRunsOffset
+        data[data.startIndex + 34] = 0                                                // compressionUnit
+        // 35-39: reserved zeros
+        MFTRecord.writeU64LE(into: &data, at: 40, value: allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: realSize)
+        MFTRecord.writeU64LE(into: &data, at: 56, value: realSize)                    // initializedSize == realSize
+        for (i, byte) in runlist.enumerated() {
+            data[data.startIndex + 64 + i] = byte
+        }
+        _ = clusterBytes
+        return data
+    }
+
+    private func encodeRunlist(extents: [Extent]) -> Data {
+        var bytes = Data()
+        var prevLCN: Int64 = 0
+        for extent in extents {
+            // length field width: bytes needed to hold extent.clusterCount.
+            let lengthBytes = encodeUnsignedLE(extent.clusterCount)
+            // Offset: signed delta from prevLCN, or no offset bytes for sparse.
+            if let startLCN = extent.startLCN {
+                let delta = Int64(startLCN) - prevLCN
+                let offsetBytes = encodeSignedLE(delta)
+                let header = UInt8(lengthBytes.count) | (UInt8(offsetBytes.count) << 4)
+                bytes.append(header)
+                bytes.append(lengthBytes)
+                bytes.append(offsetBytes)
+                prevLCN = Int64(startLCN)
+            } else {
+                // Sparse: offset width 0
+                let header = UInt8(lengthBytes.count)
+                bytes.append(header)
+                bytes.append(lengthBytes)
+            }
+        }
+        bytes.append(0)   // terminator
+        return bytes
+    }
+
+    private func encodeUnsignedLE(_ value: UInt64) -> Data {
+        if value == 0 { return Data([0]) }
+        var v = value
+        var bytes: [UInt8] = []
+        while v != 0 {
+            bytes.append(UInt8(v & 0xFF))
+            v >>= 8
+        }
+        return Data(bytes)
+    }
+
+    private func encodeSignedLE(_ value: Int64) -> Data {
+        // Find the minimum number of bytes that hold `value` with sign bit intact.
+        if value == 0 { return Data([0]) }
+        for width in 1...8 {
+            let max: Int64 = (Int64(1) << (8 * width - 1)) - 1
+            let min: Int64 = -(Int64(1) << (8 * width - 1))
+            if value >= min && value <= max {
+                var bytes: [UInt8] = []
+                var v = UInt64(bitPattern: value)
+                for _ in 0..<width {
+                    bytes.append(UInt8(v & 0xFF))
+                    v >>= 8
+                }
+                return Data(bytes)
+            }
+        }
+        return Data([0])  // shouldn't happen with valid LCN
+    }
+
+    /// Like `rewriteResidentAttribute` but the caller pre-serialized the entire
+    /// replacement attribute (header + body), so we just splice it into the
+    /// record. Used by write() and truncate() because they swap an entire
+    /// $DATA attribute (sometimes changing form between resident ↔ non-
+    /// resident, with different header layouts).
+    private func rewriteEntireAttribute(
+        in originalBytes: Data,
+        firstAttributeOffset: Int,
+        usedSize: Int,
+        recordSize: Int,
+        replacingType: UInt32,
+        attributeName: String,
+        replacementBytes: Data
+    ) throws -> Data {
+        var cursor = firstAttributeOffset
+        var targetStart: Int?
+        var targetOldLength: Int = 0
+        while cursor + 4 <= usedSize {
+            let type = try originalBytes.readU32LE(at: cursor)
+            if type == AttributeType.endMarker { break }
+            guard cursor + 16 <= usedSize else { break }
+            let length = Int(try originalBytes.readU32LE(at: cursor + 4))
+            let nameLength = try originalBytes.readU8(at: cursor + 9)
+            let nameOffset = try originalBytes.readU16LE(at: cursor + 10)
+            var thisName = ""
+            if nameLength > 0 {
+                let nameByteCount = Int(nameLength) * 2
+                let nameStart = cursor + Int(nameOffset)
+                let nameBytes = originalBytes[(originalBytes.startIndex + nameStart)..<(originalBytes.startIndex + nameStart + nameByteCount)]
+                thisName = decodeUTF16LE(nameBytes) ?? ""
+            }
+            if type == replacingType && thisName == attributeName {
+                targetStart = cursor
+                targetOldLength = length
+                break
+            }
+            cursor += length
+        }
+        guard let targetStart = targetStart else {
+            throw NTFSError.corruptOnDisk(
+                description: "rewriteEntireAttribute: target type 0x\(String(format: "%08X", replacingType)) name '\(attributeName)' not found"
+            )
+        }
+        let delta = replacementBytes.count - targetOldLength
+        let newUsedSize = usedSize + delta
+        guard newUsedSize + 4 <= recordSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "rewriteEntireAttribute: new attribute (\(replacementBytes.count) bytes) would overflow record (used \(usedSize), record \(recordSize))"
+            )
+        }
+
+        var out = Data(count: recordSize)
+        for i in 0..<targetStart {
+            out[out.startIndex + i] = originalBytes[originalBytes.startIndex + i]
+        }
+        for (i, byte) in replacementBytes.enumerated() {
+            out[out.startIndex + targetStart + i] = byte
+        }
+        // Tail: everything after old attribute, shifted by delta.
+        let tailStart = targetStart + targetOldLength
+        let tailEnd = usedSize + 4
+        let newTailStart = targetStart + replacementBytes.count
+        for i in 0..<(tailEnd - tailStart) {
+            out[out.startIndex + newTailStart + i] = originalBytes[originalBytes.startIndex + tailStart + i]
+        }
+        return out
+    }
+
     /// Roll back an MFT record allocation by flipping IN_USE off — used by
     /// createFile's error handler when the $I30 insert fails. Doesn't try to
     /// free clusters (the new record is empty resident $DATA only) and
