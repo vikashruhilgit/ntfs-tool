@@ -33,5 +33,13 @@ struct Info: AsyncParsableCommand {
         print("Index record size:        \(volume.indexRecordSizeBytes) bytes")
         print("Volume serial:            0x\(String(boot.volumeSerial, radix: 16, uppercase: true))")
         print("Boot signature:           0x\(String(format: "%04X", boot.bootSectorSignature))")
+
+        // Free-space stats from $Bitmap (Phase 5a). Best-effort — a corrupt
+        // $Bitmap shouldn't fail `ntfsctl info`, just suppresses these lines.
+        if let stats = try? await volume.allocationStats() {
+            print("Total clusters:           \(stats.totalClusters)")
+            print("Free clusters:            \(stats.freeClusters)  (\(formatter.string(fromByteCount: Int64(stats.freeBytes))))")
+            print("Allocated clusters:       \(stats.allocatedClusters)  (\(formatter.string(fromByteCount: Int64(stats.allocatedBytes))))")
+        }
     }
 }
