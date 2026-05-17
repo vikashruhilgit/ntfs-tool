@@ -62,10 +62,15 @@ final class NTFSUnaryFS: FSUnaryFileSystem, FSUnaryFileSystemOperations, @unchec
                 guard let block = resource as? FSBlockDeviceResource else {
                     throw NTFSError.ioFailure(description: "loadResource: not an FSBlockDeviceResource")
                 }
+                // Honor the `--rdonly` mount option. FSKit exposes options via
+                // FSTaskOptions; we look up "rdonly" / "ro" and default to
+                // read-write when neither is present.
+                let optionValues = options.taskOptions
+                let isReadOnly = optionValues.contains("rdonly") || optionValues.contains("ro") || optionValues.contains("--rdonly")
                 let device = FSKitBlockDevice(block: block)
                 let coreVolume = try await NTFSCore.Volume(device: device)
                 let volumeName = FSFileName(string: coreVolume.boot.oemID.trimmingCharacters(in: .whitespaces))
-                let volume = NTFSVolume(coreVolume: coreVolume, volumeName: volumeName, isReadOnly: true)
+                let volume = NTFSVolume(coreVolume: coreVolume, volumeName: volumeName, isReadOnly: isReadOnly)
 
                 // Prime the allocation-stats cache so volumeStatistics returns
                 // real free/used bytes the first time vfs queries it. Best

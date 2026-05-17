@@ -43,7 +43,7 @@ public final class MFT: Sendable {
 
     /// Serialize and write `record` back to its MFT slot. The record's
     /// `allocatedSize` must match the volume's MFT record size; we don't
-    /// resize records here.
+    /// resize records here. Also writes to $MFTMirr for records 0-3.
     public func writeRecord(at recordNumber: UInt64, _ record: MFTRecord) async throws {
         let recordSize = UInt64(volume.mftRecordSizeBytes)
         let sectorSize = Int(volume.boot.bytesPerSector)
@@ -55,23 +55,32 @@ public final class MFT: Sendable {
                 description: "writeRecord: record.allocatedSize \(record.allocatedSize) != volume MFT record size \(recordSize)"
             )
         }
-        let (offsetProduct, mulOverflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
-        guard !mulOverflow else {
-            throw NTFSError.corruptOnDisk(
-                description: "writeRecord: record number \(recordNumber) * size \(recordSize) overflows"
-            )
-        }
-        let (byteOffset, addOverflow) = volume.mftByteOffset.addingReportingOverflow(offsetProduct)
-        guard !addOverflow else {
-            throw NTFSError.corruptOnDisk(description: "writeRecord: byte offset overflows UInt64")
-        }
         let bytes = try record.serialize(sectorSize: sectorSize)
-        try await volume.device.write(offset: byteOffset, bytes: bytes)
+
+        let primaryOffset = try mftRecordByteOffset(recordNumber: recordNumber)
+        try await volume.device.write(offset: primaryOffset, bytes: bytes)
+
+        if recordNumber < Self.mirroredRecordCount {
+            let mirrorBase = UInt64(volume.boot.mftMirrorCluster) * UInt64(volume.bytesPerCluster)
+            let (offsetInMirror, overflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
+            guard !overflow else {
+                throw NTFSError.corruptOnDisk(description: "writeRecord: mirror offset overflow")
+            }
+            try await volume.device.write(offset: mirrorBase + offsetInMirror, bytes: bytes)
+        }
     }
+
+    /// NTFS mirrors the first 4 MFT records ($MFT, $MFTMirr, $LogFile,
+    /// $Volume) into $MFTMirr so a corrupted primary MFT can be recovered
+    /// from the mirror. Every write to records 0-3 MUST also write the
+    /// same bytes to the corresponding mirror slot or ntfs-3g / chkdsk
+    /// will reject the volume with "$MFTMirr does not match $MFT".
+    public static let mirroredRecordCount: UInt64 = 4
 
     /// Write raw pre-serialized record bytes to a specific slot. Used by
     /// `Volume.createFile` after MFTRecordBuilder.build() — the bytes are
     /// already in post-fix-up form and need USA-reversal before write.
+    /// When `recordNumber < mirroredRecordCount`, also writes to $MFTMirr.
     public func writeRawRecord(at recordNumber: UInt64, postFixupBytes: Data) async throws {
         let recordSize = UInt64(volume.mftRecordSizeBytes)
         let sectorSize = Int(volume.boot.bytesPerSector)
@@ -80,27 +89,47 @@ public final class MFT: Sendable {
                 description: "writeRawRecord: bytes \(postFixupBytes.count) != record size \(recordSize)"
             )
         }
-        let (offsetProduct, mulOverflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
-        guard !mulOverflow else {
-            throw NTFSError.corruptOnDisk(description: "writeRawRecord: overflow")
-        }
-        let (byteOffset, addOverflow) = volume.mftByteOffset.addingReportingOverflow(offsetProduct)
-        guard !addOverflow else {
-            throw NTFSError.corruptOnDisk(description: "writeRawRecord: byte offset overflows")
-        }
 
-        // Need usaOffset + usaCount to drive the reversal. Read them from
-        // the in-memory bytes (header always contains them).
         let usaOffset = try postFixupBytes.readU16LE(at: 4)
         let usaCount  = try postFixupBytes.readU16LE(at: 6)
-
         let onDisk = try UpdateSequenceArray.reverseFixup(
             recordBytes: postFixupBytes,
             usaOffset: Int(usaOffset),
             usaCount: Int(usaCount),
             blockSize: sectorSize
         )
-        try await volume.device.write(offset: byteOffset, bytes: onDisk)
+
+        // Primary write into $MFT.
+        let primaryOffset = try mftRecordByteOffset(recordNumber: recordNumber)
+        try await volume.device.write(offset: primaryOffset, bytes: onDisk)
+
+        // Mirror write into $MFTMirr for records 0-3.
+        if recordNumber < Self.mirroredRecordCount {
+            let mirrorBase = UInt64(volume.boot.mftMirrorCluster) * UInt64(volume.bytesPerCluster)
+            let (offsetInMirror, overflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
+            guard !overflow else {
+                throw NTFSError.corruptOnDisk(description: "writeRawRecord: mirror offset overflow")
+            }
+            try await volume.device.write(offset: mirrorBase + offsetInMirror, bytes: onDisk)
+        }
+    }
+
+    /// Resolve an MFT byte offset for a given record number, with overflow
+    /// guards. Pulled out so writeRecord and writeRawRecord share the
+    /// boundary checks.
+    private func mftRecordByteOffset(recordNumber: UInt64) throws -> UInt64 {
+        let recordSize = UInt64(volume.mftRecordSizeBytes)
+        let (offsetProduct, mulOverflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
+        guard !mulOverflow else {
+            throw NTFSError.corruptOnDisk(
+                description: "mftRecordByteOffset: record number \(recordNumber) * size \(recordSize) overflows"
+            )
+        }
+        let (byteOffset, addOverflow) = volume.mftByteOffset.addingReportingOverflow(offsetProduct)
+        guard !addOverflow else {
+            throw NTFSError.corruptOnDisk(description: "mftRecordByteOffset: byte offset overflows UInt64")
+        }
+        return byteOffset
     }
 
     /// Read and parse the MFT record at `recordNumber`.
