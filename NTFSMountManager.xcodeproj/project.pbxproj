@@ -16,6 +16,7 @@
 		4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 138AC53F11BB4630926D3661 /* MenuBarContent.swift */; };
 		53A681659B3739644B432A50 /* Truncate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62C008E3A77CB7E1A8D38487 /* Truncate.swift */; };
 		54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */; };
+		55282FEDBAEF76F7172E5825 /* SetDirty.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DE33D7BA5684962834C762F /* SetDirty.swift */; };
 		5F4936483FEF4613A8864F81 /* Create.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFA3E28642F4967D00BBD28 /* Create.swift */; };
 		7D4143F793CD345F7651B4B1 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */; };
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
@@ -75,6 +76,7 @@
 		82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = NTFSFileSystem.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		82E0F813FDD6E122C9D24085 /* Write.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Write.swift; sourceTree = "<group>"; };
 		8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSMountManagerApp.swift; sourceTree = "<group>"; };
+		8DE33D7BA5684962834C762F /* SetDirty.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetDirty.swift; sourceTree = "<group>"; };
 		8FFA3E28642F4967D00BBD28 /* Create.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Create.swift; sourceTree = "<group>"; };
 		9C014D4357F452F985A593B1 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
 		C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSVolume.swift; sourceTree = "<group>"; };
@@ -200,6 +202,7 @@
 				4126B01F860CB4A427613EB6 /* Info.swift */,
 				1B9DB06823B01F8100989970 /* List.swift */,
 				D05B381FF347C123E61FD621 /* ntfsctl.swift */,
+				8DE33D7BA5684962834C762F /* SetDirty.swift */,
 				62C008E3A77CB7E1A8D38487 /* Truncate.swift */,
 				20E22577EA73CB6742243E11 /* Verify.swift */,
 				82E0F813FDD6E122C9D24085 /* Write.swift */,
@@ -370,6 +373,7 @@
 				11CB6DA3EB985C6BC4F34535 /* Delete.swift in Sources */,
 				21A4A75C7F50E50DA8213556 /* Info.swift in Sources */,
 				B2FACFD1EEA0B776368CEC67 /* List.swift in Sources */,
+				55282FEDBAEF76F7172E5825 /* SetDirty.swift in Sources */,
 				53A681659B3739644B432A50 /* Truncate.swift in Sources */,
 				A283CF3E3376BC4686313635 /* Verify.swift in Sources */,
 				F53D207E8209413C3BDB1B68 /* Write.swift in Sources */,

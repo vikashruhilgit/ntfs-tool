@@ -12,6 +12,6 @@ struct Ntfsctl: AsyncParsableCommand {
             Read-only in v1; write subcommands land with Block G.
             """,
         version: "0.1.0",
-        subcommands: [Info.self, List.self, Verify.self, Cat.self, Create.self, Delete.self, Write.self, Truncate.self]
+        subcommands: [Info.self, List.self, Verify.self, Cat.self, Create.self, Delete.self, Write.self, Truncate.self, SetDirty.self]
     )
 }

@@ -173,7 +173,34 @@ final class NTFSVolume: FSVolume,
         on item: FSItem,
         replyHandler reply: @escaping @Sendable (FSItem.Attributes?, Error?) -> Void
     ) {
-        reply(nil, posixError(EROFS))
+        guard let ntfsItem = item as? NTFSItem else {
+            reply(nil, posixError(EBADF))
+            return
+        }
+
+        // Block G stage 5 supports only the size attribute (truncate). Other
+        // mutations (uid/gid/mode/timestamps) come later — return EPERM so
+        // the kernel knows we acknowledged but won't honor the change.
+        let wantsSize = newAttributes.consumedAttributes.contains(.size)
+
+        Task {
+            do {
+                if wantsSize {
+                    try await self.coreVolume.truncate(
+                        at: ntfsItem.recordNumber,
+                        newSize: newAttributes.size
+                    )
+                    try? await self.coreVolume.setDirty(false)
+                }
+                // Return refreshed attributes so the kernel sees the new size.
+                let fresh = try await ntfsItem.makeFreshAttributes(volume: self)
+                reply(fresh, nil)
+            } catch NTFSError.unsupportedFeature {
+                reply(nil, self.posixError(ENOTSUP))
+            } catch {
+                reply(nil, error)
+            }
+        }
     }
 
     func lookupItem(
@@ -224,7 +251,49 @@ final class NTFSVolume: FSVolume,
         attributes newAttributes: FSItem.SetAttributesRequest,
         replyHandler reply: @escaping @Sendable (FSItem?, FSFileName?, Error?) -> Void
     ) {
-        reply(nil, nil, posixError(EROFS))
+        // Block G stage 5: wire FSKit createItem onto NTFSCore.createFile.
+        // Only file + directory item types — symlinks come later.
+        guard type == .file || type == .directory else {
+            reply(nil, nil, posixError(EINVAL))
+            return
+        }
+        guard let parent = directory as? NTFSItem, parent.isDirectory else {
+            reply(nil, nil, posixError(ENOTDIR))
+            return
+        }
+        guard let nameString = name.string else {
+            reply(nil, nil, posixError(EINVAL))
+            return
+        }
+
+        Task {
+            do {
+                let recordNumber = try await self.coreVolume.createFile(
+                    named: nameString,
+                    inDirectory: parent.recordNumber,
+                    isDirectory: type == .directory
+                )
+                // Clear the dirty bit after a successful mutation.
+                try? await self.coreVolume.setDirty(false)
+                // Refresh the parent's child list, find our new entry, build
+                // an NTFSItem from the parsed DirectoryEntry.
+                let entries = try await self.coreVolume.enumerate(directory: parent.recordNumber)
+                guard let entry = entries.first(where: { $0.recordNumber == recordNumber }) else {
+                    reply(nil, nil, self.posixError(EIO))
+                    return
+                }
+                let item = NTFSItem.from(entry)
+                self.cache(item)
+                reply(item, FSFileName(string: nameString), nil)
+            } catch NTFSError.unsupportedFeature {
+                // LARGE_INDEX parent or other unsupported configuration —
+                // surface as POSIX ENOTSUP so the kernel knows it's a
+                // missing feature not a permanent error.
+                reply(nil, nil, self.posixError(ENOTSUP))
+            } catch {
+                reply(nil, nil, error)
+            }
+        }
     }
 
     func createSymbolicLink(
@@ -252,7 +321,22 @@ final class NTFSVolume: FSVolume,
         fromDirectory directory: FSItem,
         replyHandler reply: @escaping @Sendable (Error?) -> Void
     ) {
-        reply(posixError(EROFS))
+        guard let ntfsItem = item as? NTFSItem else {
+            reply(posixError(EBADF))
+            return
+        }
+        Task {
+            do {
+                try await self.coreVolume.deleteFile(at: ntfsItem.recordNumber)
+                try? await self.coreVolume.setDirty(false)
+                self.cacheQueue.sync { _ = self.itemCache.removeValue(forKey: ntfsItem.recordNumber) }
+                reply(nil)
+            } catch NTFSError.unsupportedFeature {
+                reply(self.posixError(ENOTSUP))
+            } catch {
+                reply(error)
+            }
+        }
     }
 
     func renameItem(
@@ -371,7 +455,29 @@ final class NTFSVolume: FSVolume,
         at offset: off_t,
         replyHandler reply: @escaping @Sendable (Int, Error?) -> Void
     ) {
-        reply(0, posixError(EROFS))
+        guard let ntfsItem = item as? NTFSItem, !ntfsItem.isDirectory else {
+            reply(0, posixError(EISDIR))
+            return
+        }
+        if offset < 0 {
+            reply(0, posixError(EINVAL))
+            return
+        }
+        Task {
+            do {
+                try await self.coreVolume.write(
+                    at: ntfsItem.recordNumber,
+                    offset: UInt64(offset),
+                    bytes: contents
+                )
+                try? await self.coreVolume.setDirty(false)
+                reply(contents.count, nil)
+            } catch NTFSError.unsupportedFeature {
+                reply(0, self.posixError(ENOTSUP))
+            } catch {
+                reply(0, error)
+            }
+        }
     }
 
     // MARK: - FSVolume.OpenCloseOperations
@@ -381,12 +487,15 @@ final class NTFSVolume: FSVolume,
         modes: FSVolume.OpenModes,
         replyHandler reply: @escaping @Sendable (Error?) -> Void
     ) {
-        // Read-only: reject any open with write intent.
-        if modes.contains(.write) {
+        // Block G stage 5: writes are wired up at the volume level. Accept
+        // any open mode; individual mutating callbacks still gate on item
+        // type + reserved-record checks via NTFSCore. If the volume was
+        // explicitly opened read-only by FSKit, reject writes here.
+        if modes.contains(.write) && self.isReadOnly {
             reply(posixError(EROFS))
-        } else {
-            reply(nil)
+            return
         }
+        reply(nil)
     }
 
     func closeItem(

@@ -562,6 +562,113 @@ public actor Volume {
         return MFTRecordBuilder.windowsFiletime(from: date)
     }
 
+    // MARK: — Block G stage 5: $Volume dirty-bit management
+
+    /// MFT record number of the $Volume system file. Always 3 per NTFS spec.
+    public static let volumeRecordNumber: UInt64 = 3
+
+    /// Read the current $VOLUME_INFORMATION attribute. Cheap — small resident
+    /// 12-byte attribute on a record we touch rarely.
+    public func volumeInformation() async throws -> VolumeInformation {
+        let mft = self.mft()
+        let record = try await mft.record(at: Self.volumeRecordNumber)
+        let attrs = try record.attributes()
+        // $VOLUME_INFORMATION = attribute type 0x70.
+        guard let attr = attrs.first(where: { $0.rawType == 0x70 }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "$Volume record \(Self.volumeRecordNumber) lacks $VOLUME_INFORMATION"
+            )
+        }
+        guard case let .resident(bytes, _) = attr.value else {
+            throw NTFSError.corruptOnDisk(description: "$VOLUME_INFORMATION must be resident")
+        }
+        return try VolumeInformation.parse(bytes)
+    }
+
+    /// Whether the volume's "needs recovery" flag is set. NTFS sets this on
+    /// mount and clears it on clean unmount; chkdsk / ntfsfix check it first
+    /// when deciding whether to scan.
+    public func isDirty() async throws -> Bool {
+        try await volumeInformation().flags.contains(.isDirty)
+    }
+
+    /// Set or clear the $VOLUME_INFORMATION dirty bit. After every batch of
+    /// writes is complete, callers should `setDirty(false)` so that chkdsk /
+    /// ntfsfix treat the volume as cleanly-unmounted.
+    public func setDirty(_ dirty: Bool) async throws {
+        let mft = self.mft()
+        let record = try await mft.record(at: Self.volumeRecordNumber)
+        let attrs = try record.attributes()
+        guard let attr = attrs.first(where: { $0.rawType == 0x70 }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "setDirty: $VOLUME_INFORMATION not found in $Volume record"
+            )
+        }
+        guard case let .resident(bytes, _) = attr.value else {
+            throw NTFSError.corruptOnDisk(description: "setDirty: $VOLUME_INFORMATION must be resident")
+        }
+        let current = try VolumeInformation.parse(bytes)
+        let updated = current.setting(.isDirty, to: dirty)
+        let newAttrBytes = serializeResidentAttribute(
+            type: 0x70,
+            attrID: attr.header.attributeID,
+            flags: attr.header.flags,
+            attributeName: "",
+            value: updated.serialize()
+        )
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: 0x70,
+            attributeName: "",
+            replacementBytes: newAttrBytes
+        )
+        let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
+        guard let newUsedSize = newUsedSize else {
+            throw NTFSError.corruptOnDisk(description: "setDirty: rewritten record has no end marker")
+        }
+        var updatedBytes = newRecordBytes
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        try await mft.writeRawRecord(at: Self.volumeRecordNumber, postFixupBytes: updatedBytes)
+    }
+
+    /// Generic resident-attribute serializer (no name). Variant of the
+    /// $DATA-specific one used by Stage 4; this one is parameterized over
+    /// type. Used by setDirty's $VOLUME_INFORMATION rewrite.
+    private func serializeResidentAttribute(
+        type: UInt32,
+        attrID: UInt16,
+        flags: UInt16,
+        attributeName: String,
+        value: Data
+    ) -> Data {
+        let nameByteCount = attributeName.utf16.count * 2
+        let bodyLen = value.count
+        let rawLen = 16 + 8 + nameByteCount + bodyLen
+        let alignedLen = ((rawLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: type)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 0
+        data[data.startIndex + 9] = UInt8(attributeName.utf16.count)
+        MFTRecord.writeU16LE(into: &data, at: 10, value: nameByteCount > 0 ? 24 : 0)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: flags)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        MFTRecord.writeU32LE(into: &data, at: 16, value: UInt32(bodyLen))
+        let valueOffset: UInt16 = UInt16(24 + nameByteCount)
+        MFTRecord.writeU16LE(into: &data, at: 20, value: valueOffset)
+        for (i, codeUnit) in attributeName.utf16.enumerated() {
+            data[data.startIndex + 24 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[data.startIndex + 24 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        for (i, byte) in value.enumerated() {
+            data[data.startIndex + Int(valueOffset) + i] = byte
+        }
+        return data
+    }
+
     // MARK: — Block G stage 4: file write + truncate
 
     /// Threshold for keeping $DATA resident. Below this we keep it inline in
