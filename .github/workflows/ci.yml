@@ -99,3 +99,43 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Build ntfsctl (CLI)
+        run: |
+          xcodebuild -project NTFSMountManager.xcodeproj \
+            -scheme ntfsctl \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath .build/Xcode \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+  ntfsctl-test:
+    name: ntfsctl smoke (swift run against fixture)
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: Tools/ntfsctl
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.3+
+        run: |
+          set -e
+          if [ -d "/Applications/Xcode_16.3.app" ]; then
+            sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer
+          else
+            sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+          fi
+
+      - name: swift build
+        run: swift build
+
+      - name: ntfsctl info on the committed fixture
+        run: |
+          .build/debug/ntfsctl info ../../Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+          .build/debug/ntfsctl list ../../Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+          .build/debug/ntfsctl verify ../../Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img

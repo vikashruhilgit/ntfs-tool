@@ -13,6 +13,14 @@ final class ExtensionInstaller: NSObject, ObservableObject {
     @Published var status: String = "Idle — not yet activated this session."
     @Published var isWorking: Bool = false
 
+    /// Short summary suitable for menu-bar display.
+    var shortStatus: String {
+        if isWorking { return "working…" }
+        if status.contains("activated") { return "activated" }
+        if status.contains("failed") { return "failed" }
+        return "idle"
+    }
+
     func activate() {
         isWorking = true
         status = "Submitting activation request…"
