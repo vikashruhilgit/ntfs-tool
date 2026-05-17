@@ -26,22 +26,25 @@ struct List: AsyncParsableCommand {
         let canonical = entries.filter { $0.fileName.namespace != .dos }
 
         if long {
-            print(String(format: "%-10s %-12s %-12s %s", "RECNUM", "SIZE", "NAMESPACE", "NAME"))
+            print(padRight("RECNUM", 10) + padRight("SIZE", 12) + padRight("NAMESPACE", 12) + "NAME")
             for e in canonical {
                 let typeMarker = e.isDirectory ? "/" : ""
-                print(String(
-                    format: "%-10llu %-12llu %-12s %s%s",
-                    e.recordNumber,
-                    e.fileName.realSize,
-                    "\(e.fileName.namespace)",
-                    e.name,
-                    typeMarker
-                ))
+                print(
+                    padRight(String(e.recordNumber), 10) +
+                    padRight(String(e.fileName.realSize), 12) +
+                    padRight(String(describing: e.fileName.namespace), 12) +
+                    e.name + typeMarker
+                )
             }
         } else {
             for e in canonical {
                 print(e.name + (e.isDirectory ? "/" : ""))
             }
         }
+    }
+
+    private func padRight(_ s: String, _ width: Int) -> String {
+        if s.count >= width { return s + " " }
+        return s + String(repeating: " ", count: width - s.count)
     }
 }
