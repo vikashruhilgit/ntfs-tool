@@ -135,16 +135,22 @@ public actor Volume {
         )
     }
 
-    /// Create a new file or directory in MFT (Stage 3a — MFT-level only).
+    /// Create a new file or directory.
     ///
-    /// Allocates a free MFT slot, builds a fresh record via MFTRecordBuilder
-    /// with $STANDARD_INFORMATION + $FILE_NAME(parentRef) + empty $DATA, and
-    /// writes it back to disk. **Does NOT yet update the parent directory's
-    /// $I30 index** — the file is reachable by record number (via the
-    /// MFT.record(at:) API or ntfsctl `cat`) but not by name through
-    /// enumerate(). Stage 3b adds the $I30 wiring.
+    /// Stage 3b complete: allocates an MFT slot, builds a fresh record
+    /// (\$STANDARD_INFORMATION + \$FILE_NAME(parentRef) + empty \$DATA),
+    /// writes it to disk, AND inserts the matching entry into the parent
+    /// directory's \$I30 index so the new file is visible to enumerate()
+    /// (and Finder, once mounted).
     ///
-    /// Returns the assigned record number.
+    /// Limitations:
+    /// - Parent's `$INDEX_ROOT:$I30` must be small enough to absorb the
+    ///   new entry without overflowing the MFT record. LARGE_INDEX
+    ///   directories that already have an `$INDEX_ALLOCATION` extension
+    ///   are rejected with `unsupportedFeature` — that's a future stage.
+    /// - If the new entry would overflow the parent record, we roll back
+    ///   the MFT allocation and throw `unsupportedFeature` rather than
+    ///   leaving an orphan record.
     public func createFile(
         named name: String,
         inDirectory parentRecordNumber: UInt64 = 5,
@@ -166,6 +172,7 @@ public actor Volume {
         let parent = try await mft.record(at: parentRecordNumber)
         let parentRef = (UInt64(parent.sequenceNumber) << 48) | (parentRecordNumber & 0x0000_FFFF_FFFF_FFFF)
 
+        // 1) Write the new MFT record first so we know the slot is durably ours.
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -178,15 +185,419 @@ public actor Volume {
         let recordBytes = try builder.build()
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: recordBytes)
 
+        // 2) Insert into parent's $I30. If this fails (overflow / LARGE_INDEX
+        //    rejection), roll back the MFT write by zeroing IN_USE on the
+        //    new record so we don't leave an orphan.
+        do {
+            try await insertIntoParentI30(
+                parentRecordNumber: parentRecordNumber,
+                childRecordNumber: recordNumber,
+                childSequence: newSequence,
+                childFileName: name,
+                isDirectory: isDirectory,
+                nowFiletime: MFTRecordBuilder.windowsFiletimeNow()
+            )
+        } catch {
+            // Roll back the orphan record so the volume stays consistent.
+            try? await deleteOrphan(at: recordNumber)
+            throw error
+        }
+
         return recordNumber
     }
 
-    /// Delete a file (Stage 3a — MFT-level only).
+    /// Rebuild the parent's MFT record with the inserted child entry in its
+    /// $INDEX_ROOT:$I30. Pure resident-only path: rejects LARGE_INDEX dirs
+    /// and rejects when the rewritten attribute doesn't fit in the parent
+    /// record's slack space.
+    private func insertIntoParentI30(
+        parentRecordNumber: UInt64,
+        childRecordNumber: UInt64,
+        childSequence: UInt16,
+        childFileName: String,
+        isDirectory: Bool,
+        nowFiletime: UInt64
+    ) async throws {
+        let mft = self.mft()
+        let parent = try await mft.record(at: parentRecordNumber)
+        let attrs = try parent.attributes()
+
+        guard let indexRootAttr = attrs.first(where: {
+            $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
+        }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "parent record \(parentRecordNumber) lacks $INDEX_ROOT:$I30"
+            )
+        }
+        guard case let .resident(rootBytes, _) = indexRootAttr.value else {
+            throw NTFSError.corruptOnDisk(description: "$INDEX_ROOT:$I30 must be resident")
+        }
+        let root = try IndexRoot.parse(rootBytes)
+        if root.isLargeIndex {
+            throw NTFSError.unsupportedFeature(
+                description: "parent directory has LARGE_INDEX ($INDEX_ALLOCATION) — insert path not yet supported"
+            )
+        }
+
+        // Existing entries → (fileRef, fileNameBody) pairs we can re-serialize.
+        var entries: [(fileReference: UInt64, fileNameBody: Data, sortKey: String)] = []
+        for entry in root.entries {
+            guard !entry.isLast, let fn = entry.fileName else { continue }
+            // Slice the original key bytes out of rootBytes via the entry's
+            // computed offsets. The keyLength is the in-memory entry.keyLength;
+            // the body sits at the entry's first byte + 16.
+            // We have the parsed FileName but not the raw bytes — re-serialize
+            // a $FILE_NAME body from the parsed fields. Lossy for fields we
+            // don't expose (DOS extended flags), but Stage 3b doesn't need
+            // those — they're regenerated on next Windows mount anyway.
+            let body = reserializeFileNameBody(fn)
+            entries.append((entry.fileReference, body, fn.name))
+        }
+
+        // Build the new entry's $FILE_NAME body (parent ref points at PARENT,
+        // not at the child — that's how $I30 keys are structured).
+        let parentRef = (UInt64(parent.sequenceNumber) << 48) | (parentRecordNumber & 0x0000_FFFF_FFFF_FFFF)
+        let childRef  = (UInt64(childSequence) << 48) | (childRecordNumber & 0x0000_FFFF_FFFF_FFFF)
+        let childBody = buildFileNameBody(
+            parentReference: parentRef,
+            fileName: childFileName,
+            isDirectory: isDirectory,
+            nowFiletime: nowFiletime
+        )
+        entries.append((childRef, childBody, childFileName))
+
+        // Sort by NTFS COLLATION_FILENAME (case-insensitive uppercase).
+        entries.sort { IndexBuilder.collationFilenameSortsBefore($0.sortKey, $1.sortKey) }
+
+        // Build new $INDEX_ROOT body.
+        let newRootBody = IndexBuilder.buildIndexRootBody(
+            indexAllocationBlockSize: root.indexAllocationBlockSize,
+            clustersPerIndexBlock: root.clustersPerIndexBlock,
+            sortedEntries: entries.map { ($0.fileReference, $0.fileNameBody) }
+        )
+
+        // Re-flow the parent MFT record around the new $INDEX_ROOT size.
+        let newParentBytes = try rewriteResidentAttribute(
+            in: parent.bytes,
+            firstAttributeOffset: Int(parent.firstAttributeOffset),
+            usedSize: Int(parent.usedSize),
+            recordSize: Int(parent.allocatedSize),
+            replacingType: AttributeType.indexRoot.rawValue,
+            attributeName: "$I30",
+            newValueBytes: newRootBody
+        )
+
+        // Header.usedSize must be updated too — it's the byte position of the
+        // 4-byte end marker, which shifts when the $INDEX_ROOT body resizes.
+        let newUsedSize = locateEndMarker(in: newParentBytes, fromOffset: Int(parent.firstAttributeOffset))
+        guard let newUsedSize = newUsedSize else {
+            throw NTFSError.corruptOnDisk(description: "rewritten parent record has no end marker")
+        }
+
+        var updatedBytes = newParentBytes
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+
+        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: updatedBytes)
+    }
+
+    /// Remove an entry from the parent's `$I30` (by name match). Same
+    /// resident-only constraints as insert: LARGE_INDEX directories are
+    /// rejected. Idempotent — silently no-op if the name isn't found.
+    private func removeFromParentI30(
+        parentRecordNumber: UInt64,
+        childFileName: String
+    ) async throws {
+        let mft = self.mft()
+        let parent = try await mft.record(at: parentRecordNumber)
+        let attrs = try parent.attributes()
+
+        guard let indexRootAttr = attrs.first(where: {
+            $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
+        }) else {
+            return  // can't find index — nothing to remove
+        }
+        guard case let .resident(rootBytes, _) = indexRootAttr.value else {
+            return
+        }
+        let root = try IndexRoot.parse(rootBytes)
+        if root.isLargeIndex {
+            throw NTFSError.unsupportedFeature(
+                description: "parent directory has LARGE_INDEX — remove path not yet supported"
+            )
+        }
+
+        var entries: [(fileReference: UInt64, fileNameBody: Data, sortKey: String)] = []
+        var removedAny = false
+        for entry in root.entries {
+            guard !entry.isLast, let fn = entry.fileName else { continue }
+            if fn.name == childFileName && fn.namespace != .dos {
+                removedAny = true
+                continue
+            }
+            entries.append((entry.fileReference, reserializeFileNameBody(fn), fn.name))
+        }
+        guard removedAny else { return }
+
+        entries.sort { IndexBuilder.collationFilenameSortsBefore($0.sortKey, $1.sortKey) }
+
+        let newRootBody = IndexBuilder.buildIndexRootBody(
+            indexAllocationBlockSize: root.indexAllocationBlockSize,
+            clustersPerIndexBlock: root.clustersPerIndexBlock,
+            sortedEntries: entries.map { ($0.fileReference, $0.fileNameBody) }
+        )
+
+        let newParentBytes = try rewriteResidentAttribute(
+            in: parent.bytes,
+            firstAttributeOffset: Int(parent.firstAttributeOffset),
+            usedSize: Int(parent.usedSize),
+            recordSize: Int(parent.allocatedSize),
+            replacingType: AttributeType.indexRoot.rawValue,
+            attributeName: "$I30",
+            newValueBytes: newRootBody
+        )
+        let newUsedSize = locateEndMarker(in: newParentBytes, fromOffset: Int(parent.firstAttributeOffset))
+        guard let newUsedSize = newUsedSize else {
+            throw NTFSError.corruptOnDisk(description: "rewritten parent record has no end marker")
+        }
+
+        var updatedBytes = newParentBytes
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+
+        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: updatedBytes)
+    }
+
+    /// Find the end marker (0xFFFFFFFF type field) starting from `from
+    /// Offset`. Returns the offset of the end marker's first byte, or nil
+    /// if no end marker is found.
+    private func locateEndMarker(in data: Data, fromOffset: Int) -> Int? {
+        var cursor = fromOffset
+        while cursor + 4 <= data.count {
+            let type = try? data.readU32LE(at: cursor)
+            if type == AttributeType.endMarker { return cursor }
+            // Walk to next attribute via its length field.
+            guard cursor + 8 <= data.count,
+                  let length = try? data.readU32LE(at: cursor + 4),
+                  length >= 16 else {
+                return nil
+            }
+            cursor += Int(length)
+        }
+        return nil
+    }
+
+    /// Replace a resident attribute's body with new bytes. Walks the record's
+    /// attribute chain to find the target, computes the new length, shifts
+    /// all subsequent attributes by the delta, and updates the target
+    /// attribute's length + value-length fields. Rejects if the new total
+    /// would overflow the record's allocatedSize.
+    private func rewriteResidentAttribute(
+        in originalBytes: Data,
+        firstAttributeOffset: Int,
+        usedSize: Int,
+        recordSize: Int,
+        replacingType: UInt32,
+        attributeName: String,
+        newValueBytes: Data
+    ) throws -> Data {
+        // Locate the target attribute.
+        var cursor = firstAttributeOffset
+        var targetStart: Int?
+        var targetOldLength: Int = 0
+        while cursor + 4 <= usedSize {
+            let type = try originalBytes.readU32LE(at: cursor)
+            if type == AttributeType.endMarker { break }
+            guard cursor + 16 <= usedSize else { break }
+            let length = Int(try originalBytes.readU32LE(at: cursor + 4))
+
+            // Name match.
+            let nameLength = try originalBytes.readU8(at: cursor + 9)
+            let nameOffset = try originalBytes.readU16LE(at: cursor + 10)
+            var thisName = ""
+            if nameLength > 0 {
+                let nameByteCount = Int(nameLength) * 2
+                let nameStart = cursor + Int(nameOffset)
+                let nameBytes = originalBytes[(originalBytes.startIndex + nameStart)..<(originalBytes.startIndex + nameStart + nameByteCount)]
+                thisName = decodeUTF16LE(nameBytes) ?? ""
+            }
+
+            if type == replacingType && thisName == attributeName {
+                targetStart = cursor
+                targetOldLength = length
+                break
+            }
+            cursor += length
+        }
+        guard let targetStart = targetStart else {
+            throw NTFSError.corruptOnDisk(
+                description: "rewriteResidentAttribute: target type 0x\(String(format: "%08X", replacingType)) name '\(attributeName)' not found"
+            )
+        }
+
+        // Compute new attribute length: 16 common header + 8 resident ext +
+        // attribute name bytes + body bytes, 8-byte aligned. The name bytes
+        // are CRITICAL — forgetting them is the silent off-by-N bug that
+        // makes the rewritten attribute appear truncated to attribute
+        // iteration.
+        let newBodyLength = newValueBytes.count
+        let nameByteCount = Int(attributeName.utf16.count) * 2
+        let newAttrRawLength = 16 + 8 + nameByteCount + newBodyLength
+        let newAttrLength = ((newAttrRawLength + 7) / 8) * 8
+
+        // Compute new record byte usage and reject if it overflows.
+        let delta = newAttrLength - targetOldLength
+        let newUsedSize = usedSize + delta
+        guard newUsedSize + 4 <= recordSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "rewriteResidentAttribute: new attribute (\(newAttrLength) bytes) would overflow parent record (used \(usedSize), record \(recordSize))"
+            )
+        }
+
+        // Build new record bytes.
+        var out = Data(count: recordSize)
+        // Copy header + USA + everything up to target start.
+        for i in 0..<targetStart {
+            out[out.startIndex + i] = originalBytes[originalBytes.startIndex + i]
+        }
+
+        // Write the new attribute at targetStart.
+        MFTRecord.writeU32LE(into: &out, at: targetStart + 0,  value: replacingType)
+        MFTRecord.writeU32LE(into: &out, at: targetStart + 4,  value: UInt32(newAttrLength))
+        out[out.startIndex + targetStart + 8]  = 0    // resident
+        out[out.startIndex + targetStart + 9]  = UInt8(attributeName.utf16.count)
+        let nameOffset: UInt16 = 24   // resident ext is 8 bytes; name goes right after
+        // For $INDEX_ROOT (the only attribute we rewrite), $I30 name lives between resident ext + value.
+        // Place name immediately after resident ext (offset 24), then value after the name.
+        let actualValueOffset: UInt16 = UInt16(24 + nameByteCount)
+        MFTRecord.writeU16LE(into: &out, at: targetStart + 10, value: nameOffset)
+        // Re-read original flags + attrID for the rewritten attribute
+        let origFlags = try originalBytes.readU16LE(at: targetStart + 12)
+        let origAttrID = try originalBytes.readU16LE(at: targetStart + 14)
+        MFTRecord.writeU16LE(into: &out, at: targetStart + 12, value: origFlags)
+        MFTRecord.writeU16LE(into: &out, at: targetStart + 14, value: origAttrID)
+
+        // Resident extension at +16.
+        MFTRecord.writeU32LE(into: &out, at: targetStart + 16, value: UInt32(newBodyLength))
+        MFTRecord.writeU16LE(into: &out, at: targetStart + 20, value: actualValueOffset)
+        out[out.startIndex + targetStart + 22] = 0
+        out[out.startIndex + targetStart + 23] = 0
+
+        // Name bytes at +24 (if name length > 0)
+        for (i, codeUnit) in attributeName.utf16.enumerated() {
+            out[out.startIndex + targetStart + 24 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            out[out.startIndex + targetStart + 24 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+
+        // Value bytes at targetStart + actualValueOffset
+        for (i, byte) in newValueBytes.enumerated() {
+            out[out.startIndex + targetStart + Int(actualValueOffset) + i] = byte
+        }
+        // Padding to newAttrLength stays zero.
+
+        // Tail: everything after the old attribute, shifted by delta.
+        let tailStart = targetStart + targetOldLength
+        let tailEnd = usedSize + 4    // include end marker
+        let newTailStart = targetStart + newAttrLength
+        for i in 0..<(tailEnd - tailStart) {
+            out[out.startIndex + newTailStart + i] = originalBytes[originalBytes.startIndex + tailStart + i]
+        }
+
+        return out
+    }
+
+    /// Re-serialize a parsed FileName back into a $FILE_NAME body. Slightly
+    /// lossy — we don't preserve EA/reparse fields (we don't expose them),
+    /// but that's harmless on Windows since they get regenerated.
+    private func reserializeFileNameBody(_ fn: FileName) -> Data {
+        let nameUTF16 = Array(fn.name.utf16)
+        let nameByteCount = nameUTF16.count * 2
+        var data = Data(count: 66 + nameByteCount)
+        MFTRecord.writeU64LE(into: &data, at: 0,  value: fn.parentDirectoryReference)
+        MFTRecord.writeU64LE(into: &data, at: 8,  value: filetimeFromDate(fn.creationTime))
+        MFTRecord.writeU64LE(into: &data, at: 16, value: filetimeFromDate(fn.modificationTime))
+        MFTRecord.writeU64LE(into: &data, at: 24, value: filetimeFromDate(fn.mftChangeTime))
+        MFTRecord.writeU64LE(into: &data, at: 32, value: filetimeFromDate(fn.accessTime))
+        MFTRecord.writeU64LE(into: &data, at: 40, value: fn.allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: fn.realSize)
+        MFTRecord.writeU32LE(into: &data, at: 56, value: fn.fileAttributes)
+        MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
+        data[64] = UInt8(nameUTF16.count)
+        data[65] = fn.namespace.rawValue
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        return data
+    }
+
+    /// Build a $FILE_NAME body for a brand-new entry being inserted into $I30.
+    private func buildFileNameBody(
+        parentReference: UInt64,
+        fileName: String,
+        isDirectory: Bool,
+        nowFiletime: UInt64
+    ) -> Data {
+        let nameUTF16 = Array(fileName.utf16)
+        let nameByteCount = nameUTF16.count * 2
+        var data = Data(count: 66 + nameByteCount)
+        MFTRecord.writeU64LE(into: &data, at: 0,  value: parentReference)
+        MFTRecord.writeU64LE(into: &data, at: 8,  value: nowFiletime)
+        MFTRecord.writeU64LE(into: &data, at: 16, value: nowFiletime)
+        MFTRecord.writeU64LE(into: &data, at: 24, value: nowFiletime)
+        MFTRecord.writeU64LE(into: &data, at: 32, value: nowFiletime)
+        MFTRecord.writeU64LE(into: &data, at: 40, value: 0)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: 0)
+        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0000 : 0)
+        MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
+        data[64] = UInt8(nameUTF16.count)
+        data[65] = 1  // Win32 namespace
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        return data
+    }
+
+    private func filetimeFromDate(_ date: Date?) -> UInt64 {
+        guard let date = date else { return 0 }
+        return MFTRecordBuilder.windowsFiletime(from: date)
+    }
+
+    /// Roll back an MFT record allocation by flipping IN_USE off — used by
+    /// createFile's error handler when the $I30 insert fails. Doesn't try to
+    /// free clusters (the new record is empty resident $DATA only) and
+    /// doesn't update the parent (this is the rollback path called after
+    /// the parent update itself failed).
+    private func deleteOrphan(at recordNumber: UInt64) async throws {
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else { return }
+        var newFlags = record.flags
+        newFlags.remove(.inUse)
+        let updated = MFTRecord(
+            magic: record.magic,
+            usaOffset: record.usaOffset,
+            usaCount: record.usaCount,
+            logFileSequenceNumber: record.logFileSequenceNumber,
+            sequenceNumber: record.sequenceNumber,
+            hardLinkCount: record.hardLinkCount,
+            firstAttributeOffset: record.firstAttributeOffset,
+            flags: newFlags,
+            usedSize: record.usedSize,
+            allocatedSize: record.allocatedSize,
+            baseFileReference: record.baseFileReference,
+            nextAttributeID: record.nextAttributeID,
+            mftRecordNumber: record.mftRecordNumber,
+            bytes: record.bytes
+        )
+        try await mft.writeRecord(at: recordNumber, updated)
+    }
+
+    /// Delete a file. Stage 3b complete: frees non-resident clusters, marks
+    /// the MFT record IN_USE=0, bumps the sequence number, AND removes the
+    /// corresponding entry from the parent directory's $I30 index.
     ///
-    /// Reads the file's MFT record, frees any non-resident clusters via the
-    /// $Bitmap allocator, marks the record IN_USE=0 + bumps the sequence
-    /// number, and writes it back. **Does NOT yet update the parent
-    /// directory's $I30 index** (Stage 3b).
+    /// Idempotent — deleting an already-deleted record is a no-op rather
+    /// than an error.
     public func deleteFile(at recordNumber: UInt64) async throws {
         // Don't allow deleting NTFS system records.
         guard recordNumber >= MFT.firstUserRecord else {
@@ -199,8 +610,30 @@ public actor Volume {
         let record = try await mft.record(at: recordNumber)
         guard record.isInUse else { return }  // already deleted — idempotent
 
-        // Free non-resident clusters.
+        // Find the parent record number from the file's $FILE_NAME so we can
+        // remove the corresponding $I30 entry.
         let attrs = try record.attributes()
+        var parentRecordNumber: UInt64?
+        var deletedName: String?
+        if let fnAttr = attrs.first(where: { $0.type == .fileName }),
+           case let .resident(fnBytes, _) = fnAttr.value,
+           let fn = try? FileName.parse(fnBytes) {
+            parentRecordNumber = fn.parentRecordNumber
+            deletedName = fn.name
+        }
+
+        // 1) Remove from parent's $I30 first. Best-effort — if it fails, the
+        // record is still removable from MFT and the $I30 stale-entry can
+        // be cleaned up by `chkdsk`. Done before the MFT delete so we can
+        // tolerate failures here without leaving an orphan.
+        if let parentRN = parentRecordNumber, let name = deletedName {
+            try? await removeFromParentI30(
+                parentRecordNumber: parentRN,
+                childFileName: name
+            )
+        }
+
+        // 2) Free non-resident clusters.
         for attr in attrs {
             if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
                 for extent in extents {

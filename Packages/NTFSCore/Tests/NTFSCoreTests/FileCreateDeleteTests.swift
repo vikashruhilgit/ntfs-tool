@@ -61,6 +61,19 @@ final class FileCreateDeleteTests: XCTestCase {
         XCTAssertEqual(fileName.parentRecordNumber, 5)
     }
 
+    /// Find a small-enough subdirectory's MFT record number. The fixture's
+    /// root is LARGE_INDEX (it has 15 entries — 12 system files + 3 user
+    /// files); our resident-only $I30 mutation path correctly rejects it.
+    /// The `sub/` subdirectory contains only `nested.txt` so its $I30 stays
+    /// resident — use that as the parent for create/delete tests.
+    private func subDirRecordNumber(volume: Volume) async throws -> UInt64 {
+        let root = try await volume.enumerate(directory: 5)
+        guard let sub = root.first(where: { $0.name == "sub" && $0.fileName.namespace != .dos }) else {
+            throw XCTSkip("fixture root doesn't contain 'sub/' — regenerate via scripts/make_test_images.sh")
+        }
+        return sub.recordNumber
+    }
+
     func testCreateFileWritesParseableMFTRecord() async throws {
         guard fixtureExists("small.img") else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
@@ -69,10 +82,11 @@ final class FileCreateDeleteTests: XCTestCase {
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
         let mft = await volume.mft()
+        let parentRN = try await subDirRecordNumber(volume: volume)
 
         // Snapshot the MFT slot at the next free position before the create.
         let firstFree = try await mft.findFreeRecordNumber()
-        let recordNumber = try await volume.createFile(named: "created.txt", inDirectory: 5)
+        let recordNumber = try await volume.createFile(named: "created.txt", inDirectory: parentRN)
         XCTAssertEqual(recordNumber, firstFree)
 
         // Re-read via a fresh BlockDevice so we know the write hit disk.
@@ -95,7 +109,9 @@ final class FileCreateDeleteTests: XCTestCase {
         }
         let fileName = try FileName.parse(fnBytes)
         XCTAssertEqual(fileName.name, "created.txt")
-        XCTAssertEqual(fileName.parentRecordNumber, 5)
+        // Parent record is `sub/` (not root) since the fixture's root has
+        // LARGE_INDEX which stage 3b doesn't yet support.
+        XCTAssertEqual(fileName.parentRecordNumber, parentRN)
 
         // $DATA should be resident + empty.
         guard let dataAttr = attrs.first(where: { $0.type == .data }),
@@ -114,9 +130,10 @@ final class FileCreateDeleteTests: XCTestCase {
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
         let mft = await volume.mft()
+        let parentRN = try await subDirRecordNumber(volume: volume)
 
         // Create then immediately delete.
-        let recordNumber = try await volume.createFile(named: "ephemeral.txt", inDirectory: 5)
+        let recordNumber = try await volume.createFile(named: "ephemeral.txt", inDirectory: parentRN)
         let beforeDelete = try await mft.record(at: recordNumber)
         XCTAssertTrue(beforeDelete.isInUse)
         let seqBeforeDelete = beforeDelete.sequenceNumber
@@ -132,6 +149,84 @@ final class FileCreateDeleteTests: XCTestCase {
         XCTAssertFalse(deleted.isInUse, "record should be IN_USE=0 after delete")
         XCTAssertNotEqual(deleted.sequenceNumber, seqBeforeDelete,
                           "sequence number should bump on delete")
+    }
+
+    // MARK: — Stage 3b: $I30 wiring round-trips
+
+    /// Created file appears in enumerate() of its parent.
+    func testCreatedFileVisibleInEnumerate() async throws {
+        guard fixtureExists("small.img") else {
+            throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
+        }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+
+        let beforeNames = Set(try await volume.enumerate(directory: parentRN).map { $0.name })
+        XCTAssertFalse(beforeNames.contains("via-i30.txt"))
+
+        _ = try await volume.createFile(named: "via-i30.txt", inDirectory: parentRN)
+
+        // Re-open via fresh device — proves the $I30 update persisted.
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopenedVolume = try await Volume(device: reader)
+        let afterNames = Set(try await reopenedVolume.enumerate(directory: parentRN).map { $0.name })
+        XCTAssertTrue(
+            afterNames.contains("via-i30.txt"),
+            "expected 'via-i30.txt' in parent enumerate after create; got \(afterNames)"
+        )
+    }
+
+    /// After create + delete, the entry is gone from enumerate again.
+    func testDeletedFileGoneFromEnumerate() async throws {
+        guard fixtureExists("small.img") else {
+            throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
+        }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+
+        let recordNumber = try await volume.createFile(named: "ephemeral.txt", inDirectory: parentRN)
+        let midNames = Set(try await volume.enumerate(directory: parentRN).map { $0.name })
+        XCTAssertTrue(midNames.contains("ephemeral.txt"))
+
+        try await volume.deleteFile(at: recordNumber)
+
+        let afterNames = Set(try await volume.enumerate(directory: parentRN).map { $0.name })
+        XCTAssertFalse(
+            afterNames.contains("ephemeral.txt"),
+            "expected 'ephemeral.txt' absent from parent enumerate after delete; got \(afterNames)"
+        )
+    }
+
+    /// Creating into a LARGE_INDEX directory (the fixture's root) must
+    /// reject cleanly without leaving an orphan MFT record.
+    func testCreateInLargeIndexRejected() async throws {
+        guard fixtureExists("small.img") else {
+            throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
+        }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let mft = await volume.mft()
+
+        let beforeFirstFree = try await mft.findFreeRecordNumber()
+
+        do {
+            _ = try await volume.createFile(named: "into-root.txt", inDirectory: 5)
+            XCTFail("expected unsupportedFeature for LARGE_INDEX root")
+        } catch NTFSError.unsupportedFeature {
+            // expected
+        }
+
+        // Orphan rollback: the would-be slot should still be free.
+        let afterFirstFree = try await mft.findFreeRecordNumber()
+        XCTAssertEqual(
+            afterFirstFree, beforeFirstFree,
+            "failed create must roll back the orphan MFT record"
+        )
     }
 
     func testDeleteRejectsSystemRecords() async throws {
@@ -161,6 +256,7 @@ final class FileCreateDeleteTests: XCTestCase {
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
         let mft = await volume.mft()
+        let parentRN = try await subDirRecordNumber(volume: volume)
 
         let originalFirstFree = try await mft.findFreeRecordNumber()
 
@@ -168,7 +264,7 @@ final class FileCreateDeleteTests: XCTestCase {
         let names = ["a.txt", "b.txt", "c.txt"]
         var assignedSlots: [UInt64] = []
         for name in names {
-            let recordNumber = try await volume.createFile(named: name, inDirectory: 5)
+            let recordNumber = try await volume.createFile(named: name, inDirectory: parentRN)
             assignedSlots.append(recordNumber)
         }
         XCTAssertEqual(Set(assignedSlots).count, names.count,

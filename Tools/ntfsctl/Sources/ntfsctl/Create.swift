@@ -5,7 +5,8 @@ import NTFSCore
 struct Create: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "create",
-        abstract: "Create a new (empty) file in MFT. Block-G-stage-3a: file is reachable by MFT record number but not yet visible in directory listings (Stage 3b wires up \\$I30)."
+        abstract: "Create a new (empty) file or directory. Inserts into the parent's \\$I30 so the file is visible to `list` immediately.",
+        discussion: "Limitation: parent directory must have a resident-only \\$INDEX_ROOT (no \\$INDEX_ALLOCATION extension). LARGE_INDEX parents are rejected — that path lands in a future stage."
     )
 
     @Argument(help: "Path to an NTFS block device or disk image (must be writable).")
@@ -29,6 +30,5 @@ struct Create: AsyncParsableCommand {
             isDirectory: directory
         )
         print("Created '\(name)' at MFT record \(recordNumber)\(directory ? " (directory)" : "")")
-        print("Note: \\$I30 wiring lands in Stage 3b — the file is not yet visible to `list`.")
     }
 }
