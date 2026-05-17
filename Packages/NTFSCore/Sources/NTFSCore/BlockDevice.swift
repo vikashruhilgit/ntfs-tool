@@ -9,6 +9,23 @@ import Foundation
 
 public protocol BlockDevice: Sendable {
     func read(offset: UInt64, length: Int) async throws -> Data
+
+    /// Write `bytes` to the device starting at `offset`. The caller is
+    /// responsible for any sector/cluster alignment requirements; this API
+    /// is byte-level. Implementations that wrap a read-only backing store
+    /// (e.g. a `FSBlockDeviceResource` opened read-only by FSKit) should
+    /// throw `NTFSError.readOnlyDevice` rather than silently dropping.
+    ///
+    /// Phase 5b additive: defaulted to throw so existing read-only
+    /// implementations don't have to opt in until they're ready to support
+    /// writes.
+    func write(offset: UInt64, bytes: Data) async throws
+}
+
+public extension BlockDevice {
+    func write(offset: UInt64, bytes: Data) async throws {
+        throw NTFSError.readOnlyDevice
+    }
 }
 
 // A BlockDevice backed by a Foundation FileHandle. Used for the CLI and for
@@ -20,18 +37,35 @@ public protocol BlockDevice: Sendable {
 public actor FileHandleBlockDevice: BlockDevice {
     public let path: String
     private let handle: FileHandle
+    private let isWritable: Bool
 
+    /// Open `path` read-only. `write(...)` will throw `readOnlyDevice`.
     public init(openingFileAt path: String) throws {
         self.path = path
         guard let handle = FileHandle(forReadingAtPath: path) else {
             throw NTFSError.ioFailure(description: "cannot open \(path) for reading")
         }
         self.handle = handle
+        self.isWritable = false
     }
 
-    public init(handle: FileHandle, path: String = "<handle>") {
+    /// Open `path` read-write. The file must already exist; we don't create
+    /// new NTFS volumes (that's `mkntfs`'s job). Used by mutable-fixture
+    /// tests and (Phase 5+) by `ntfsctl` write operations against raw
+    /// devices.
+    public init(openingFileForUpdateAt path: String) throws {
+        self.path = path
+        guard let handle = FileHandle(forUpdatingAtPath: path) else {
+            throw NTFSError.ioFailure(description: "cannot open \(path) for updating")
+        }
+        self.handle = handle
+        self.isWritable = true
+    }
+
+    public init(handle: FileHandle, path: String = "<handle>", isWritable: Bool = false) {
         self.path = path
         self.handle = handle
+        self.isWritable = isWritable
     }
 
     deinit {
@@ -60,6 +94,21 @@ public actor FileHandleBlockDevice: BlockDevice {
             throw NTFSError.shortRead(expected: length, got: data?.count ?? 0)
         }
         return data
+    }
+
+    public func write(offset: UInt64, bytes: Data) async throws {
+        guard isWritable else { throw NTFSError.readOnlyDevice }
+        if bytes.isEmpty { return }
+        do {
+            try handle.seek(toOffset: offset)
+        } catch {
+            throw NTFSError.ioFailure(description: "seek to offset \(offset) for write failed: \(error)")
+        }
+        do {
+            try handle.write(contentsOf: bytes)
+        } catch {
+            throw NTFSError.ioFailure(description: "write at offset \(offset) length \(bytes.count) failed: \(error)")
+        }
     }
 }
 

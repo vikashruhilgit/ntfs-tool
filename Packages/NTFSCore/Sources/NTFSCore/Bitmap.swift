@@ -9,7 +9,7 @@ import Foundation
 public struct Bitmap: Sendable, Equatable {
     /// Raw bitmap bytes. Length = ceil(clusterCount / 8). May be padded with
     /// trailing zero bytes if the on-disk attribute is cluster-aligned.
-    public let bytes: Data
+    public var bytes: Data
 
     /// Total clusters this bitmap describes — usually equal to
     /// `volume.boot.totalSectors / volume.boot.sectorsPerCluster`. Stored
@@ -63,6 +63,63 @@ public struct Bitmap: Sendable, Equatable {
 
     public var allocatedClusterCount: UInt64 {
         clusterCount - freeClusterCount
+    }
+
+    /// Mark `count` clusters starting at `startLCN` as allocated. No-op for
+    /// `count == 0`. Out-of-range clusters throw `corruptOnDisk` rather
+    /// than silently scribbling past the bitmap.
+    public mutating func markAllocated(startLCN: UInt64, count: UInt64) throws {
+        for offset in 0..<count {
+            let cluster = startLCN + offset
+            guard cluster < clusterCount else {
+                throw NTFSError.corruptOnDisk(
+                    description: "markAllocated: cluster \(cluster) >= clusterCount \(clusterCount)"
+                )
+            }
+            let byteIndex = Int(cluster / 8)
+            let bitIndex = Int(cluster % 8)
+            bytes[bytes.startIndex + byteIndex] |= (1 << bitIndex)
+        }
+    }
+
+    /// Mark `count` clusters starting at `startLCN` as free. Same out-of-
+    /// range behavior as `markAllocated`.
+    public mutating func markFree(startLCN: UInt64, count: UInt64) throws {
+        for offset in 0..<count {
+            let cluster = startLCN + offset
+            guard cluster < clusterCount else {
+                throw NTFSError.corruptOnDisk(
+                    description: "markFree: cluster \(cluster) >= clusterCount \(clusterCount)"
+                )
+            }
+            let byteIndex = Int(cluster / 8)
+            let bitIndex = Int(cluster % 8)
+            bytes[bytes.startIndex + byteIndex] &= ~(UInt8(1) << bitIndex)
+        }
+    }
+
+    /// Allocate a single contiguous run of `count` clusters. Returns the
+    /// starting LCN. Throws `outOfSpace` if no such run is available.
+    /// Mutates the bitmap to mark the run allocated.
+    public mutating func allocate(_ count: UInt64) throws -> Extent {
+        guard count > 0 else {
+            throw NTFSError.ioFailure(description: "allocate: count must be > 0")
+        }
+        guard let startLCN = findFreeRun(count: count) else {
+            throw NTFSError.outOfSpace(
+                requestedClusters: count,
+                freeClusters: freeClusterCount
+            )
+        }
+        try markAllocated(startLCN: startLCN, count: count)
+        return Extent(startLCN: startLCN, clusterCount: count)
+    }
+
+    /// Free a previously-allocated extent. Sparse extents (startLCN == nil)
+    /// are no-ops since they don't occupy bitmap bits.
+    public mutating func free(_ extent: Extent) throws {
+        guard let startLCN = extent.startLCN else { return }
+        try markFree(startLCN: startLCN, count: extent.clusterCount)
     }
 
     /// Find the first run of `count` consecutive free clusters at or after
