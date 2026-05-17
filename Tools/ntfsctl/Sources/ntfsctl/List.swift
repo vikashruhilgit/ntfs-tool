@@ -11,8 +11,8 @@ struct List: AsyncParsableCommand {
     @Argument(help: "Path to an NTFS block device or disk image.")
     var device: String
 
-    @Argument(help: "MFT record number of the directory to list. 5 = root (default).")
-    var recordNumber: UInt64 = 5
+    @Argument(help: "MFT record number of the directory, OR a path under the volume root (e.g. /Backups). Default: 5 (root).")
+    var target: String = "5"
 
     @Flag(name: [.short, .long], help: "Long format (include size, namespace, parent ref).")
     var long: Bool = false
@@ -20,6 +20,15 @@ struct List: AsyncParsableCommand {
     func run() async throws {
         let blockDevice = try FileHandleBlockDevice(openingFileAt: device)
         let volume = try await NTFSCore.Volume(device: blockDevice)
+        let recordNumber: UInt64
+        if let parsed = UInt64(target) {
+            recordNumber = parsed
+        } else {
+            guard let resolved = try await volume.resolvePath(target) else {
+                throw ValidationError("path not found in volume: \(target)")
+            }
+            recordNumber = resolved
+        }
         let entries = try await volume.enumerate(directory: recordNumber)
 
         // Filter out DOS-namespace aliases so 8.3 names don't double up.

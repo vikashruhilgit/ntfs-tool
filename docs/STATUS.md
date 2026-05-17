@@ -2,8 +2,8 @@
 
 This document is the single source of truth for project state. Updated when major work lands.
 
-**Last updated:** 2026-05-17, after PR #14 (`main` at commit `72e48c8`).
-**Rubric score:** 30/30 (multi-phase Outcomes Rubric from `.supervisor/requirements/auto-2026-05-14-203703-ntfs-multi-phase-rubric.md`).
+**Last updated:** 2026-05-17, after Phase 5f-pre work (recursive copy, LARGE_INDEX insert + promotion, streaming I/O).
+**Rubric score:** 30/30 baseline from `.supervisor/requirements/auto-2026-05-14-203703-ntfs-multi-phase-rubric.md`, plus three follow-on capabilities (see "What's done — post-v0.1 enhancements").
 
 ## Contents
 
@@ -57,21 +57,39 @@ If you want **terminal read/write access to NTFS on macOS today**, the CLI is re
 
 ### `ntfsctl` CLI (`Tools/ntfsctl`)
 
-9 subcommands covering read + write:
+10 subcommands covering read + write:
 
 | Subcommand | Done | Notes |
 |---|---|---|
 | `info` | ✅ | Volume metadata + free-space stats |
-| `list` | ✅ | Directory enumeration, short + long format |
+| `list` | ✅ | Directory enumeration, short + long format. Accepts MFT recnum OR path. |
 | `verify` | ✅ | MFT sweep 0..63, parse-error reporting |
-| `cat` | ✅ | File content to stdout |
-| `create` | ✅ | New file/directory with $I30 insertion |
-| `delete` | ✅ | File deletion with cluster free + $I30 removal |
-| `write` | ✅ | Stdin → file content (rewrite or append) |
+| `cat` | ✅ | File content to stdout. **Streaming (no 1 GiB cap)**, supports `--offset`/`--length`. Accepts MFT recnum OR path. |
+| `create` | ✅ | New file/directory with $I30 insertion. Works against LARGE_INDEX parents. |
+| `delete` | ✅ | File deletion with cluster free + $I30 removal. Works against LARGE_INDEX parents. |
+| `write` | ✅ | Stdin → file content (rewrite or append). **`--from-file` streams from a host file (no 1 GiB cap)**. Accepts MFT recnum OR path. |
+| `cp` | ✅ | **Copy host files/directories into the volume. `-r` for recursive. Path-based destination, auto-creates intermediate dirs, streams large files.** |
 | `truncate` | ✅ | Resize (0 or cluster-aligned) |
 | `setdirty` | ✅ | $VOLUME_INFORMATION dirty bit toggle |
 
 See [`docs/CLI.md`](CLI.md) for usage walkthrough.
+
+### Post-v0.1 capability work (this iteration)
+
+These three follow-on capabilities lifted the v0.1 limits that made the CLI awkward for real-world phone-backup style workflows:
+
+| Capability | Where | What changed |
+|---|---|---|
+| **Recursive host→volume copy** | `Tools/ntfsctl/Sources/ntfsctl/Cp.swift` | New `cp -r` subcommand: walks a host directory, auto-creates intermediate destination dirs on the volume, streams file content in 1 MiB chunks. Marks the volume clean (`setDirty(false)`) on success. |
+| **LARGE_INDEX insert + remove** | `Packages/NTFSCore/Sources/NTFSCore/IndexAllocationWriter.swift` | B-tree descent through `$INDEX_ROOT` → `$INDEX_ALLOCATION` leaves. Inserts new entries into the correct leaf with USA fix-up. Removes existing entries from leaves on delete. Was: every parent dir with `$INDEX_ALLOCATION` (typically >5-7 entries) was rejected; now: works as long as the target leaf has slack (~50 entries per 4 KiB INDX block). |
+| **Small→LARGE promotion** | `Packages/NTFSCore/Sources/NTFSCore/Volume.swift` (`promoteDirectoryToLargeIndex`) | When a small (resident-only) directory's `$INDEX_ROOT` would overflow on insert, automatically promote it: allocate one cluster, move all existing entries to an INDX leaf, replace `$INDEX_ROOT` with an empty interior root (`LARGE_INDEX` flag + LAST+HAS_SUBNODE→VCN 0), add `$INDEX_ALLOCATION:$I30` and `$BITMAP:$I30` to the parent record. Lets fresh directories grow past the ~5-7-entry resident ceiling. |
+| **Streaming writeFile** | `Packages/NTFSCore/Sources/NTFSCore/Volume.swift` (`writeFile`) | Chunked API that allocates clusters once, streams content via repeated `BlockDevice.write` calls. Multi-extent allocator (`allocateClustersFragmented`) falls back to greedy splitting on fragmented volumes. No 1 GiB cap. Convenience overload `writeFile(at:fromFileAt:)` opens a host file and streams in 1 MiB chunks. |
+| **Streaming cat via `readFileSlice`** | `Tools/ntfsctl/Sources/ntfsctl/Cat.swift` | `cat` now loops `readFileSlice` (which is already streaming) instead of `readFile` (which has the 1 GiB cap). |
+| **Path resolve** | `Packages/NTFSCore/Sources/NTFSCore/Volume.swift` (`resolvePath`) | Resolves a slash-separated path under root to its MFT record number. CLI commands accept either a recnum or a path, so users don't have to chase numbers manually. |
+
+**Test count:** 98 (was 87 at v0.1). New tests in `Packages/NTFSCore/Tests/NTFSCoreTests/StreamingAndLargeIndexTests.swift` cover streaming round-trips, bulk LARGE_INDEX inserts, the leaf-full sentinel error, and `resolvePath` cases.
+
+**Remaining LARGE_INDEX limit:** if a single INDX leaf fills up, the next insert into that leaf throws `unsupportedFeature(...leaf full)`. On a typical 4 KiB INDX block with ~70-byte entries, this caps inserts into any one leaf at ~50 entries. **Leaf split (proper B-tree split that allocates a new leaf, propagates a median key up to `$INDEX_ROOT`, and may grow tree height) is the next major engineering follow-up** — see "engineering follow-ups" below.
 
 ### FSKit System Extension (`Extensions/NTFSFileSystem`)
 
@@ -212,10 +230,11 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 
 ### High-impact
 
-1. **Path-based subcommand resolution.** Add `ntfsctl ls /path/to/dir` and similar so users don't have to chase MFT record numbers manually. Implementation: a `resolvePath(_:)` helper on `Volume` that walks `$I30` from root.
-2. **LARGE_INDEX mutation.** Lift the limitation that `create` rejects parents with $INDEX_ALLOCATION. Required to add files to large existing directories (e.g., your typical `Documents/` folder on a populated NTFS drive). Implementation: read INDX blocks, identify the right node to insert into, rewrite the affected block with USA fix-up. Significant work — ~2-3 days.
+1. ~~**Path-based subcommand resolution.**~~ ✅ Done — `Volume.resolvePath` + `cat`/`write`/`list`/`cp` all accept paths.
+2. **LARGE_INDEX leaf split.** The new LARGE_INDEX insert path works until any single 4 KiB INDX leaf fills (~50 entries). A real B-tree split (allocate new leaf, split entries 50/50, propagate median key to `$INDEX_ROOT`, possibly grow tree height) lifts this cap. Significant work — ~2-3 days. Without it, `cp -r` of folders with > ~50 files into the same leaf will hit `unsupportedFeature(leaf full)`. (Existing volumes that were formatted by Windows typically already have multi-leaf trees so the per-leaf cap matters less; fresh directories created on macOS hit it sooner.)
 3. **Partial mid-file overwrites.** Currently `write` only supports offset==0 or offset==size. Real apps (e.g., text editors saving Word docs) need arbitrary offsets. Implementation: walk extents, write to specific clusters, no need to rewrite the entire runlist. ~1 day.
-4. **Streaming `cat` for large files.** Lift the 1 GiB eager-load cap by exposing the underlying `readFileSlice` API through the CLI. ~half a day.
+4. ~~**Streaming `cat` for large files.**~~ ✅ Done — `cat` streams via `readFileSlice`, no 1 GiB cap. `write --from-file` streams the inverse direction.
+5. **Stale `$FILE_NAME` size hints.** After `writeFile`, the parent's `$I30` entry still reports `realSize: 0` from the `createFile` call (no live re-sync). `ntfsctl list` shows 0 for sizes; real Apple/Windows drivers compute from `$DATA` so it's cosmetic. To fix: re-insert the entry with the new size after each write, OR update the `$I30` entry's sizes in place. Half a day.
 
 ### Medium-impact
 

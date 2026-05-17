@@ -201,31 +201,38 @@ final class FileCreateDeleteTests: XCTestCase {
         )
     }
 
-    /// Creating into a LARGE_INDEX directory (the fixture's root) must
-    /// reject cleanly without leaving an orphan MFT record.
-    func testCreateInLargeIndexRejected() async throws {
+    /// Inserting into a LARGE_INDEX directory (the fixture's root) descends
+    /// the $INDEX_ALLOCATION B-tree and rewrites the right leaf in place.
+    /// Verifies that the new file appears in the directory enumeration and
+    /// that a follow-up delete cleanly removes it.
+    func testCreateInLargeIndexSucceeds() async throws {
         guard fixtureExists("small.img") else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
         let path = try MutableFixture.scopedCopy("small.img", testCase: self)
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
-        let mft = await volume.mft()
 
-        let beforeFirstFree = try await mft.findFreeRecordNumber()
+        // Create into the LARGE_INDEX root directory (recnum 5).
+        let recordNumber = try await volume.createFile(named: "into-root.txt", inDirectory: 5)
+        XCTAssertGreaterThanOrEqual(recordNumber, 16, "new file should land in user-record range")
 
-        do {
-            _ = try await volume.createFile(named: "into-root.txt", inDirectory: 5)
-            XCTFail("expected unsupportedFeature for LARGE_INDEX root")
-        } catch NTFSError.unsupportedFeature {
-            // expected
-        }
+        // Re-open the volume so we read from disk, not in-memory state.
+        let reader = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let reopened = try await Volume(device: reader)
+        let entries = try await reopened.enumerate(directory: 5)
+        let names = entries.map { $0.name }
+        XCTAssertTrue(
+            names.contains("into-root.txt"),
+            "newly-created file should appear in LARGE_INDEX root enumeration; got \(names)"
+        )
 
-        // Orphan rollback: the would-be slot should still be free.
-        let afterFirstFree = try await mft.findFreeRecordNumber()
-        XCTAssertEqual(
-            afterFirstFree, beforeFirstFree,
-            "failed create must roll back the orphan MFT record"
+        // Round-trip delete: file should disappear from the enumeration.
+        try await reopened.deleteFile(at: recordNumber)
+        let after = try await reopened.enumerate(directory: 5)
+        XCTAssertFalse(
+            after.map { $0.name }.contains("into-root.txt"),
+            "deleted file should not appear in LARGE_INDEX root enumeration"
         )
     }
 

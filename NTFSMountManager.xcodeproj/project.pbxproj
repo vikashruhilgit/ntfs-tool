@@ -18,6 +18,7 @@
 		54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */; };
 		55282FEDBAEF76F7172E5825 /* SetDirty.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DE33D7BA5684962834C762F /* SetDirty.swift */; };
 		5F4936483FEF4613A8864F81 /* Create.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFA3E28642F4967D00BBD28 /* Create.swift */; };
+		6D724EC442E40A0DDDC0B54A /* Cp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DCA58042BB15FFD8F32EDD3 /* Cp.swift */; };
 		7D4143F793CD345F7651B4B1 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */; };
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
 		84561F4715F1DFA581FFB5D8 /* NTFSFileSystem.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
@@ -66,6 +67,7 @@
 		1B9DB06823B01F8100989970 /* List.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = List.swift; sourceTree = "<group>"; };
 		20E22577EA73CB6742243E11 /* Verify.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Verify.swift; sourceTree = "<group>"; };
 		2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cat.swift; sourceTree = "<group>"; };
+		2DCA58042BB15FFD8F32EDD3 /* Cp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cp.swift; sourceTree = "<group>"; };
 		4126B01F860CB4A427613EB6 /* Info.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Info.swift; sourceTree = "<group>"; };
 		43ACC1740AE27F5F1F244E0A /* NTFSUnaryFS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSUnaryFS.swift; sourceTree = "<group>"; };
 		4CC62877FC7ADECC37C4FC47 /* NTFSCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NTFSCore; path = Packages/NTFSCore; sourceTree = SOURCE_ROOT; };
@@ -197,6 +199,7 @@
 			isa = PBXGroup;
 			children = (
 				2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */,
+				2DCA58042BB15FFD8F32EDD3 /* Cp.swift */,
 				8FFA3E28642F4967D00BBD28 /* Create.swift */,
 				DE068D882A088571281101D0 /* Delete.swift */,
 				4126B01F860CB4A427613EB6 /* Info.swift */,
@@ -369,6 +372,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				BBB98DE04B189933E57E523D /* Cat.swift in Sources */,
+				6D724EC442E40A0DDDC0B54A /* Cp.swift in Sources */,
 				5F4936483FEF4613A8864F81 /* Create.swift in Sources */,
 				11CB6DA3EB985C6BC4F34535 /* Delete.swift in Sources */,
 				21A4A75C7F50E50DA8213556 /* Info.swift in Sources */,

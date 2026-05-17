@@ -112,14 +112,31 @@ public struct MFTRecordBuilder {
             valueBytes: fileNameBody(fileNameUTF16: fileNameUTF16)
         )
 
-        // 3) $DATA (type 0x80, resident, 0-byte body for an empty file).
-        cursor = try writeResidentAttribute(
-            into: &data,
-            at: cursor,
-            type: 0x80,
-            attrID: 2,
-            valueBytes: Data()
-        )
+        // 3) Type-discriminated body attribute:
+        //    - File:      $DATA (0x80) resident, empty body.
+        //    - Directory: $INDEX_ROOT (0x90) with attribute name $I30 and an
+        //                 empty $I30 body (just the INDEX_ROOT preamble +
+        //                 INDEX_HEADER + LAST sentinel). Without this, the
+        //                 new directory has no enumerable index and any
+        //                 attempt to descend into it would fail.
+        if isDirectory {
+            cursor = try writeNamedResidentAttribute(
+                into: &data,
+                at: cursor,
+                type: 0x90,
+                attrID: 2,
+                attributeName: "$I30",
+                valueBytes: emptyIndexRootBody()
+            )
+        } else {
+            cursor = try writeResidentAttribute(
+                into: &data,
+                at: cursor,
+                type: 0x80,
+                attrID: 2,
+                valueBytes: Data()
+            )
+        }
 
         // 4) End marker.
         guard cursor + 4 <= recordSize else {
@@ -214,6 +231,78 @@ public struct MFTRecordBuilder {
             data[data.startIndex + offset + Int(valueOffset) + i] = byte
         }
 
+        return offset + alignedLength
+    }
+
+    /// Build the body of an empty $INDEX_ROOT:$I30 attribute. Layout matches
+    /// IndexRoot.parse / IndexBuilder.buildIndexRootBody: 16-byte preamble +
+    /// 16-byte INDEX_HEADER + 16-byte LAST sentinel = 48 bytes total.
+    private func emptyIndexRootBody() -> Data {
+        var body = Data(count: 48)
+        // Preamble.
+        MFTRecord.writeU32LE(into: &body, at: 0,  value: 0x30)              // attributeTypeIndexed = $FILE_NAME
+        MFTRecord.writeU32LE(into: &body, at: 4,  value: 0x01)              // COLLATION_FILENAME
+        MFTRecord.writeU32LE(into: &body, at: 8,  value: 4096)              // indexAllocationBlockSize (4 KiB default)
+        body[body.startIndex + 12] = 1                                       // clustersPerIndexBlock (1 if blockSize == clusterSize, fine for 4096/4096)
+        // INDEX_HEADER at offset 16.
+        MFTRecord.writeU32LE(into: &body, at: 16, value: 16)                // entriesOffset (relative to header start)
+        MFTRecord.writeU32LE(into: &body, at: 20, value: 32)                // usedSize: header + LAST sentinel
+        MFTRecord.writeU32LE(into: &body, at: 24, value: 32)                // allocatedSize matches usedSize for empty
+        body[body.startIndex + 28] = 0                                       // flags: not LARGE_INDEX
+        // LAST sentinel at offset 32 (16 bytes).
+        MFTRecord.writeU64LE(into: &body, at: 32, value: 0)                  // fileReference (unused)
+        MFTRecord.writeU16LE(into: &body, at: 40, value: 16)                 // entryLength
+        MFTRecord.writeU16LE(into: &body, at: 42, value: 0)                  // keyLength
+        MFTRecord.writeU16LE(into: &body, at: 44, value: 0x02)               // flags: LAST
+        MFTRecord.writeU16LE(into: &body, at: 46, value: 0)                  // reserved
+        return body
+    }
+
+    /// Write a resident attribute that carries a UTF-16 name (e.g. $INDEX_ROOT:$I30).
+    /// Layout: 16-byte common header + 8-byte resident extension + name bytes +
+    /// value bytes, 8-byte aligned.
+    private func writeNamedResidentAttribute(
+        into data: inout Data,
+        at offset: Int,
+        type: UInt32,
+        attrID: UInt16,
+        attributeName: String,
+        valueBytes: Data
+    ) throws -> Int {
+        let nameUTF16 = Array(attributeName.utf16)
+        let nameByteCount = nameUTF16.count * 2
+        let bodyLength = valueBytes.count
+        let rawLength = 16 + 8 + nameByteCount + bodyLength
+        let alignedLength = ((rawLength + 7) / 8) * 8
+        let nameOffset: UInt16 = 24
+        let valueOffset: UInt16 = UInt16(24 + nameByteCount)
+
+        guard offset + alignedLength + 4 <= recordSize else {
+            throw NTFSError.corruptOnDisk(
+                description: "MFTRecordBuilder: named attribute type 0x\(String(format: "%02X", type)) doesn't fit at offset \(offset)"
+            )
+        }
+
+        MFTRecord.writeU32LE(into: &data, at: offset + 0,  value: type)
+        MFTRecord.writeU32LE(into: &data, at: offset + 4,  value: UInt32(alignedLength))
+        data[data.startIndex + offset + 8]  = 0                          // resident
+        data[data.startIndex + offset + 9]  = UInt8(nameUTF16.count)
+        MFTRecord.writeU16LE(into: &data, at: offset + 10, value: nameOffset)
+        MFTRecord.writeU16LE(into: &data, at: offset + 12, value: 0)     // flags
+        MFTRecord.writeU16LE(into: &data, at: offset + 14, value: attrID)
+
+        MFTRecord.writeU32LE(into: &data, at: offset + 16, value: UInt32(bodyLength))
+        MFTRecord.writeU16LE(into: &data, at: offset + 20, value: valueOffset)
+        data[data.startIndex + offset + 22] = 0                          // indexedFlag
+        data[data.startIndex + offset + 23] = 0                          // padding
+
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[data.startIndex + offset + Int(nameOffset) + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[data.startIndex + offset + Int(nameOffset) + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        for (i, byte) in valueBytes.enumerated() {
+            data[data.startIndex + offset + Int(valueOffset) + i] = byte
+        }
         return offset + alignedLength
     }
 

@@ -165,13 +165,14 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | Command | Arguments | Description |
 |---|---|---|
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
-| `list` | `<device> [recnum]` | List directory contents. Default `recnum` = 5 (root). Pass `--long` for record numbers + sizes + namespace |
-| `cat` | `<device> <recnum>` | Read file bytes to stdout |
+| `list` | `<device> [recnum-or-path]` | List directory contents. Default = 5 (root). Pass `--long` for record numbers + sizes + namespace. Accepts a path like `/Backups` instead of a recnum. |
+| `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
 | `verify` | `<device>` | Sweep MFT records 0..63, report parse errors. Pass `--verbose` for per-record details |
-| `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder |
-| `write` | `<device> <recnum>` | Write stdin bytes to file. `--offset N` (default 0). Only 0 or current-size supported |
+| `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
+| `cp` | `<source> <device> <destination>` | Copy host file (or directory tree with `-r`) into the volume. Path-based destination; auto-creates intermediate dirs; streams large files. |
+| `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N` (0 or current-size). Or pass `--from-file <path>` to stream from a host file (no 1 GiB cap). |
 | `truncate` | `<device> <recnum> <newSize>` | Resize file. Only 0 or cluster-aligned (multiples of 4096) shrinks supported |
-| `delete` | `<device> <recnum>` | Delete file. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15 |
+| `delete` | `<device> <recnum>` | Delete file. Frees clusters + removes from parent's $I30 (incl. LARGE_INDEX leaves). Refuses reserved records 0-15 |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
 
 ## Common task recipes
@@ -202,14 +203,34 @@ diskutil mount /dev/disk10s1
 ```bash
 diskutil unmount /dev/disk10s1
 sudo ntfsctl list --long /dev/disk10s1                                # root
-# Then for each subdirectory in the output, list it:
-sudo ntfsctl list --long /dev/disk10s1 44                              # WD - Software/
-sudo ntfsctl list --long /dev/disk10s1 224                             # gallery/
-# ...
+# Descend either by record number or by path (path form is friendlier):
+sudo ntfsctl list --long /dev/disk10s1 /WD\ -\ Software
+sudo ntfsctl list --long /dev/disk10s1 /gallery/2024
 diskutil mount /dev/disk10s1
 ```
 
 (A `find`-style recursive walker is future work — for now you walk by hand or write a shell loop.)
+
+### Recursive copy from host to NTFS
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# Single file into an existing directory (auto-creates intermediates):
+sudo ntfsctl cp ~/photo.jpg /dev/disk10s1 /Backups/Photos/
+
+# Recursive: copy an entire host tree:
+sudo ntfsctl cp -r ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone
+
+# Big-file streaming happens automatically — no separate flag needed for cp:
+sudo ntfsctl cp ~/Movies/big.mp4 /dev/disk10s1 /Videos/
+
+diskutil mount /dev/disk10s1
+```
+
+`cp` resolves the destination path: trailing slash (or matching an existing directory) treats it as the parent and appends the source basename; otherwise it copies under the given name. Intermediate destination directories are auto-created.
+
+**Per-leaf cap reminder:** v1's LARGE_INDEX support has no leaf split. If you're copying many files into a single fresh directory, expect ~30-50 files per directory before hitting `unsupportedFeature(...leaf full)`. Existing Windows-formatted volumes typically already have multi-leaf trees so this matters less for inserts into pre-existing folders.
 
 ### Validate a volume's structural integrity
 
@@ -250,15 +271,19 @@ echo "apples:  $apples"
 
 These are documented as "v1 scope" with clear pointers to where they'd be lifted in a future hardening pass. None of them prevent ordinary read/write use against typical NTFS volumes.
 
-### `create` rejects LARGE_INDEX parent directories
+### `create` into LARGE_INDEX parents — per-leaf cap
 
-A directory whose `$INDEX_ROOT` has spilled into an `$INDEX_ALLOCATION` extension (typically directories with more than ~30 entries on a 1024-byte MFT) is rejected:
+`create` (and `cp`'s internal create) now descends `$INDEX_ALLOCATION` and inserts into the correct INDX leaf. Real-world directories with hundreds of entries work as long as the specific leaf the new key sorts into still has slack space (~50 entries per typical 4 KiB INDX block).
+
+If the target leaf is fully packed, you'll see:
 
 ```
-unsupportedFeature(description: "parent directory has LARGE_INDEX ...")
+unsupportedFeature(description: "LARGE_INDEX leaf full (used X / allocated Y, needed Z) — leaf split not yet implemented")
 ```
 
-**Workaround:** create your file inside a smaller subdirectory. If you need to add to a large directory, do it via Apple's driver (which only supports read… ok, doesn't help). LARGE_INDEX mutation is the single biggest pending enhancement for a v0.2.
+**Workaround:** create files inside a different (less-full) subdirectory until leaf split is implemented (see [`docs/STATUS.md`](STATUS.md) engineering follow-up #2). Or for fresh directories created via `cp -r`, copy at most ~30-40 files per directory in v1.
+
+Small (resident-only `$INDEX_ROOT`) directories are auto-promoted to LARGE_INDEX on overflow — you don't have to do this manually.
 
 ### `write` is rewrite-or-append only
 
@@ -276,7 +301,17 @@ Arbitrary mid-file overwrites (`offset == 100` on a 1000-byte file) return `unsu
 
 ### Files larger than 1 GiB
 
-`cat` returns `unsupportedFeature` for files larger than 1 GiB because the read API eagerly materializes the whole file in memory. The FSKit extension uses a per-chunk streaming path internally that doesn't have this limit; the streaming path will be lifted up into the CLI in a v0.2.
+**Lifted in this iteration.** `cat` and `write --from-file` now stream in 1 MiB chunks (configurable via `--chunk-size`), so file size is bounded only by free clusters on the volume, not by RSS or any explicit cap. The `cat` (no flags) and `write --from-file <path>` paths are the streaming-safe entry points:
+
+```bash
+# Write a multi-GB video to NTFS:
+sudo ntfsctl write /dev/disk10s1 /Videos/movie.mp4 --from-file ~/Movies/big.mp4
+
+# Read it back, computing SHA-256 on the fly:
+sudo ntfsctl cat /dev/disk10s1 /Videos/movie.mp4 | shasum -a 256
+```
+
+The `write` stdin path (`echo ... | ntfsctl write`) still reads stdin fully into memory before writing — practical ceiling is RSS. Prefer `--from-file` for anything over a few hundred MiB.
 
 ### `$LogFile` journaling is "dirty bit only"
 

@@ -30,7 +30,8 @@ diskutil list                                            # find a "Microsoft Bas
 diskutil unmount /dev/disk10s1                           # release Apple's auto-mount
 sudo ntfsctl info /dev/disk10s1                          # volume metadata
 sudo ntfsctl list --long /dev/disk10s1                   # root directory with MFT record numbers
-sudo ntfsctl cat /dev/disk10s1 36 > /tmp/extracted.bin   # read file #36's content
+sudo ntfsctl list --long /dev/disk10s1 /Photos          # list a directory by path
+sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg > out.jpg  # by path; streams (no 1 GiB cap)
 diskutil mount /dev/disk10s1                             # re-mount via Apple's read-only driver
 ```
 
@@ -42,6 +43,14 @@ sudo ntfsctl create /dev/disk10s1 hello.txt --parent 44  # parent dir's MFT recn
 echo "Hello from macOS." | sudo ntfsctl write /dev/disk10s1 <new-recnum>
 sudo ntfsctl setdirty /dev/disk10s1 0                    # mark clean
 diskutil mount /dev/disk10s1                             # Apple's driver now sees the new file
+```
+
+### Copy a directory tree (e.g. phone backup) onto NTFS
+
+```bash
+diskutil unmount /dev/disk10s1
+sudo ntfsctl cp -r ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone   # recursive, streams big files
+diskutil mount /dev/disk10s1
 ```
 
 **Full CLI guide with all subcommands, constraints, and troubleshooting:** **[`docs/CLI.md`](docs/CLI.md)**.
