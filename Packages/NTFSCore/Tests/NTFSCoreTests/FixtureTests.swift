@@ -33,7 +33,7 @@ final class FixtureTests: XCTestCase {
                 """)
         }
 
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let firstSector = try await device.read(offset: 0, length: BootSector.onDiskSize)
         let boot = try BootSector.parse(firstSector)
 
@@ -74,7 +74,7 @@ final class FixtureTests: XCTestCase {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
 
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
 
         // Read just the boot signature (2 bytes at offset 510).
         let sig = try await device.read(offset: 510, length: 2)
@@ -93,7 +93,7 @@ final class FixtureTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let empty = try await device.read(offset: 0, length: 0)
         XCTAssertEqual(empty.count, 0)
     }

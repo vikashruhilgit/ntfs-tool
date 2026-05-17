@@ -20,7 +20,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
 
         let entries = try await volume.enumerate(directory: 5)
@@ -41,7 +41,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
 
         let entries = try await volume.enumerate(directory: 5)
@@ -84,7 +84,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let entries = try await volume.enumerate(directory: 5)
 
@@ -108,7 +108,7 @@ final class DirectoryTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
         let rootEntries = try await volume.enumerate(directory: 5)
 
@@ -126,13 +126,50 @@ final class DirectoryTests: XCTestCase {
         )
     }
 
+    /// readFileSlice on a non-resident file returns only the requested window
+    /// without materializing the whole file. medium.txt is 2560 bytes of
+    /// "abcdefghij" repeated 256 times.
+    func testReadFileSliceWindows() async throws {
+        let path = fixturePath("small.img")
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
+        }
+        let device = try FileHandleBlockDevice(openingFileAt: path)
+        let volume = try await Volume(device: device)
+        let entries = try await volume.enumerate(directory: 5)
+        guard let medium = entries.first(where: { $0.name == "medium.txt" && $0.fileName.namespace != .dos }) else {
+            return XCTFail("medium.txt not in root enumeration")
+        }
+
+        // First 10 bytes — should be "abcdefghij".
+        let head = try await volume.readFileSlice(at: medium.recordNumber, offset: 0, length: 10)
+        XCTAssertEqual(String(decoding: head, as: UTF8.self), "abcdefghij")
+
+        // Middle slice (offset 100, length 20).
+        let middle = try await volume.readFileSlice(at: medium.recordNumber, offset: 100, length: 20)
+        XCTAssertEqual(middle.count, 20)
+        XCTAssertEqual(String(decoding: middle, as: UTF8.self), "abcdefghijabcdefghij")
+
+        // Last 10 bytes (offset 2550).
+        let tail = try await volume.readFileSlice(at: medium.recordNumber, offset: 2550, length: 10)
+        XCTAssertEqual(String(decoding: tail, as: UTF8.self), "abcdefghij")
+
+        // Request past EOF returns empty.
+        let past = try await volume.readFileSlice(at: medium.recordNumber, offset: 5000, length: 10)
+        XCTAssertEqual(past.count, 0)
+
+        // Request straddling EOF gets truncated to realSize - offset.
+        let straddle = try await volume.readFileSlice(at: medium.recordNumber, offset: 2555, length: 100)
+        XCTAssertEqual(straddle.count, 5)
+    }
+
     /// Rejects: enumerating an MFT record that isn't a directory should throw.
     func testEnumerateNonDirectoryThrows() async throws {
         let path = fixturePath("small.img")
         guard FileManager.default.fileExists(atPath: path) else {
             throw XCTSkip("fixture missing; run scripts/make_test_images.sh")
         }
-        let device = try BlockDevice(openingFileAt: path)
+        let device = try FileHandleBlockDevice(openingFileAt: path)
         let volume = try await Volume(device: device)
 
         let rootEntries = try await volume.enumerate(directory: 5)

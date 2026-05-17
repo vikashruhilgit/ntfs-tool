@@ -1,0 +1,99 @@
+# xcodegen spec — generates Apps/NTFSMountManager.xcodeproj.
+#
+# Regenerate any time targets change:
+#   brew install xcodegen   # if not already installed
+#   xcodegen generate
+#
+# CI runs `xcodebuild build` against the generated project; the .xcodeproj is
+# committed for convenience but project.yml is the source of truth.
+
+name: NTFSMountManager
+options:
+  bundleIdPrefix: com.ntfs-tool
+  deploymentTarget:
+    macOS: "15.4"
+  groupSortPosition: top
+  generateEmptyDirectories: true
+  createIntermediateGroups: true
+  defaultConfig: Debug
+  xcodeVersion: "16.3"
+  groupOrdering:
+    - order: [Apps, Extensions, Packages, scripts, Tests]
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "15.4"
+    DEAD_CODE_STRIPPING: YES
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""    # set per machine before running on hardware
+    CODE_SIGN_IDENTITY: "-" # ad-hoc for CI builds
+
+packages:
+  NTFSCore:
+    path: Packages/NTFSCore
+
+projectReferences: {}
+
+targets:
+
+  NTFSMountManager:
+    type: application
+    platform: macOS
+    sources:
+      - path: Apps/NTFSMountManager/Sources
+    info:
+      path: Apps/NTFSMountManager/Info.plist
+      properties:
+        LSMinimumSystemVersion: "15.4"
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        NSHighResolutionCapable: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ntfs-tool.NTFSMountManager
+        CODE_SIGN_ENTITLEMENTS: Apps/NTFSMountManager/NTFSMountManager.entitlements
+        INFOPLIST_KEY_LSUIElement: NO
+    dependencies:
+      - package: NTFSCore
+        product: NTFSCore
+      - target: NTFSFileSystem
+        embed: true
+        codeSign: true
+
+  NTFSFileSystem:
+    type: system-extension
+    platform: macOS
+    sources:
+      - path: Extensions/NTFSFileSystem/Sources
+    info:
+      path: Extensions/NTFSFileSystem/Info.plist
+      properties:
+        CFBundlePackageType: "XPC!"
+        LSMinimumSystemVersion: "15.4"
+        FSShortName: "NTFS (Phase 2)"
+        EXAppExtensionAttributes:
+          EXExtensionPointIdentifier: com.apple.fskit.fsmodule
+        FSPersonalities:
+          NTFS:
+            FSName: ntfs
+            FSSubType: 0
+            FSFormatSubType: 0
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ntfs-tool.NTFSMountManager.NTFSFileSystem
+        CODE_SIGN_ENTITLEMENTS: Extensions/NTFSFileSystem/NTFSFileSystem.entitlements
+        SWIFT_OPTIMIZATION_LEVEL: -Onone
+        # FSKit's Obj-C surface predates Swift 6 strict concurrency. Relax
+        # the project-wide setting for this target so callback handlers
+        # capturing FSResource references compile cleanly. The protocol
+        # itself uses @Sendable on reply handlers, so the relaxation is
+        # bounded.
+        SWIFT_STRICT_CONCURRENCY: minimal
+        SWIFT_VERSION: "5"
+    dependencies:
+      - package: NTFSCore
+        product: NTFSCore
+      - sdk: FSKit.framework
