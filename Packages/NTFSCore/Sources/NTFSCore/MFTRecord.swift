@@ -126,4 +126,64 @@ public struct MFTRecord: Equatable, Sendable {
             bytes: fixedUp
         )
     }
+
+    /// Serialize this MFT record into on-disk bytes ready for `BlockDevice.write`.
+    /// Applies USA fix-up (increments the sentinel, copies block tails into
+    /// USA[1..N], replaces tails with the new sentinel). The returned Data
+    /// is the inverse of what `parse` consumes.
+    ///
+    /// `sectorSize` must match the volume — default 512.
+    public func serialize(sectorSize: Int = 512) throws -> Data {
+        // Sanity-check the in-memory bytes — every header field must agree
+        // with the public properties before we serialize.
+        guard bytes.count == Int(allocatedSize) else {
+            throw NTFSError.corruptOnDisk(
+                description: "MFTRecord.serialize: bytes.count \(bytes.count) != allocatedSize \(allocatedSize)"
+            )
+        }
+
+        var mutable = bytes
+
+        // Re-write the header in case the caller mutated any of our fields.
+        Self.writeU32LE(into: &mutable, at: 0,  value: magic)
+        Self.writeU16LE(into: &mutable, at: 4,  value: usaOffset)
+        Self.writeU16LE(into: &mutable, at: 6,  value: usaCount)
+        Self.writeU64LE(into: &mutable, at: 8,  value: logFileSequenceNumber)
+        Self.writeU16LE(into: &mutable, at: 16, value: sequenceNumber)
+        Self.writeU16LE(into: &mutable, at: 18, value: hardLinkCount)
+        Self.writeU16LE(into: &mutable, at: 20, value: firstAttributeOffset)
+        Self.writeU16LE(into: &mutable, at: 22, value: flags.rawValue)
+        Self.writeU32LE(into: &mutable, at: 24, value: usedSize)
+        Self.writeU32LE(into: &mutable, at: 28, value: allocatedSize)
+        Self.writeU64LE(into: &mutable, at: 32, value: baseFileReference)
+        Self.writeU16LE(into: &mutable, at: 40, value: nextAttributeID)
+        if bytes.count >= 48 {
+            Self.writeU32LE(into: &mutable, at: 44, value: mftRecordNumber)
+        }
+
+        // Apply USA on the way out.
+        return try UpdateSequenceArray.reverseFixup(
+            recordBytes: mutable,
+            usaOffset: Int(usaOffset),
+            usaCount: Int(usaCount),
+            blockSize: sectorSize
+        )
+    }
+
+    // MARK: — Little-endian writers (mirror of Endian.swift's readers)
+
+    static func writeU16LE(into data: inout Data, at offset: Int, value: UInt16) {
+        data[data.startIndex + offset]     = UInt8(value & 0xFF)
+        data[data.startIndex + offset + 1] = UInt8((value >> 8) & 0xFF)
+    }
+    static func writeU32LE(into data: inout Data, at offset: Int, value: UInt32) {
+        for i in 0..<4 {
+            data[data.startIndex + offset + i] = UInt8((value >> (8 * i)) & 0xFF)
+        }
+    }
+    static func writeU64LE(into data: inout Data, at offset: Int, value: UInt64) {
+        for i in 0..<8 {
+            data[data.startIndex + offset + i] = UInt8((value >> (8 * i)) & 0xFF)
+        }
+    }
 }
