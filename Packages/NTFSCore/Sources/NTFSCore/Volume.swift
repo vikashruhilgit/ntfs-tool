@@ -55,6 +55,86 @@ public actor Volume {
         return mft
     }
 
+    /// MFT record number of the $Bitmap system file. Always 6 on every NTFS
+    /// volume — this is part of the NTFS spec, not a per-volume value.
+    public static let bitmapRecordNumber: UInt64 = 6
+
+    private var _bitmap: Bitmap?
+
+    /// Read and cache the volume's $Bitmap. The $Bitmap attribute is one bit
+    /// per cluster (1 = allocated, 0 = free). On the read-only mount this
+    /// answer is stable for the lifetime of the Volume, so we cache it; the
+    /// Phase 5b write-side allocator will invalidate the cache on mutation.
+    public func bitmap() async throws -> Bitmap {
+        if let cached = _bitmap { return cached }
+
+        let mft = self.mft()
+        let bitmapRecord = try await mft.record(at: Self.bitmapRecordNumber)
+        let attrs = try bitmapRecord.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "$Bitmap record \(Self.bitmapRecordNumber) has no unnamed $DATA attribute"
+            )
+        }
+
+        // Total clusters the bitmap MUST describe = volume clusters total.
+        let totalClusters = boot.totalSectors / UInt64(boot.sectorsPerCluster)
+
+        switch dataAttr.value {
+        case let .resident(bytes, _):
+            let bm = Bitmap(bytes: bytes, clusterCount: totalClusters)
+            _bitmap = bm
+            return bm
+        case let .nonResident(_, _, _, _, _, realSize, _, extents):
+            // Walk every extent and concatenate. The $Bitmap is contiguous on
+            // every healthy volume, so this is one read for typical fixtures
+            // and a handful for fragmented production volumes.
+            var bytes = Data()
+            bytes.reserveCapacity(Int(min(realSize, UInt64(Int.max))))
+            let clusterBytes = UInt64(bytesPerCluster)
+            var remaining = Int(min(realSize, UInt64(Int.max)))
+            for extent in extents where remaining > 0 {
+                let extentLen = Int(min(extent.clusterCount * clusterBytes, UInt64(remaining)))
+                if let startLCN = extent.startLCN {
+                    let chunk = try await device.read(
+                        offset: startLCN * clusterBytes,
+                        length: extentLen
+                    )
+                    bytes.append(chunk)
+                } else {
+                    bytes.append(Data(repeating: 0, count: extentLen))
+                }
+                remaining -= extentLen
+            }
+            let bm = Bitmap(bytes: bytes, clusterCount: totalClusters)
+            _bitmap = bm
+            return bm
+        }
+    }
+
+    /// Snapshot of cluster-allocation statistics. Cheap if `bitmap()` has
+    /// already been called; otherwise pays one bitmap read.
+    public struct AllocationStats: Sendable, Equatable {
+        public let totalClusters: UInt64
+        public let freeClusters: UInt64
+        public let allocatedClusters: UInt64
+        public let bytesPerCluster: UInt32
+
+        public var totalBytes: UInt64     { totalClusters * UInt64(bytesPerCluster) }
+        public var freeBytes: UInt64      { freeClusters * UInt64(bytesPerCluster) }
+        public var allocatedBytes: UInt64 { allocatedClusters * UInt64(bytesPerCluster) }
+    }
+
+    public func allocationStats() async throws -> AllocationStats {
+        let bm = try await bitmap()
+        return AllocationStats(
+            totalClusters: bm.clusterCount,
+            freeClusters: bm.freeClusterCount,
+            allocatedClusters: bm.allocatedClusterCount,
+            bytesPerCluster: bytesPerCluster
+        )
+    }
+
     /// Enumerate the children of the directory at `recordNumber`. For the root
     /// directory pass `recordNumber: 5`. Returns the entries in the order they
     /// appear in the $I30 index (sorted by NTFS collation, typically Unicode

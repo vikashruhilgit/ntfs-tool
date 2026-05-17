@@ -61,20 +61,35 @@ final class NTFSVolume: FSVolume,
         return caps
     }
 
+    /// Cached AllocationStats so volumeStatistics is cheap after first call.
+    /// FSKit's volumeStatistics is a sync property, so we can't call the
+    /// async bitmap() reader here directly — `loadResource` primes the
+    /// cache before returning the volume to FSKit.
+    nonisolated(unsafe) var cachedAllocationStats: NTFSCore.Volume.AllocationStats?
+
     var volumeStatistics: FSStatFSResult {
         let stats = FSStatFSResult(fileSystemTypeName: "ntfs")
         stats.blockSize = Int(coreVolume.bytesPerCluster)
         stats.ioSize = Int(coreVolume.bytesPerCluster)
-        let totalSectors = coreVolume.boot.totalSectors
-        let bytesPerSector = UInt64(coreVolume.boot.bytesPerSector)
-        let totalBytes = totalSectors * bytesPerSector
-        stats.totalBytes = totalBytes
-        // Free / used numbers require $Bitmap parsing (Block G); for now
-        // report "unknown" via zeros — Finder displays the volume but
-        // accurate capacity awaits Phase 5.
-        stats.availableBytes = 0
-        stats.freeBytes = 0
-        stats.usedBytes = totalBytes
+
+        if let alloc = cachedAllocationStats {
+            stats.totalBytes = alloc.totalBytes
+            stats.freeBytes = alloc.freeBytes
+            stats.availableBytes = alloc.freeBytes
+            stats.usedBytes = alloc.allocatedBytes
+        } else {
+            let totalSectors = coreVolume.boot.totalSectors
+            let bytesPerSector = UInt64(coreVolume.boot.bytesPerSector)
+            let totalBytes = totalSectors * bytesPerSector
+            stats.totalBytes = totalBytes
+            // Bitmap cache not yet primed — report total as the placeholder
+            // and 0 used so Finder shows the volume as "empty" rather than
+            // refusing copies. Real numbers land as soon as loadResource's
+            // priming completes.
+            stats.usedBytes = 0
+            stats.freeBytes = totalBytes
+            stats.availableBytes = totalBytes
+        }
         stats.totalFiles = 0
         stats.freeFiles = 0
         return stats

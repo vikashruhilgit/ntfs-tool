@@ -66,6 +66,17 @@ final class NTFSUnaryFS: FSUnaryFileSystem, FSUnaryFileSystemOperations, @unchec
                 let coreVolume = try await NTFSCore.Volume(device: device)
                 let volumeName = FSFileName(string: coreVolume.boot.oemID.trimmingCharacters(in: .whitespaces))
                 let volume = NTFSVolume(coreVolume: coreVolume, volumeName: volumeName, isReadOnly: true)
+
+                // Prime the allocation-stats cache so volumeStatistics returns
+                // real free/used bytes the first time vfs queries it. Best
+                // effort — if the read fails (corrupt $Bitmap), fall back to
+                // the "totalBytes free, 0 used" placeholder.
+                do {
+                    volume.cachedAllocationStats = try await coreVolume.allocationStats()
+                } catch {
+                    self.log.warning("loadResource: $Bitmap read failed: \(error.localizedDescription, privacy: .public). Stats will show placeholders.")
+                }
+
                 log.info("loadResource: NTFS volume loaded read-only")
                 reply(volume, nil)
             } catch {
