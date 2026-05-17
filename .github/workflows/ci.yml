@@ -18,7 +18,23 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select Xcode 16.3+
-        run: sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer || sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+        run: |
+          set -e
+          if [ -d "/Applications/Xcode_16.3.app" ]; then
+            sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer
+          else
+            echo "::warning::Xcode_16.3.app not present on runner; falling back to default Xcode.app"
+            sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Verify FSKit SDK is present
+        run: |
+          test -d "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/FSKit.framework" || {
+            echo "::error::FSKit.framework not in SDK $(xcrun --sdk macosx --show-sdk-path)"
+            exit 1
+          }
+          xcrun --sdk macosx --show-sdk-platform-version
 
       - name: Show Swift version
         run: swift --version
@@ -37,7 +53,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select Xcode 16.3+
-        run: sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer || sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+        run: |
+          set -e
+          if [ -d "/Applications/Xcode_16.3.app" ]; then
+            sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer
+          else
+            echo "::warning::Xcode_16.3.app not present on runner; falling back to default Xcode.app"
+            sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Verify FSKit SDK is present
+        run: |
+          test -d "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/FSKit.framework" || {
+            echo "::error::FSKit.framework not in SDK $(xcrun --sdk macosx --show-sdk-path)"
+            exit 1
+          }
 
       - name: Install xcodegen
         run: brew install xcodegen

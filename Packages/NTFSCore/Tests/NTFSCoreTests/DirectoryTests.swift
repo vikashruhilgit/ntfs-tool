@@ -62,17 +62,15 @@ final class DirectoryTests: XCTestCase {
             "hello.txt content mismatch — got \(content.count) bytes: \(String(decoding: content, as: UTF8.self))"
         )
 
-        // SHA-256 round trip: hash the bytes we read off disk and compare to
-        // the hash of the literal we wrote in make_test_images.sh. This proves
-        // the BlockDevice → Volume → MFT → DataRun → readFile chain is byte-
-        // exact, without us having to hand-compute (and potentially mis-paste)
-        // a hex digest into the test.
-        let actualHash = SHA256.hash(data: content)
-        let expectedHash = SHA256.hash(data: Data("Hello, NTFS.\n".utf8))
-        XCTAssertEqual(
-            actualHash, expectedHash,
-            "SHA-256 mismatch on round-tripped hello.txt"
-        )
+        // SHA-256 of "Hello, NTFS.\n" (13 bytes) pinned as a hex literal so
+        // the test validates against an EXTERNAL oracle rather than just
+        // CryptoKit's own output. (A `SHA256(read) == SHA256(literal)` check
+        // is mathematically equivalent to the bytes-equality assertion two
+        // lines up — both would silently pass if CryptoKit's SHA were broken.)
+        // The hex was computed via `printf 'Hello, NTFS.\n' | shasum -a 256`.
+        let actualHash = SHA256.hash(data: content).compactMap { String(format: "%02x", $0) }.joined()
+        let pinnedHash = "74c1373a760d25dd7168b74976da2ba20e167a119439ece11fbc6d4d5c1e7fbe"
+        XCTAssertEqual(actualHash, pinnedHash, "SHA-256 of hello.txt should match the pinned literal")
     }
 
     /// medium.txt is 2560 bytes ("abcdefghij" repeated 256 times = 2560 chars).

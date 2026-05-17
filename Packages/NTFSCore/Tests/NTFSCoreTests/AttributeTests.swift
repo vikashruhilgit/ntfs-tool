@@ -80,6 +80,125 @@ final class AttributeTests: XCTestCase {
         return data
     }
 
+    /// Hand-crafted MFT record holding a single non-resident $DATA attribute
+    /// whose runlist payload is the same three-run mix tested in DataRunTests
+    /// (normal positive delta, negative delta, sparse). Exercises the
+    /// Attribute → DataRun handoff and dataRunsOffset-relative slicing
+    /// without depending on the live fixture.
+    private static func recordWithNonResidentData() -> Data {
+        var data = Data(repeating: 0, count: 1024)
+
+        func writeU16(at o: Int, _ v: UInt16) {
+            data[o] = UInt8(v & 0xFF); data[o + 1] = UInt8((v >> 8) & 0xFF)
+        }
+        func writeU32(at o: Int, _ v: UInt32) {
+            for i in 0..<4 { data[o + i] = UInt8((v >> (8 * i)) & 0xFF) }
+        }
+        func writeU64(at o: Int, _ v: UInt64) {
+            for i in 0..<8 { data[o + i] = UInt8((v >> (8 * i)) & 0xFF) }
+        }
+
+        // MFT record header.
+        writeU32(at: 0, MFTRecord.magicFILE)
+        writeU16(at: 4, 48)          // usaOffset
+        writeU16(at: 6, 3)           // usaCount
+        writeU64(at: 8, 0xAAAA_BBBB) // LSN
+        writeU16(at: 16, 1)          // sequence
+        writeU16(at: 18, 1)          // hardLinkCount
+        writeU16(at: 20, 56)         // firstAttributeOffset
+
+        // Non-resident attribute is 16 (common header) + 48 (non-resident
+        // extension) + runlist bytes. Our runlist payload is 11 bytes
+        // (3 runs: 1+1+2=4, 1+1+1=3, 1+1=2, plus 0x00 terminator = 11).
+        // Round attribute length up to 8-byte alignment: 64 + 11 = 75 → 80.
+        let attrLength: UInt32 = 80
+        writeU16(at: 22, 0x0001)     // IN_USE
+        writeU32(at: 24, UInt32(56) + attrLength + 4) // usedSize = firstAttrOffset + attr + end marker
+        writeU32(at: 28, 1024)
+        writeU64(at: 32, 0)
+        writeU16(at: 40, 5)
+        writeU32(at: 44, 0)
+
+        // USA at 48.
+        writeU16(at: 48, 0xCAFE)
+        writeU16(at: 50, 0xDEAD)
+        writeU16(at: 52, 0xBEEF)
+
+        // Block-tail sentinels for USA fix-up.
+        writeU16(at: 510, 0xCAFE)
+        writeU16(at: 1022, 0xCAFE)
+
+        // Non-resident $DATA attribute at offset 56.
+        let attrStart = 56
+        writeU32(at: attrStart + 0, 0x80)        // type = $DATA
+        writeU32(at: attrStart + 4, attrLength)  // length
+        data[attrStart + 8]  = 1                 // non-resident flag
+        data[attrStart + 9]  = 0                 // name length
+        writeU16(at: attrStart + 10, 0)          // name offset
+        writeU16(at: attrStart + 12, 0)          // flags
+        writeU16(at: attrStart + 14, 0)          // attribute ID
+
+        // Non-resident extension (offsets relative to attribute start).
+        writeU64(at: attrStart + 16, 0)          // startingVCN
+        writeU64(at: attrStart + 24, 17)         // lastVCN = 8+4+6-1 = 17
+        writeU16(at: attrStart + 32, 64)         // dataRunsOffset (right after the ext)
+        data[attrStart + 34] = 0                 // compressionUnit
+        writeU32(at: attrStart + 40, 18 * 4096)  // allocatedSize (18 clusters × 4096)
+        writeU64(at: attrStart + 40, UInt64(18 * 4096))
+        writeU64(at: attrStart + 48, UInt64(17 * 4096) + 100)  // realSize (arbitrary < allocated)
+        writeU64(at: attrStart + 56, UInt64(17 * 4096) + 100)  // initializedSize
+
+        // Runlist at attrStart + 64 — same encoding as DataRunTests.mixedRunlist():
+        //   run 1: 0x21 / length=8 / offset=+100 (LE u16 = 0x64 0x00)
+        //   run 2: 0x11 / length=4 / offset=-5  (i8 = 0xFB)
+        //   run 3: 0x01 / length=6                (sparse)
+        //   terminator: 0x00
+        let runsStart = attrStart + 64
+        data[runsStart + 0]  = 0x21
+        data[runsStart + 1]  = 0x08
+        data[runsStart + 2]  = 0x64
+        data[runsStart + 3]  = 0x00
+        data[runsStart + 4]  = 0x11
+        data[runsStart + 5]  = 0x04
+        data[runsStart + 6]  = 0xFB
+        data[runsStart + 7]  = 0x01
+        data[runsStart + 8]  = 0x06
+        data[runsStart + 9]  = 0x00
+        // remaining bytes through attrStart + 80 stay zero (padding)
+
+        // End marker.
+        writeU32(at: attrStart + Int(attrLength), AttributeType.endMarker)
+
+        return data
+    }
+
+    func testIterateSingleNonResidentDataAttribute() throws {
+        let raw = Self.recordWithNonResidentData()
+        let record = try MFTRecord.parse(raw, expectedSize: 1024)
+        let attrs = try record.attributes()
+
+        XCTAssertEqual(attrs.count, 1)
+        let dataAttr = attrs[0]
+        XCTAssertEqual(dataAttr.type, .data)
+        XCTAssertTrue(dataAttr.header.nonResident)
+        XCTAssertEqual(dataAttr.header.length, 80)
+
+        guard case let .nonResident(startingVCN, lastVCN, dataRunsOffset, _, _, _, _, extents) = dataAttr.value else {
+            return XCTFail("expected non-resident value")
+        }
+        XCTAssertEqual(startingVCN, 0)
+        XCTAssertEqual(lastVCN, 17)
+        XCTAssertEqual(dataRunsOffset, 64)
+
+        XCTAssertEqual(extents.count, 3)
+        XCTAssertEqual(extents[0].startLCN, 100)
+        XCTAssertEqual(extents[0].clusterCount, 8)
+        XCTAssertEqual(extents[1].startLCN, 95)        // 100 + (-5)
+        XCTAssertEqual(extents[1].clusterCount, 4)
+        XCTAssertNil(extents[2].startLCN)              // sparse
+        XCTAssertEqual(extents[2].clusterCount, 6)
+    }
+
     func testIterateSingleResidentAttribute() throws {
         let raw = Self.recordWithStandardInformation()
         let record = try MFTRecord.parse(raw, expectedSize: 1024)
