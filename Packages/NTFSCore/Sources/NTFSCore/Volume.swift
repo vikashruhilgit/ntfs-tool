@@ -135,6 +135,64 @@ public actor Volume {
         )
     }
 
+    /// Allocate a contiguous run of `count` clusters from $Bitmap, persist
+    /// the updated $Bitmap back to disk, and return the granted Extent.
+    /// Throws `outOfSpace` if no run of the requested length exists.
+    ///
+    /// Phase 5b: contiguous-only allocator. Phase 5c will add a fall-back
+    /// path that splits a request into multiple extents when no single run
+    /// is large enough (common on fragmented volumes).
+    public func allocateClusters(_ count: UInt64) async throws -> Extent {
+        var bm = try await bitmap()
+        let extent = try bm.allocate(count)
+        try await persistBitmap(bm)
+        _bitmap = bm
+        return extent
+    }
+
+    /// Free a previously-allocated extent and persist the updated $Bitmap.
+    public func freeClusters(_ extent: Extent) async throws {
+        var bm = try await bitmap()
+        try bm.free(extent)
+        try await persistBitmap(bm)
+        _bitmap = bm
+    }
+
+    /// Persist the in-memory Bitmap back to the on-disk $Bitmap attribute.
+    /// Walks $Bitmap's $DATA extents and writes the corresponding bitmap
+    /// bytes via `BlockDevice.write`. For a resident $Bitmap (a degenerate
+    /// case that doesn't happen on real volumes since $Bitmap is always
+    /// non-resident), we'd need to rewrite the MFT record — out of scope
+    /// for stage 2.
+    private func persistBitmap(_ bm: Bitmap) async throws {
+        let mft = self.mft()
+        let bitmapRecord = try await mft.record(at: Self.bitmapRecordNumber)
+        let attrs = try bitmapRecord.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "$Bitmap record \(Self.bitmapRecordNumber) has no $DATA"
+            )
+        }
+        guard case let .nonResident(_, _, _, _, _, _, _, extents) = dataAttr.value else {
+            throw NTFSError.unsupportedFeature(
+                description: "$Bitmap is resident — rewriting the MFT record is not yet supported"
+            )
+        }
+
+        let clusterBytes = UInt64(bytesPerCluster)
+        var bytesRemaining = bm.bytes
+        for extent in extents where !bytesRemaining.isEmpty {
+            guard let startLCN = extent.startLCN else { continue }  // sparse
+            let extentBytes = Int(min(extent.clusterCount * clusterBytes, UInt64(bytesRemaining.count)))
+            let chunk = bytesRemaining.prefix(extentBytes)
+            try await device.write(
+                offset: startLCN * clusterBytes,
+                bytes: Data(chunk)
+            )
+            bytesRemaining = bytesRemaining.dropFirst(extentBytes)
+        }
+    }
+
     /// Enumerate the children of the directory at `recordNumber`. For the root
     /// directory pass `recordNumber: 5`. Returns the entries in the order they
     /// appear in the $I30 index (sorted by NTFS collation, typically Unicode
