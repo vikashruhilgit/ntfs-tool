@@ -16,7 +16,9 @@ final class NTFSVolume: FSVolume,
 
     private let log = Logger(subsystem: "com.ntfs-tool.fskit", category: "NTFSVolume")
 
-    private let coreVolume: NTFSCore.Volume
+    /// Internal-visible so NTFSItem can read live MFT records when building
+    /// fresh attributes (see NTFSItem.makeFreshAttributes(volume:)).
+    let coreVolume: NTFSCore.Volume
     private let isReadOnly: Bool
 
     /// Cache items by MFT record number so repeated lookups don't allocate.
@@ -119,7 +121,36 @@ final class NTFSVolume: FSVolume,
             reply(nil, posixError(EBADF))
             return
         }
-        reply(ntfsItem.makeAttributes(volume: self), nil)
+
+        // If the caller wants any size or time attribute, do a fresh read off
+        // the live MFT record so we don't hand back stale $FILE_NAME values
+        // (NTFS-by-design quirk: $FILE_NAME sizes/times are written at
+        // create/rename and never updated thereafter). For caller requests
+        // that only want IDs / type / mode, the cheap snapshot is enough.
+        let needsFresh = desiredAttributes.isAttributeWanted(.size)
+            || desiredAttributes.isAttributeWanted(.allocSize)
+            || desiredAttributes.isAttributeWanted(.modifyTime)
+            || desiredAttributes.isAttributeWanted(.changeTime)
+            || desiredAttributes.isAttributeWanted(.accessTime)
+            || desiredAttributes.isAttributeWanted(.birthTime)
+            || desiredAttributes.isAttributeWanted(.flags)
+            || desiredAttributes.isAttributeWanted(.linkCount)
+
+        if needsFresh {
+            Task {
+                do {
+                    let fresh = try await ntfsItem.makeFreshAttributes(volume: self)
+                    reply(fresh, nil)
+                } catch {
+                    // Fresh-read failed (record corrupt, IO error, etc) — fall back
+                    // to the stale snapshot rather than failing the getattr outright.
+                    self.log.warning("getAttributes: fresh read failed for record \(ntfsItem.recordNumber): \(error.localizedDescription, privacy: .public). Returning stale snapshot.")
+                    reply(ntfsItem.makeAttributes(volume: self), nil)
+                }
+            }
+        } else {
+            reply(ntfsItem.makeAttributes(volume: self), nil)
+        }
     }
 
     func setAttributes(
@@ -306,11 +337,13 @@ final class NTFSVolume: FSVolume,
                     reply(0, nil)
                     return
                 }
-                let copyCount = slice.count
-                buffer.withUnsafeMutableBytes { dest in
-                    _ = slice.copyBytes(to: dest.bindMemory(to: UInt8.self))
+                // Use copyBytes's actual return value so reported count is
+                // provably consistent with what was written, even if a
+                // future FSKit bumps buffer-size contract semantics.
+                let actuallyCopied = buffer.withUnsafeMutableBytes { dest -> Int in
+                    slice.copyBytes(to: dest.bindMemory(to: UInt8.self))
                 }
-                reply(copyCount, nil)
+                reply(actuallyCopied, nil)
             } catch {
                 reply(0, error)
             }

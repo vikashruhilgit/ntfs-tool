@@ -123,6 +123,63 @@ final class NTFSItem: FSItem {
         return attrs
     }
 
+    /// Produce attributes refreshed from the live MFT record — read
+    /// `$STANDARD_INFORMATION` for canonical timestamps and the unnamed
+    /// `$DATA` attribute for the real file size. The cheap `makeAttributes`
+    /// path uses `$FILE_NAME` values which are populated at create/rename
+    /// and never updated after, so a file written after creation shows
+    /// `size: 0` and stale timestamps. Use this path from any getAttributes
+    /// callback that wants the truth.
+    ///
+    /// Per-call cost is one MFT record read + an attribute walk. For bulk
+    /// directory listings that doesn't want this overhead, the cheap path
+    /// remains available.
+    func makeFreshAttributes(volume: NTFSVolume) async throws -> FSItem.Attributes {
+        let coreVolume = volume.coreVolume
+        let mft = await coreVolume.mft()
+        let record = try await mft.record(at: recordNumber)
+        let attrs = try record.attributes()
+
+        // Start from the cheap snapshot, then overwrite the fields that the
+        // live record gives us better values for.
+        let result = makeAttributes(volume: volume)
+
+        if let siAttr = attrs.first(where: { $0.type == .standardInformation }),
+           case let .resident(siBytes, _) = siAttr.value,
+           let si = try? StandardInformation.parse(siBytes) {
+            result.modifyTime = Self.makeTimespec(from: si.modificationTime)
+            result.changeTime = Self.makeTimespec(from: si.mftChangeTime)
+            result.accessTime = Self.makeTimespec(from: si.accessTime)
+            result.birthTime  = Self.makeTimespec(from: si.creationTime)
+            result.addedTime  = Self.makeTimespec(from: si.creationTime)
+            result.flags      = si.fileAttributes
+        }
+
+        if let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) {
+            switch dataAttr.value {
+            case let .resident(bytes, _):
+                result.size = UInt64(bytes.count)
+                result.allocSize = UInt64(bytes.count)
+            case let .nonResident(_, _, _, _, allocatedSize, realSize, _, _):
+                result.size = realSize
+                result.allocSize = allocatedSize
+            }
+        }
+
+        result.linkCount = UInt32(record.hardLinkCount)
+        result.type = record.isDirectory ? .directory : .file
+
+        return result
+    }
+
+    private static func makeTimespec(from date: Date?) -> Darwin.timespec {
+        guard let date = date else { return Darwin.timespec(tv_sec: 0, tv_nsec: 0) }
+        let interval = date.timeIntervalSince1970
+        let seconds = Int(interval)
+        let nanos = Int((interval - Double(seconds)) * 1_000_000_000)
+        return Darwin.timespec(tv_sec: seconds, tv_nsec: nanos)
+    }
+
     /// MFT record number of NTFS's root directory. Static for use from
     /// `enumerateDirectory` where we don't have an NTFSItem instance yet.
     static let rootRecordNumber: UInt64 = 5

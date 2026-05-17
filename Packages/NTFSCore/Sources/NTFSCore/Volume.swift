@@ -236,9 +236,26 @@ public actor Volume {
         var collected: [DirectoryEntry] = []
         let clusterBytes = UInt64(bytesPerCluster)
 
+        // INDX blocks are sized by indexRecordSizeBytes — not necessarily one
+        // cluster. On a 4 KiB-cluster + 4 KiB-INDX volume (the common case)
+        // each cluster IS one block, but on volumes where indexRecordSizeBytes
+        // > bytesPerCluster (e.g. 4 KiB clusters + 8 KiB INDX records) each
+        // INDX spans multiple clusters and stepping cluster-by-cluster
+        // misaligns reads. Walk by block instead.
+        guard blockSize > 0, blockSize % Int(clusterBytes) == 0 || Int(clusterBytes) % blockSize == 0 else {
+            throw NTFSError.corruptOnDisk(
+                description: "indexRecordSizeBytes \(blockSize) is not a multiple/divisor of cluster size \(clusterBytes)"
+            )
+        }
+        let clustersPerBlock = max(UInt64(1), UInt64(blockSize) / clusterBytes)
+
         for extent in extents {
             guard let startLCN = extent.startLCN else { continue } // skip sparse
-            for cluster in 0..<extent.clusterCount {
+            // Stride by clustersPerBlock so we land on each INDX-block boundary.
+            // For the common 1-cluster-per-block case this collapses to the
+            // original per-cluster loop.
+            var cluster: UInt64 = 0
+            while cluster < extent.clusterCount {
                 let (clusterLCN, addOverflow) = startLCN.addingReportingOverflow(cluster)
                 guard !addOverflow else {
                     throw NTFSError.corruptOnDisk(description: "$INDEX_ALLOCATION extent cluster index overflows UInt64")
@@ -261,6 +278,7 @@ public actor Volume {
                         collected.append(de)
                     }
                 }
+                cluster += clustersPerBlock
             }
         }
         return collected
@@ -358,6 +376,18 @@ public actor Volume {
     }
 
     private func readNonResidentData(extents: [Extent], realSize: UInt64, lastVCN: UInt64) async throws -> Data {
+        // lastVCN is the runlist's claimed final virtual-cluster index; the sum
+        // of extent cluster counts must be lastVCN+1 (or more, if the trailing
+        // allocation is larger than realSize). Catch mismatches early — a
+        // corrupt runlist that lies about coverage would otherwise just
+        // short-read with no signal.
+        let totalRunClusters = DataRun.totalClusters(extents)
+        if extents.count > 0, totalRunClusters < lastVCN + 1 {
+            throw NTFSError.corruptOnDisk(
+                description: "$DATA runlist covers \(totalRunClusters) clusters but lastVCN=\(lastVCN) requires at least \(lastVCN + 1)"
+            )
+        }
+
         guard realSize <= UInt64(Int.max) else {
             throw NTFSError.corruptOnDisk(
                 description: "$DATA realSize \(realSize) exceeds Int.max — refusing to allocate"
@@ -406,9 +436,6 @@ public actor Volume {
             }
             remaining -= takeBytes
         }
-
-        // lastVCN is informational here; track that we honored realSize.
-        _ = lastVCN
 
         return out
     }

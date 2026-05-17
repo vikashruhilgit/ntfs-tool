@@ -36,6 +36,8 @@ Requires Swift 6.0+ (Xcode 16.3+) targeting macOS 15+.
 
 The output `small.img` (~4 MiB) is committed to the repo so CI does not need Docker — only the unit tests reading the fixture run there. Regenerate only when the fixture's contents need to change (new in-image test files, new sizes, etc) and commit the new `small.img` alongside the test code that depends on it. Requires Docker Desktop (`open -a Docker`) running on macOS.
 
+**Fixture budget:** total committed fixture footprint must stay below **25 MiB**. The next fixture that would exceed this triggers migration of `Tests/NTFSCoreTests/Fixtures/` to Git LFS (`git lfs install && git lfs track "*.img"`). Until then inline commits are fine and avoid LFS quota / fork-pollution friction.
+
 Hand-crafted 512-byte boot-sector literals in `BootSectorTests` continue to cover the parser's corruption-rejection cases — those tests never touch disk.
 
 ## Mounting an NTFS volume via the FSKit extension (Phase 2 manual smoke test)
