@@ -18,12 +18,35 @@ Project conventions and architecture live in [CLAUDE.md](CLAUDE.md).
 ## Building & testing
 
 ```bash
+# NTFSCore (parsing library) — buildable + testable with no Xcode
 cd Packages/NTFSCore
 swift build
 swift test
+
+# ntfsctl (command-line companion) — same, no Xcode
+cd Tools/ntfsctl
+swift build
+.build/debug/ntfsctl info ../../Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+
+# FSKit extension + menu-bar GUI — require Xcode
+xcodegen generate
+xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager build
+xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSFileSystem build
 ```
 
 Requires Swift 6.0+ (Xcode 16.3+) targeting macOS 15+.
+
+## ntfsctl quick reference
+
+```bash
+ntfsctl info <device>            # boot sector + MFT placement
+ntfsctl list <device> [recnum]   # list a directory (default = root, MFT 5)
+ntfsctl list --long <device>     # add size + namespace + parent ref
+ntfsctl verify <device>          # parse MFT records 0..63, report errors
+ntfsctl cat <device> <recnum>    # dump a file's bytes (by MFT record number)
+```
+
+The CLI operates on raw block devices (`/dev/diskNsM`) or disk-image files; it does **not** need the FSKit extension to be active. `ntfsctl verify` is the alternate verification path for confirming the same volume the extension would mount actually parses cleanly.
 
 ## Generating test fixtures
 

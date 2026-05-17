@@ -7,18 +7,27 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		21A4A75C7F50E50DA8213556 /* Info.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4126B01F860CB4A427613EB6 /* Info.swift */; };
 		21E98A27BEA920BA59362F20 /* NTFSCore in Frameworks */ = {isa = PBXBuildFile; productRef = 387AA4DBE0FBBEF7BD24A6E7 /* NTFSCore */; };
+		33BEF93E7789FE406DC41CEB /* NTFSCore in Frameworks */ = {isa = PBXBuildFile; productRef = 361533FD035B11636B2B68D5 /* NTFSCore */; };
 		4132D3E45E6226359DF28725 /* NTFSUnaryFS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43ACC1740AE27F5F1F244E0A /* NTFSUnaryFS.swift */; };
 		432DE1CA11DF1A500A0E8121 /* NTFSCore in Frameworks */ = {isa = PBXBuildFile; productRef = EED6039FC9F604323FFB010D /* NTFSCore */; };
+		4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 138AC53F11BB4630926D3661 /* MenuBarContent.swift */; };
 		54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */; };
 		7D4143F793CD345F7651B4B1 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */; };
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
 		84561F4715F1DFA581FFB5D8 /* NTFSFileSystem.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5684F8D00837370737BB2555 /* ContentView.swift */; };
+		A283CF3E3376BC4686313635 /* Verify.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20E22577EA73CB6742243E11 /* Verify.swift */; };
 		A9E17066DF075F9BA303EAA2 /* NTFSItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = F82499EDC514F10F561B7784 /* NTFSItem.swift */; };
+		AFE66833D21DBA777309099F /* ntfsctl.swift in Sources */ = {isa = PBXBuildFile; fileRef = D05B381FF347C123E61FD621 /* ntfsctl.swift */; };
+		B2FACFD1EEA0B776368CEC67 /* List.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B9DB06823B01F8100989970 /* List.swift */; };
+		B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */; };
 		B9751912CAE0F2EA9A170F9E /* FSKitBlockDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */; };
+		BBB98DE04B189933E57E523D /* Cat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */; };
 		CFB3B74CC0B795207981A6FC /* NTFSFileSystemExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */; };
 		E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */; };
+		EF91959587345A62A4C6F9C7 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = 5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -47,14 +56,22 @@
 
 /* Begin PBXFileReference section */
 		00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionInstaller.swift; sourceTree = "<group>"; };
+		09D3FC8C31A4FC193F55D32C /* ntfsctl */ = {isa = PBXFileReference; includeInIndex = 0; path = ntfsctl; sourceTree = BUILT_PRODUCTS_DIR; };
+		138AC53F11BB4630926D3661 /* MenuBarContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarContent.swift; sourceTree = "<group>"; };
+		1B9DB06823B01F8100989970 /* List.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = List.swift; sourceTree = "<group>"; };
+		20E22577EA73CB6742243E11 /* Verify.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Verify.swift; sourceTree = "<group>"; };
+		2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cat.swift; sourceTree = "<group>"; };
+		4126B01F860CB4A427613EB6 /* Info.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Info.swift; sourceTree = "<group>"; };
 		43ACC1740AE27F5F1F244E0A /* NTFSUnaryFS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSUnaryFS.swift; sourceTree = "<group>"; };
 		4CC62877FC7ADECC37C4FC47 /* NTFSCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NTFSCore; path = Packages/NTFSCore; sourceTree = SOURCE_ROOT; };
 		5684F8D00837370737BB2555 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKitBlockDevice.swift; sourceTree = "<group>"; };
+		73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskArbitrationService.swift; sourceTree = "<group>"; };
 		82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = NTFSFileSystem.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSMountManagerApp.swift; sourceTree = "<group>"; };
 		9C014D4357F452F985A593B1 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
 		C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSVolume.swift; sourceTree = "<group>"; };
+		D05B381FF347C123E61FD621 /* ntfsctl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ntfsctl.swift; sourceTree = "<group>"; };
 		D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSFileSystemExtension.swift; sourceTree = "<group>"; };
 		D95B833D3F9CBB00BD401B92 /* NTFSMountManager.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NTFSMountManager.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F82499EDC514F10F561B7784 /* NTFSItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSItem.swift; sourceTree = "<group>"; };
@@ -75,6 +92,15 @@
 			files = (
 				432DE1CA11DF1A500A0E8121 /* NTFSCore in Frameworks */,
 				83C5AB393704602915008B48 /* FSKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A257354331660F691E77AA7D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				33BEF93E7789FE406DC41CEB /* NTFSCore in Frameworks */,
+				EF91959587345A62A4C6F9C7 /* ArgumentParser in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -101,7 +127,9 @@
 			isa = PBXGroup;
 			children = (
 				5684F8D00837370737BB2555 /* ContentView.swift */,
+				73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */,
 				00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */,
+				138AC53F11BB4630926D3661 /* MenuBarContent.swift */,
 				8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */,
 			);
 			path = Sources;
@@ -113,6 +141,7 @@
 				0EE4872174B6EC025B36B5C6 /* Apps */,
 				1C55BA2A8B7819E8A7714BF8 /* Extensions */,
 				3EB674BBB3EF2D83BD06DA8C /* Packages */,
+				624293EBA70027E7DABA339B /* Tools */,
 				35304404C6628BA50DC41BAD /* Frameworks */,
 				82BFF7C6E0671CB1D5FF1B9C /* Products */,
 			);
@@ -146,13 +175,42 @@
 			path = Sources;
 			sourceTree = "<group>";
 		};
+		624293EBA70027E7DABA339B /* Tools */ = {
+			isa = PBXGroup;
+			children = (
+				C903328DD9BD85CBEBFB87BC /* ntfsctl */,
+			);
+			path = Tools;
+			sourceTree = "<group>";
+		};
+		7A3A362088FBA7905C508356 /* ntfsctl */ = {
+			isa = PBXGroup;
+			children = (
+				2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */,
+				4126B01F860CB4A427613EB6 /* Info.swift */,
+				1B9DB06823B01F8100989970 /* List.swift */,
+				D05B381FF347C123E61FD621 /* ntfsctl.swift */,
+				20E22577EA73CB6742243E11 /* Verify.swift */,
+			);
+			path = ntfsctl;
+			sourceTree = "<group>";
+		};
 		82BFF7C6E0671CB1D5FF1B9C /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				09D3FC8C31A4FC193F55D32C /* ntfsctl */,
 				82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */,
 				D95B833D3F9CBB00BD401B92 /* NTFSMountManager.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		8760F97F8A4349FA63784E71 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				7A3A362088FBA7905C508356 /* ntfsctl */,
+			);
+			path = Sources;
 			sourceTree = "<group>";
 		};
 		8D62129F707305A5EE57C591 /* NTFSFileSystem */ = {
@@ -169,6 +227,14 @@
 				1D277ED2F0C730E6AD914DB3 /* Sources */,
 			);
 			path = NTFSMountManager;
+			sourceTree = "<group>";
+		};
+		C903328DD9BD85CBEBFB87BC /* ntfsctl */ = {
+			isa = PBXGroup;
+			children = (
+				8760F97F8A4349FA63784E71 /* Sources */,
+			);
+			path = ntfsctl;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -194,6 +260,26 @@
 			productName = NTFSMountManager;
 			productReference = D95B833D3F9CBB00BD401B92 /* NTFSMountManager.app */;
 			productType = "com.apple.product-type.application";
+		};
+		2485D5A272EA9DB7B479260D /* ntfsctl */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4A94394592847CBC8A4457F9 /* Build configuration list for PBXNativeTarget "ntfsctl" */;
+			buildPhases = (
+				4704142DB7367AE5B91FF6DE /* Sources */,
+				A257354331660F691E77AA7D /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ntfsctl;
+			packageProductDependencies = (
+				361533FD035B11636B2B68D5 /* NTFSCore */,
+				5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */,
+			);
+			productName = ntfsctl;
+			productReference = 09D3FC8C31A4FC193F55D32C /* ntfsctl */;
+			productType = "com.apple.product-type.tool";
 		};
 		C999CC268F92FFEAC8204988 /* NTFSFileSystem */ = {
 			isa = PBXNativeTarget;
@@ -227,6 +313,10 @@
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
+					2485D5A272EA9DB7B479260D = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
 					C999CC268F92FFEAC8204988 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
@@ -243,6 +333,7 @@
 			mainGroup = 272ED651801774056685C147;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				7D761D3355081F77909C4863 /* XCRemoteSwiftPackageReference "swift-argument-parser" */,
 				4967F3E4688D9349D2468E18 /* XCLocalSwiftPackageReference "Packages/NTFSCore" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -252,17 +343,32 @@
 			targets = (
 				C999CC268F92FFEAC8204988 /* NTFSFileSystem */,
 				1AE32544B7D0BD9E664FC9FE /* NTFSMountManager */,
+				2485D5A272EA9DB7B479260D /* ntfsctl */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXSourcesBuildPhase section */
+		4704142DB7367AE5B91FF6DE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BBB98DE04B189933E57E523D /* Cat.swift in Sources */,
+				21A4A75C7F50E50DA8213556 /* Info.swift in Sources */,
+				B2FACFD1EEA0B776368CEC67 /* List.swift in Sources */,
+				A283CF3E3376BC4686313635 /* Verify.swift in Sources */,
+				AFE66833D21DBA777309099F /* ntfsctl.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		62ABB4C4B000DD4B44FFC12B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */,
+				B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */,
 				E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */,
+				4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */,
 				54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -290,6 +396,21 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		01C6C57E2C02ED996ABBE882 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.ntfs-tool.ntfsctl";
+				SDKROOT = macosx;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5;
+			};
+			name = Debug;
+		};
 		1D4DDA51B313665ADE94E086 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -491,9 +612,33 @@
 			};
 			name = Release;
 		};
+		E9F4E22488EF790885A5C488 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.ntfs-tool.ntfsctl";
+				SDKROOT = macosx;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		4A94394592847CBC8A4457F9 /* Build configuration list for PBXNativeTarget "ntfsctl" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				01C6C57E2C02ED996ABBE882 /* Debug */,
+				E9F4E22488EF790885A5C488 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		7A0E504463F0E56737A815C1 /* Build configuration list for PBXNativeTarget "NTFSFileSystem" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -530,10 +675,30 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		7D761D3355081F77909C4863 /* XCRemoteSwiftPackageReference "swift-argument-parser" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-argument-parser.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.3.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
+		361533FD035B11636B2B68D5 /* NTFSCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = NTFSCore;
+		};
 		387AA4DBE0FBBEF7BD24A6E7 /* NTFSCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = NTFSCore;
+		};
+		5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 7D761D3355081F77909C4863 /* XCRemoteSwiftPackageReference "swift-argument-parser" */;
+			productName = ArgumentParser;
 		};
 		EED6039FC9F604323FFB010D /* NTFSCore */ = {
 			isa = XCSwiftPackageProductDependency;
