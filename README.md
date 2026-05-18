@@ -33,7 +33,18 @@ Built for macOS 15.4+ (Sequoia) on Apple Silicon. Swift 6.0+ / Xcode 16.3+ to bu
 
 ## Quick start — CLI
 
-### Build
+### Install (prebuilt binary, no Xcode needed)
+
+Once v0.2.0 is published on the [Releases page](https://github.com/vikashruhilgit/ntfs-tool/releases):
+
+```bash
+TAG=v0.2.0
+curl -L "https://github.com/vikashruhilgit/ntfs-tool/releases/download/${TAG}/ntfsctl-${TAG}-macos-arm64.tar.gz" | tar xz
+sudo mv "ntfsctl-${TAG}-macos-arm64" /usr/local/bin/ntfsctl
+ntfsctl --version
+```
+
+### Build from source
 
 ```bash
 cd Tools/ntfsctl

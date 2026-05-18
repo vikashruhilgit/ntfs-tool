@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # any v0.2.0, v0.2.1, etc.
+
+# We need write permission to upload release assets.
+permissions:
+  contents: write
+
+jobs:
+  ntfsctl-release-binary:
+    name: Build + attach ntfsctl binary to release
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.3+
+        run: |
+          set -e
+          if [ -d "/Applications/Xcode_16.3.app" ]; then
+            sudo xcode-select -switch /Applications/Xcode_16.3.app/Contents/Developer
+          else
+            echo "::warning::Xcode_16.3.app not present on runner; falling back to default Xcode.app"
+            sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Resolve dependencies
+        working-directory: Tools/ntfsctl
+        run: swift package resolve
+
+      - name: Build release binary (arm64)
+        working-directory: Tools/ntfsctl
+        run: |
+          set -e
+          swift build --configuration release --arch arm64
+          # Where the binary ends up depends on Swift version / arch flags;
+          # search the build dir to be robust.
+          BIN=$(find .build -type f -name ntfsctl -perm +111 | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::error::ntfsctl binary not found under .build"
+            find .build -type f -name 'ntfsctl*' || true
+            exit 1
+          fi
+          echo "Binary: $BIN"
+          file "$BIN"
+          # Stage into a flat artifact dir with a versioned name.
+          TAG="${GITHUB_REF_NAME}"  # e.g. v0.2.0
+          mkdir -p ../../release
+          cp "$BIN" "../../release/ntfsctl-${TAG}-macos-arm64"
+          # Also include LICENSE + README + STATUS for context.
+          cp ../../LICENSE ../../release/
+          cp ../../README.md ../../release/
+          # Tarball for `curl | tar` install convenience.
+          cd ../../release
+          tar czf "ntfsctl-${TAG}-macos-arm64.tar.gz" "ntfsctl-${TAG}-macos-arm64" LICENSE README.md
+          shasum -a 256 "ntfsctl-${TAG}-macos-arm64" "ntfsctl-${TAG}-macos-arm64.tar.gz" > SHA256SUMS.txt
+          ls -la
+
+      - name: Smoke-test the release binary against the committed fixture
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          BIN="release/ntfsctl-${TAG}-macos-arm64"
+          "$BIN" --version
+          "$BIN" info Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+          "$BIN" list  Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+          "$BIN" verify Packages/NTFSCore/Tests/NTFSCoreTests/Fixtures/small.img
+
+      - name: Create GitHub Release + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          # Generate release notes from the most recent commit message if no
+          # tag annotation; otherwise use the annotation.
+          NOTES=$(git tag -l --format='%(contents)' "$TAG")
+          if [ -z "$NOTES" ]; then
+            NOTES=$(git log -1 --format='%B' "$TAG")
+          fi
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "$NOTES" \
+            --draft \
+            release/ntfsctl-${TAG}-macos-arm64 \
+            release/ntfsctl-${TAG}-macos-arm64.tar.gz \
+            release/SHA256SUMS.txt
+          echo "Release drafted. Review + publish at:"
+          gh release view "$TAG" --json url -q .url

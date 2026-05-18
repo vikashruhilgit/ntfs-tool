@@ -2,7 +2,9 @@
 
 This document is the single source of truth for project state. Updated when major work lands.
 
-**Last updated:** 2026-05-18, after Phase 5f-pre+ work (recursive copy, LARGE_INDEX insert + promotion, streaming I/O, mid-file write, byte-precise truncate, rename, reverse cp, rm -r, scan, full-MFT verify).
+**Last updated:** 2026-05-18, after the v0.2 audit-driven push: T0 safety (dirty bit + fsync + flock + rm safety + --recnum + verify cap + MIT LICENSE), T1.1 MFT $BITMAP allocator, T1.2 LARGE_INDEX leaf split, T1.3 LARGE_INDEX size hint refresh, T1.4 mtime updates, T2.1 release CI workflow.
+
+**Audit status:** every FATAL + CRITICAL item from [`AUDIT-REPORT.md`](../AUDIT-REPORT.md) is closed. WARNING #9 (streaming bitmap reader) and #11 (pre-baked test Docker image) deferred to v0.3.
 **Rubric score:** 30/30 baseline from `.supervisor/requirements/auto-2026-05-14-203703-ntfs-multi-phase-rubric.md`, plus three follow-on capabilities (see "What's done — post-v0.1 enhancements").
 
 ## Contents
@@ -250,12 +252,14 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 ### High-impact
 
 1. ~~**Path-based subcommand resolution.**~~ ✅ Done.
-2. **LARGE_INDEX leaf split.** A scaffold exists in `splitLeafAndPromote` but is disabled — the first split works in isolation, the second split (when `$INDEX_ROOT` already has an interior entry) corrupts state so later USA fix-up rejects the record. Root cause needs investigation: likely either the `$INDEX_ROOT` interior-entry serialization, the `$INDEX_ALLOCATION` runlist re-encoding, or the parent record's USA / used-size update after attribute resize. Wire it up after fixing. ~2-3 days. Without it, `cp -r` of folders with > ~50 files into a single fresh dir hits `unsupportedFeature(leaf full)`. (Existing Windows-formatted volumes typically already have multi-leaf trees so the per-leaf cap matters less for inserts into pre-existing folders.)
-3. ~~**Partial mid-file overwrites.**~~ ✅ Done — `write` now accepts arbitrary `0 < offset < size` as in-place patch (calls `overwriteRange`).
+2. ~~**LARGE_INDEX leaf split.**~~ ✅ Done (T1.2). Directories grow past the single-leaf cap; tested to 40+ inserts. The actual remaining cap is `$MFT.$DATA` growth.
+3. ~~**Partial mid-file overwrites.**~~ ✅ Done.
 4. ~~**Streaming `cat` for large files.**~~ ✅ Done.
-5. ~~**Stale `$FILE_NAME` size hints.**~~ ✅ Done for resident-$INDEX_ROOT parents (`refreshParentI30Size`). LARGE_INDEX parents still have stale hints — fixing requires the same B-tree walk + leaf rewrite path that leaf-split needs.
-6. **Free-space pre-check across LARGE_INDEX leaves.** The `cp -r` pre-check verifies total bytes but not per-directory leaf room. If a fresh destination directory will overflow its single leaf, the copy fails partway. Fix: estimate inserts-per-leaf during the dry-run phase and warn. ~half a day.
-7. **`mtime`/`atime` updates on read/write.** NTFS conventionally updates access/modification time on each operation. We don't touch them, so timestamps stay frozen at creation. Half a day for the obvious cases.
+5. ~~**Stale `$FILE_NAME` size hints.**~~ ✅ Done for both resident and LARGE_INDEX parents (T1.3).
+6. ~~**`mtime` updates on write.**~~ ✅ Done (T1.4). `atime` deferred — most NTFS-on-Windows volumes have atime updates disabled by default (perf), no value-add for this CLI.
+7. **`$MFT.$DATA` growth.** When the bitmap runs out of slots within `$MFT.$DATA.allocatedSize`, we throw `unsupportedFeature("growing $MFT")`. On real drives this cap is in the tens of thousands of records — plenty for phone backups. Implementation: allocate more clusters via `$Bitmap`, extend `$MFT.$DATA`'s runlist + `$MFT.$BITMAP`'s coverage. ~1-2 days.
+8. **`cp --resume`.** Skip files already present at destination (by name + size match, or optional SHA-256). Important for multi-GB copies over flaky USB. ~1 day.
+9. **Streaming bitmap reader.** `$Bitmap` is loaded whole into RAM (~250 MB for 8 TB volumes). Chunk on demand. ~1-2 days. Defer to v0.3.
 
 ### Medium-impact
 
