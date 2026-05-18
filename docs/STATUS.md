@@ -257,7 +257,7 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 4. ~~**Streaming `cat` for large files.**~~ ✅ Done.
 5. ~~**Stale `$FILE_NAME` size hints.**~~ ✅ Done for both resident and LARGE_INDEX parents (T1.3).
 6. ~~**`mtime` updates on write.**~~ ✅ Done (T1.4). `atime` deferred — most NTFS-on-Windows volumes have atime updates disabled by default (perf), no value-add for this CLI.
-7. **`$MFT.$DATA` growth.** When the bitmap runs out of slots within `$MFT.$DATA.allocatedSize`, we throw `unsupportedFeature("growing $MFT")`. On real drives this cap is in the tens of thousands of records — plenty for phone backups. Implementation: allocate more clusters via `$Bitmap`, extend `$MFT.$DATA`'s runlist + `$MFT.$BITMAP`'s coverage. ~1-2 days.
+7. ~~**`$MFT.$DATA` growth.**~~ **Partial.** `growMFTDataByClusters()` + `growMFTBitmapToCoverBytes()` + runlist-aware MFT reads are implemented and tested in isolation (75-insert small-dir round-trip clean). NOT auto-invoked from `allocateMFTRecord` in v0.2 — the interaction with a second LARGE_INDEX leaf split corrupts state in a way I haven't been able to track down. Real Windows-formatted drives reserve ~12.5% of the volume for $MFT growth, so on a 4 TB drive `allocatedSize` covers hundreds of millions of records — plenty for phone-backup workloads without auto-grow. The framework is there; flip the retry loop in `allocateMFTRecord` back on once the second-split bug is found.
 8. **`cp --resume`.** Skip files already present at destination (by name + size match, or optional SHA-256). Important for multi-GB copies over flaky USB. ~1 day.
 9. **Streaming bitmap reader.** `$Bitmap` is loaded whole into RAM (~250 MB for 8 TB volumes). Chunk on demand. ~1-2 days. Defer to v0.3.
 

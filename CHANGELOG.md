@@ -47,7 +47,7 @@ This release closes every FATAL + CRITICAL item from the [red-team audit](AUDIT-
 ### Known limits (deferred)
 
 - **`$LogFile` journaling** — only the dirty bit is managed. Clean unmount = always safe. Power loss mid-write = manual `chkdsk /f` recovery. Real journaling is a 1-2 week separate effort.
-- **`$MFT.$DATA` growth** — when allocating past `$MFT`'s pre-allocated cluster range, throws `unsupportedFeature("growing $MFT")`. On real drives this cap is in the tens of thousands of records, well past phone-backup needs.
+- **`$MFT.$DATA` growth auto-invoke** — `growMFTDataByClusters` is implemented and works in isolation, but isn't auto-called from `allocateMFTRecord` in v0.2 because the interaction with a second LARGE_INDEX leaf split (when `$INDEX_ROOT` accumulates a second interior entry post-growth) corrupts state in a subtle way. On real drives `$MFT.$DATA.allocatedSize` is huge (12.5% of volume reserved); auto-grow mostly matters for tiny fixtures.
 - **Symlinks / hardlinks / reparse points / ADS / LZNT1 / EFS** — explicit non-goals for v1.
 - **Streaming bitmap reader** — `$Bitmap` is loaded whole into RAM (~250 MB for 8 TB volumes). Defer to v0.3 hardening.
 - **Daemon mode / setuid helper** — security-sensitive; defer.

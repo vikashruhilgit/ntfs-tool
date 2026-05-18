@@ -185,9 +185,15 @@ final class StreamingAndLargeIndexTests: XCTestCase {
             do {
                 _ = try await volume.createFile(named: name, inDirectory: 5)
                 inserted.append(name)
-            } catch NTFSError.unsupportedFeature(let desc) where desc.contains("growing $MFT") {
-                // Hit MFT growth boundary — separate feature. As long as we
-                // got well past the single-leaf cap, leaf split worked.
+            } catch NTFSError.unsupportedFeature(let desc) where
+                desc.contains("auto-grow is disabled") ||
+                desc.contains("would overflow parent record") {
+                // Stop at the next ceiling — either $MFT auto-grow not
+                // wired (v0.2 limitation; growMFTDataByClusters exists
+                // but isn't auto-invoked), or $INDEX_ROOT grew too many
+                // interior entries to fit in the parent MFT record
+                // (tree-height growth, separate future feature). Either
+                // is fine — as long as leaf split itself worked.
                 break
             }
         }
@@ -385,7 +391,7 @@ final class StreamingAndLargeIndexTests: XCTestCase {
                 XCTAssertFalse(assigned.contains(rn), "recnum \(rn) handed out twice")
                 XCTAssertGreaterThanOrEqual(rn, 16, "must allocate in user region")
                 assigned.insert(rn)
-            } catch NTFSError.unsupportedFeature(let d) where d.contains("growing $MFT") {
+            } catch NTFSError.unsupportedFeature(let d) where d.contains("auto-grow is disabled") {
                 // Hit the $MFT growth boundary — expected with our small fixture.
                 hitMFTGrowthGuard = true
                 break

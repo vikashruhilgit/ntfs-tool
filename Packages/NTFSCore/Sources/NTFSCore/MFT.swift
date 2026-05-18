@@ -57,7 +57,7 @@ public final class MFT: Sendable {
         }
         let bytes = try record.serialize(sectorSize: sectorSize)
 
-        let primaryOffset = try mftRecordByteOffset(recordNumber: recordNumber)
+        let primaryOffset = try await mftRecordByteOffset(recordNumber: recordNumber)
         try await volume.device.write(offset: primaryOffset, bytes: bytes)
 
         if recordNumber < Self.mirroredRecordCount {
@@ -100,7 +100,7 @@ public final class MFT: Sendable {
         )
 
         // Primary write into $MFT.
-        let primaryOffset = try mftRecordByteOffset(recordNumber: recordNumber)
+        let primaryOffset = try await mftRecordByteOffset(recordNumber: recordNumber)
         try await volume.device.write(offset: primaryOffset, bytes: onDisk)
 
         // Mirror write into $MFTMirr for records 0-3.
@@ -114,10 +114,16 @@ public final class MFT: Sendable {
         }
     }
 
-    /// Resolve an MFT byte offset for a given record number, with overflow
-    /// guards. Pulled out so writeRecord and writeRawRecord share the
-    /// boundary checks.
-    private func mftRecordByteOffset(recordNumber: UInt64) throws -> UInt64 {
+    /// Resolve an MFT byte offset for a given record number. Walks the
+    /// $MFT.$DATA runlist (cached by the Volume) so multi-extent $MFT
+    /// layouts work — necessary because growMFTDataByClusters may add
+    /// non-adjacent clusters when adjacency isn't available.
+    ///
+    /// MFT record 0 itself is a chicken-and-egg case: to walk the runlist
+    /// we need to read record 0 first. The contiguous-from-mftCluster
+    /// shortcut covers record 0 (it's always at the start of the first
+    /// extent at boot.mftCluster).
+    fileprivate func mftRecordByteOffset(recordNumber: UInt64) async throws -> UInt64 {
         let recordSize = UInt64(volume.mftRecordSizeBytes)
         let (offsetProduct, mulOverflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
         guard !mulOverflow else {
@@ -125,6 +131,37 @@ public final class MFT: Sendable {
                 description: "mftRecordByteOffset: record number \(recordNumber) * size \(recordSize) overflows"
             )
         }
+        // Fast path / bootstrap: record 0 is always at boot.mftCluster.
+        // Same fast path for records that fit entirely within the FIRST
+        // extent (which holds record 0). Avoids the recursive read of
+        // record 0 to discover its own runlist.
+        if recordNumber == 0 {
+            return volume.mftByteOffset
+        }
+        // Try to walk the cached runlist. If unavailable (first call before
+        // any $MFT parse has cached it), fall back to the contiguous
+        // assumption — Volume warms the cache on init.
+        if let extents = await volume.mftDataExtents() {
+            let clusterBytes = UInt64(volume.bytesPerCluster)
+            let recordsPerCluster = max(UInt64(1), clusterBytes / recordSize)
+            // For typical layouts (cluster=4096, record=1024 → 4 records/cluster).
+            var cumulativeClusters: UInt64 = 0
+            for extent in extents {
+                let endRecord = (cumulativeClusters + extent.clusterCount) * recordsPerCluster
+                if recordNumber < endRecord {
+                    guard let startLCN = extent.startLCN else {
+                        throw NTFSError.corruptOnDisk(description: "mftRecordByteOffset: sparse $MFT extent")
+                    }
+                    let recordInExtent = recordNumber - cumulativeClusters * recordsPerCluster
+                    return startLCN * clusterBytes + recordInExtent * recordSize
+                }
+                cumulativeClusters += extent.clusterCount
+            }
+            throw NTFSError.corruptOnDisk(
+                description: "mftRecordByteOffset: record \(recordNumber) past $MFT runlist coverage (\(cumulativeClusters) clusters)"
+            )
+        }
+        // Fallback: contiguous assumption (works if $MFT hasn't grown).
         let (byteOffset, addOverflow) = volume.mftByteOffset.addingReportingOverflow(offsetProduct)
         guard !addOverflow else {
             throw NTFSError.corruptOnDisk(description: "mftRecordByteOffset: byte offset overflows UInt64")
@@ -139,18 +176,7 @@ public final class MFT: Sendable {
         guard recordSize > 0 else {
             throw NTFSError.corruptOnDisk(description: "volume MFT record size is zero")
         }
-        let (offsetProduct, mulOverflow) = recordNumber.multipliedReportingOverflow(by: recordSize)
-        guard !mulOverflow else {
-            throw NTFSError.corruptOnDisk(
-                description: "MFT record number \(recordNumber) overflows when multiplied by record size \(recordSize)"
-            )
-        }
-        let (byteOffset, addOverflow) = volume.mftByteOffset.addingReportingOverflow(offsetProduct)
-        guard !addOverflow else {
-            throw NTFSError.corruptOnDisk(
-                description: "MFT byte offset overflows UInt64 at record \(recordNumber)"
-            )
-        }
+        let byteOffset = try await mftRecordByteOffset(recordNumber: recordNumber)
         let raw = try await volume.device.read(offset: byteOffset, length: Int(recordSize))
         return try MFTRecord.parse(raw, expectedSize: Int(recordSize), sectorSize: sectorSize)
     }
