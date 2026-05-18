@@ -164,15 +164,18 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 
 | Command | Arguments | Description |
 |---|---|---|
+| `scan` | (no args) | List attached NTFS partitions with size + free space + serial. `--include-images` also probes `.img` files in cwd. `--long` for cluster size + MFT location. |
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
 | `list` | `<device> [recnum-or-path]` | List directory contents. Default = 5 (root). Pass `--long` for record numbers + sizes + namespace. Accepts a path like `/Backups` instead of a recnum. |
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
-| `verify` | `<device>` | Sweep MFT records 0..63, report parse errors. Pass `--verbose` for per-record details |
+| `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. `--max-records N` (default 4096). `--verbose` for per-record details. |
 | `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
-| `cp` | `<source> <device> <destination>` | Copy host file (or directory tree with `-r`) into the volume. Path-based destination; auto-creates intermediate dirs; streams large files. |
-| `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N` (0 or current-size). Or pass `--from-file <path>` to stream from a host file (no 1 GiB cap). |
-| `truncate` | `<device> <recnum> <newSize>` | Resize file. Only 0 or cluster-aligned (multiples of 4096) shrinks supported |
-| `delete` | `<device> <recnum>` | Delete file. Frees clusters + removes from parent's $I30 (incl. LARGE_INDEX leaves). Refuses reserved records 0-15 |
+| `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
+| `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N`: 0 (rewrite) / file size (append) / `0 < N ≤ size-bytes.count` (in-place mid-file patch). `--from-file <path>` streams from a host file. |
+| `rm` | `<device> <recnum-or-path>` | Delete a file or directory. `-r` recursive. `-v` verbose. |
+| `mv` | `<device> <src-path> <dest-path>` | Rename or move (with auto-create of intermediate destination dirs). |
+| `truncate` | `<device> <recnum> <newSize>` | Resize file to any byte-precise size (shrink only; growing requires `write`). |
+| `delete` | `<device> <recnum>` | Single-record delete by recnum. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15. (Prefer `rm` for path-based use.) |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
 
 ## Common task recipes
@@ -285,19 +288,18 @@ unsupportedFeature(description: "LARGE_INDEX leaf full (used X / allocated Y, ne
 
 Small (resident-only `$INDEX_ROOT`) directories are auto-promoted to LARGE_INDEX on overflow — you don't have to do this manually.
 
-### `write` is rewrite-or-append only
+### `write` supports rewrite, append, and in-place mid-file overwrite
 
-Only two offsets are accepted:
+Three patterns:
 - `offset == 0` → rewrites the file from the start (any existing content is discarded)
 - `offset == existingSize` → appends
+- `0 < offset` AND `offset + bytes.count ≤ existingSize` → in-place mid-file patch (no allocation, no MFT touch — fast)
 
-Arbitrary mid-file overwrites (`offset == 100` on a 1000-byte file) return `unsupportedFeature`. To edit in the middle: cat the file, modify in memory, write the whole thing back.
+Writes that EXTEND past the existing size (other than pure append) still return `unsupportedFeature` — use `--from-file` with a fresh full-size payload, OR `truncate` + `write` separately.
 
-### `truncate` only at cluster boundaries (or to 0)
+### `truncate` is byte-precise (shrink only)
 
-`newSize` must be either 0 or a multiple of the volume's cluster size (4096 bytes on the typical 4 KiB-cluster volume). Arbitrary byte-precise truncation (`truncate ... 12345`) returns `unsupportedFeature`. **Workaround:** read the file, slice in memory, `truncate ... 0`, then `write` the desired bytes.
-
-`truncate` also doesn't grow files. Use `write` to extend.
+`newSize` may be any value ≤ existing size. Non-cluster-aligned shrinks work — trailing partial clusters keep their slack (the on-disk realSize stops reads at the right byte). Growing files via `truncate` isn't supported; use `write` to extend.
 
 ### Files larger than 1 GiB
 

@@ -257,6 +257,96 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         XCTAssertNil(missing)
     }
 
+    // MARK: - Mid-file write
+
+    func testMidFileOverwritePreservesSurroundingBytes() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+        let rn = try await volume.createFile(named: "midwrite.bin", inDirectory: parentRN)
+        // Build a 16 KiB file with a deterministic pattern.
+        var original = Data(count: 16 * 1024)
+        for i in 0..<original.count { original[i] = UInt8(i & 0xFF) }
+        try await volume.write(at: rn, offset: 0, bytes: original)
+
+        // Overwrite a 100-byte chunk starting at offset 4097 (NOT cluster-aligned).
+        let patch = Data(repeating: 0xAB, count: 100)
+        try await volume.write(at: rn, offset: 4097, bytes: patch)
+
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let readBack = try await reopened.readFile(at: rn)
+        XCTAssertEqual(readBack.count, original.count, "file size should be unchanged by mid-file overwrite")
+        // Bytes before 4097 unchanged
+        XCTAssertEqual(readBack.prefix(4097), original.prefix(4097))
+        // Bytes 4097..4197 are 0xAB
+        XCTAssertEqual(readBack.subdata(in: 4097..<4197), patch)
+        // Bytes 4197 onwards unchanged
+        XCTAssertEqual(readBack.subdata(in: 4197..<readBack.count), original.subdata(in: 4197..<original.count))
+    }
+
+    // MARK: - Byte-precise truncate
+
+    func testBytePreciseTruncateShrinksRealSize() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+        let rn = try await volume.createFile(named: "trunc.bin", inDirectory: parentRN)
+        var bytes = Data(count: 12 * 1024)
+        for i in 0..<bytes.count { bytes[i] = UInt8((i * 13) & 0xFF) }
+        try await volume.write(at: rn, offset: 0, bytes: bytes)
+        // Truncate to a non-cluster-aligned size.
+        try await volume.truncate(at: rn, newSize: 7321)
+
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let readBack = try await reopened.readFile(at: rn)
+        XCTAssertEqual(readBack.count, 7321, "truncate should land at exact byte size")
+        XCTAssertEqual(readBack, bytes.prefix(7321))
+    }
+
+    // MARK: - Rename
+
+    func testRenameMovesEntryInSameDirectory() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+        let rn = try await volume.createFile(named: "old.txt", inDirectory: parentRN)
+
+        try await volume.rename(at: rn, toName: "new.txt", inDirectory: nil)
+
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let names = try await reopened.enumerate(directory: parentRN).map { $0.name }
+        XCTAssertTrue(names.contains("new.txt"), "renamed entry should appear under new name")
+        XCTAssertFalse(names.contains("old.txt"), "old name should be removed from parent")
+    }
+
+    func testRenameMovesEntryToDifferentDirectory() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+        let destDir = try await volume.createFile(named: "newdir", inDirectory: parentRN, isDirectory: true)
+        let rn = try await volume.createFile(named: "movable.txt", inDirectory: parentRN)
+
+        try await volume.rename(at: rn, toName: "movable.txt", inDirectory: destDir)
+
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let srcNames = try await reopened.enumerate(directory: parentRN).map { $0.name }
+        let destNames = try await reopened.enumerate(directory: destDir).map { $0.name }
+        XCTAssertFalse(srcNames.contains("movable.txt"), "removed from source")
+        XCTAssertTrue(destNames.contains("movable.txt"), "appears in destination")
+    }
+
     func testResolvePathTwoLevels() async throws {
         guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
         let path = try MutableFixture.scopedCopy("small.img", testCase: self)

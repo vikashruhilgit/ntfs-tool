@@ -269,7 +269,7 @@ public actor Volume {
             switch outcome {
             case .inserted:
                 return
-            case let .leafFull(used, allocated, needed):
+            case let .leafFull(_, _, used, allocated, needed, _):
                 throw NTFSError.unsupportedFeature(
                     description: "LARGE_INDEX leaf full (used \(used) / allocated \(allocated), needed \(needed)) — leaf split not yet implemented"
                 )
@@ -485,6 +485,554 @@ public actor Volume {
         // Bump nextAttributeID by 2 (we consumed two IDs).
         MFTRecord.writeU16LE(into: &newParent, at: 40, value: parent.nextAttributeID &+ 2)
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParent)
+    }
+
+    /// Leaf split scaffold (NOT YET WIRED): when a LARGE_INDEX leaf is full,
+    /// divide its entries (plus the new entry, already merged into sorted
+    /// order) across two leaves, promote the median entry into $INDEX_ROOT
+    /// as an interior entry, and extend the directory's $INDEX_ALLOCATION +
+    /// $BITMAP to cover the new leaf block.
+    ///
+    /// **Currently disabled** — the parent-record rewrite after a second
+    /// split (when $INDEX_ROOT already has an interior entry) produces a
+    /// corrupted MFT record. The first split works in isolation but the
+    /// second corrupts state in a way that USA fix-up later rejects. Needs
+    /// more careful design + testing; see STATUS.md #2.
+    @available(*, deprecated, message: "Leaf split scaffold — disabled pending second-split correctness fix")
+    ///
+    /// v1 scope:
+    ///  - Only handles single-level trees ($INDEX_ROOT directly points at
+    ///    leaves; promoted median lands in $INDEX_ROOT). If the existing
+    ///    $INDEX_ROOT already has too many interior entries to absorb one
+    ///    more, this throws unsupportedFeature — tree-height growth is a
+    ///    future enhancement.
+    ///  - Only handles indexRecordSizeBytes == bytesPerCluster (the common
+    ///    case). Otherwise multi-cluster INDX block math would be needed.
+    private func splitLeafAndPromote(
+        parentRecordNumber: UInt64,
+        leafVCN: UInt64,
+        leafByteOffset: UInt64,
+        mergedSortedEntries: [(fileRef: UInt64, body: Data, sortKey: String)],
+        rootBytes: Data,
+        indexRoot: IndexRoot,
+        allocationExtents: [Extent]
+    ) async throws {
+        let clusterBytes = UInt64(bytesPerCluster)
+        guard UInt64(indexRecordSizeBytes) == clusterBytes else {
+            throw NTFSError.unsupportedFeature(
+                description: "splitLeaf: indexRecordSizeBytes (\(indexRecordSizeBytes)) != bytesPerCluster (\(clusterBytes)) not supported"
+            )
+        }
+
+        // 1. Choose the median entry. Bisect by byte size so left and right
+        //    are roughly balanced — using count alone biases when entry sizes
+        //    vary (filenames of different lengths).
+        let entries = mergedSortedEntries
+        let totalEntryBytes = entries.reduce(0) { acc, e in
+            let rawLen = 16 + e.body.count
+            return acc + ((rawLen + 7) / 8) * 8
+        }
+        var accumulated = 0
+        var medianIdx = entries.count / 2  // default
+        for (i, e) in entries.enumerated() {
+            let rawLen = 16 + e.body.count
+            accumulated += ((rawLen + 7) / 8) * 8
+            if accumulated * 2 >= totalEntryBytes {
+                medianIdx = i
+                break
+            }
+        }
+        if medianIdx == 0 { medianIdx = 1 }
+        if medianIdx >= entries.count { medianIdx = entries.count - 1 }
+        let median = entries[medianIdx]
+        let leftEntries = Array(entries[0..<medianIdx])
+        let rightEntries = Array(entries[(medianIdx + 1)..<entries.count])
+        // Guard: empty halves would mean we can't actually split anything.
+        guard !leftEntries.isEmpty, !rightEntries.isEmpty else {
+            throw NTFSError.unsupportedFeature(
+                description: "splitLeaf: cannot bisect \(entries.count) entries (median index \(medianIdx))"
+            )
+        }
+
+        // 2. Allocate one new cluster for the right-half leaf.
+        let newExtent = try await allocateClusters(1)
+        guard let newLCN = newExtent.startLCN else {
+            throw NTFSError.corruptOnDisk(description: "splitLeaf: allocator returned sparse extent")
+        }
+        let newVCN = allocationExtents.reduce(0) { $0 + $1.clusterCount }
+
+        // 3. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
+        let blockSize = Int(indexRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        let originalLeafRaw = try await device.read(offset: leafByteOffset, length: blockSize)
+        let originalLeafFixed = try UpdateSequenceArray.applyFixup(
+            recordBytes: originalLeafRaw,
+            usaOffset: Int(try originalLeafRaw.readU16LE(at: 4)),
+            usaCount: Int(try originalLeafRaw.readU16LE(at: 6)),
+            blockSize: sectorSize
+        )
+        let leftBlock = try IndexAllocationWriter.buildLeafIndexBlock(
+            sourceBlockBytes: originalLeafFixed,
+            sortedEntries: leftEntries.map { ($0.fileRef, $0.body, $0.sortKey) },
+            blockSize: blockSize
+        )
+        let leftOnDisk = try UpdateSequenceArray.reverseFixup(
+            recordBytes: leftBlock,
+            usaOffset: Int(try leftBlock.readU16LE(at: 4)),
+            usaCount: Int(try leftBlock.readU16LE(at: 6)),
+            blockSize: sectorSize
+        )
+        try await device.write(offset: leafByteOffset, bytes: leftOnDisk)
+
+        // 4. Build the RIGHT leaf at the new VCN — fresh block with rightEntries.
+        let rightBlock = try buildEmptyIndxBlock(
+            blockSize: blockSize,
+            sectorSize: sectorSize,
+            vcn: newVCN,
+            entries: rightEntries.map { ($0.fileRef, $0.body, $0.sortKey) }
+        )
+        let rightOnDisk = try UpdateSequenceArray.reverseFixup(
+            recordBytes: rightBlock,
+            usaOffset: Int(try rightBlock.readU16LE(at: 4)),
+            usaCount: Int(try rightBlock.readU16LE(at: 6)),
+            blockSize: sectorSize
+        )
+        try await device.write(offset: newLCN * clusterBytes, bytes: rightOnDisk)
+
+        // 5. Rebuild $INDEX_ROOT with the median promoted as an interior entry.
+        //    Existing $INDEX_ROOT interior entries are preserved; we insert
+        //    a new interior entry for `median` pointing at the LEFT leaf (the
+        //    original leaf, which now holds the smaller half), and the LAST
+        //    sentinel either retains its existing target or gets retargeted
+        //    to the RIGHT leaf depending on which leaf was just split.
+        try await rewriteIndexRootForSplit(
+            parentRecordNumber: parentRecordNumber,
+            indexRoot: indexRoot,
+            rootBytes: rootBytes,
+            splitLeafVCN: leafVCN,
+            newLeafVCN: newVCN,
+            medianEntry: median,
+            allocationExtents: allocationExtents,
+            newExtent: newExtent
+        )
+    }
+
+    /// Update the parent's $INDEX_ROOT after a leaf split, AND its
+    /// $INDEX_ALLOCATION runlist + $BITMAP to cover the new leaf block.
+    private func rewriteIndexRootForSplit(
+        parentRecordNumber: UInt64,
+        indexRoot: IndexRoot,
+        rootBytes: Data,
+        splitLeafVCN: UInt64,
+        newLeafVCN: UInt64,
+        medianEntry: (fileRef: UInt64, body: Data, sortKey: String),
+        allocationExtents: [Extent],
+        newExtent: Extent
+    ) async throws {
+        let mft = self.mft()
+        let parent = try await mft.record(at: parentRecordNumber)
+        let attrs = try parent.attributes()
+
+        // 5a) Build the new $INDEX_ROOT body.
+        //
+        // Parse current interior entries (everything before LAST sentinel),
+        // insert the median as a new interior entry, and retarget pointers so
+        // splitLeafVCN keeps pointing to the left (original) leaf and the
+        // newLeafVCN replaces it as the "rightmost subtree" if appropriate.
+        //
+        // Current shape: each interior entry has a key + HAS_SUBNODE→VCN
+        // pointing at the subtree whose keys are LESS than this entry's key.
+        // The LAST sentinel (HAS_SUBNODE only) points at the rightmost subtree.
+        let rootEntriesStart = 16 + Int(indexRoot.header.entriesOffset)
+        let rootEntriesEnd = 16 + Int(indexRoot.header.usedSize)
+        let parsedEntries = try parseRootInteriorEntries(in: rootBytes, start: rootEntriesStart, limit: rootEntriesEnd)
+
+        // Decompose: real interior entries (with key+subnode) + LAST sentinel (subnode only).
+        var interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)] = []
+        var lastSubnodeVCN: UInt64 = 0
+        for e in parsedEntries {
+            if e.isLast {
+                lastSubnodeVCN = e.subnodeVCN ?? 0
+            } else if let key = e.keyName {
+                interior.append((
+                    key: key,
+                    body: e.keyBytes,
+                    fileRef: e.fileReference,
+                    subnodeVCN: e.subnodeVCN ?? 0
+                ))
+            }
+        }
+
+        // Where does splitLeafVCN sit in the current pointer set?
+        //  - if lastSubnodeVCN == splitLeafVCN: the leaf we split is the RIGHTMOST
+        //    leaf. The new interior entry holds the median pointing at splitLeafVCN
+        //    (now containing keys < median). LAST.subnode retargets to newLeafVCN.
+        //  - else splitLeafVCN appears in some interior entry's subnode pointer.
+        //    That entry's subnode now points at splitLeafVCN (left half), and we
+        //    insert a NEW interior entry between it and the next entry whose key
+        //    is the median, pointing at... wait, this needs care.
+        //
+        // The classic split-promote: the leaf being split currently corresponds
+        // to ONE pointer in the parent. After split, that pointer covers the
+        // LEFT half (keys < median) and we need a NEW adjacent pointer covering
+        // the RIGHT half (keys > median), separated by an interior entry holding
+        // the median key.
+        //
+        // Implementation: walk parent's pointers in order. Find the slot where
+        // splitLeafVCN lives. Replace that slot with: (splitLeafVCN keeping its
+        // left position) + (new interior entry: median key, subnode=splitLeafVCN)
+        // + (newLeafVCN as the right position). But the existing interior entry
+        // ABOVE splitLeafVCN (if any) is what points at it, and the entry BELOW
+        // (or LAST) is what holds the next key.
+        //
+        // The cleanest representation: model the parent as a sequence of
+        // "tokens" — alternating (key) and (subnode VCN) — terminated by a
+        // subnode VCN. e.g. [V0, K1, V1, K2, V2, ..., Kn, Vn] where K_i are
+        // keys and V_i are subnode VCNs.
+        var tokens: [(kind: String, key: String?, body: Data?, fileRef: UInt64?, vcn: UInt64?)] = []
+        // First leftmost subnode = first interior entry's subnode if any, else lastSubnodeVCN
+        if interior.isEmpty {
+            tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: lastSubnodeVCN))
+        } else {
+            tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: interior[0].subnodeVCN))
+            for i in 0..<interior.count {
+                tokens.append((kind: "key", key: interior[i].key, body: interior[i].body, fileRef: interior[i].fileRef, vcn: nil))
+                if i + 1 < interior.count {
+                    tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: interior[i + 1].subnodeVCN))
+                } else {
+                    tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: lastSubnodeVCN))
+                }
+            }
+        }
+
+        // Find the VCN token matching splitLeafVCN, and splice in the new median + newLeafVCN AFTER it.
+        var spliced = false
+        var newTokens: [(kind: String, key: String?, body: Data?, fileRef: UInt64?, vcn: UInt64?)] = []
+        for t in tokens {
+            newTokens.append(t)
+            if !spliced, t.kind == "vcn", t.vcn == splitLeafVCN {
+                newTokens.append((kind: "key", key: medianEntry.sortKey, body: medianEntry.body, fileRef: medianEntry.fileRef, vcn: nil))
+                newTokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: newLeafVCN))
+                spliced = true
+            }
+        }
+        guard spliced else {
+            throw NTFSError.corruptOnDisk(
+                description: "splitLeaf: split leaf VCN \(splitLeafVCN) not found among parent's subnode pointers"
+            )
+        }
+
+        // Re-collapse tokens back into interior entries + LAST sentinel.
+        // Tokens after splice: [V, K, V, K, V, ..., K, V] (alternating starting and ending with V).
+        // Interior entries take (V_i, K_{i+1}) for i in 0..<n-1; LAST sentinel takes final V.
+        var newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)] = []
+        var idx = 0
+        while idx + 2 < newTokens.count {
+            // newTokens[idx] is VCN, newTokens[idx+1] is KEY, newTokens[idx+2] is VCN
+            let leftVCN = newTokens[idx].vcn ?? 0
+            let key = newTokens[idx + 1]
+            newInterior.append((
+                key: key.key ?? "",
+                body: key.body ?? Data(),
+                fileRef: key.fileRef ?? 0,
+                subnodeVCN: leftVCN
+            ))
+            idx += 2
+        }
+        let newLastVCN = newTokens.last?.vcn ?? 0
+
+        // 5b) Serialize the new $INDEX_ROOT body.
+        let newRootBody = serializeLargeIndexRoot(
+            indexAllocationBlockSize: indexRoot.indexAllocationBlockSize,
+            clustersPerIndexBlock: indexRoot.clustersPerIndexBlock,
+            interior: newInterior,
+            lastSubnodeVCN: newLastVCN
+        )
+
+        // 5c) Compute the new $INDEX_ALLOCATION runlist (existing extents + newExtent).
+        let updatedExtents = mergeAdjacentExtents(allocationExtents + [newExtent])
+        let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
+        let clusterBytes = UInt64(bytesPerCluster)
+        let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
+            attrID: try findIndexAllocationAttributeID(attrs: attrs),
+            extents: updatedExtents,
+            totalBytes: totalIndexAllocClusters * clusterBytes
+        )
+
+        // 5d) Update $BITMAP:$I30 — set the bit at index = newVCN / clustersPerBlock.
+        let updatedBitmapAttrBytes = try updateBitmapAttribute(
+            attrs: attrs,
+            blockIndex: newLeafVCN  // since indexRecordSizeBytes == bytesPerCluster, VCN==block index
+        )
+
+        // 5e) Rebuild the parent MFT record with all three updates.
+        let newRecordBytes = try rewriteParentForLeafSplit(
+            parent: parent,
+            newRootBody: newRootBody,
+            newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+            newBitmapAttrBytes: updatedBitmapAttrBytes
+        )
+        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newRecordBytes)
+    }
+
+    /// Parse $INDEX_ROOT entries including the LAST sentinel (which carries
+    /// the rightmost-subtree pointer when LARGE_INDEX). The shared
+    /// IndexEntryParser drops LAST so we re-walk raw bytes here.
+    private struct _InteriorEntry {
+        let fileReference: UInt64
+        let entryLength: Int
+        let keyLength: Int
+        let flags: UInt16
+        let keyBytes: Data
+        let keyName: String?
+        let subnodeVCN: UInt64?
+        var isLast: Bool { (flags & 0x02) != 0 }
+        var hasSubnode: Bool { (flags & 0x01) != 0 }
+    }
+
+    private func parseRootInteriorEntries(in data: Data, start: Int, limit: Int) throws -> [_InteriorEntry] {
+        var entries: [_InteriorEntry] = []
+        var pos = start
+        let end = min(limit, data.count)
+        while pos + 16 <= end {
+            let fileRef = try data.readU64LE(at: pos + 0)
+            let entryLength = Int(try data.readU16LE(at: pos + 8))
+            let keyLength = Int(try data.readU16LE(at: pos + 10))
+            let flags = try data.readU16LE(at: pos + 12)
+            guard entryLength >= 16, pos + entryLength <= end else {
+                throw NTFSError.corruptOnDisk(description: "$INDEX_ROOT entry malformed at \(pos)")
+            }
+            let isLast = (flags & 0x02) != 0
+            let hasSubnode = (flags & 0x01) != 0
+            var keyBytes = Data()
+            var keyName: String?
+            if !isLast, keyLength > 0 {
+                let keyStart = pos + 16
+                let keyEnd = keyStart + keyLength
+                keyBytes = Data(data[(data.startIndex + keyStart)..<(data.startIndex + keyEnd)])
+                if let fn = try? FileName.parse(keyBytes) { keyName = fn.name }
+            }
+            var subnodeVCN: UInt64?
+            if hasSubnode {
+                subnodeVCN = try data.readU64LE(at: pos + entryLength - 8)
+            }
+            entries.append(_InteriorEntry(
+                fileReference: fileRef,
+                entryLength: entryLength,
+                keyLength: keyLength,
+                flags: flags,
+                keyBytes: keyBytes,
+                keyName: keyName,
+                subnodeVCN: subnodeVCN
+            ))
+            pos += entryLength
+            if isLast { break }
+        }
+        return entries
+    }
+
+    /// Serialize a $INDEX_ROOT body for a LARGE_INDEX tree with `interior`
+    /// entries (each with a key + subnode VCN) terminated by a LAST sentinel
+    /// whose subnode is `lastSubnodeVCN`.
+    private func serializeLargeIndexRoot(
+        indexAllocationBlockSize: UInt32,
+        clustersPerIndexBlock: Int8,
+        interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        lastSubnodeVCN: UInt64
+    ) -> Data {
+        // Compute total entry bytes.
+        var entriesBytes = Data()
+        for e in interior {
+            // INDEX_ENTRY with key + subnode VCN: header(16) + keyBytes + alignment + 8 bytes subnode VCN at end.
+            let rawLen = 16 + e.body.count
+            let aligned = ((rawLen + 7) / 8) * 8
+            let totalLen = aligned + 8  // append subnode VCN at the very end
+            var entry = Data(count: totalLen)
+            MFTRecord.writeU64LE(into: &entry, at: 0, value: e.fileRef)
+            MFTRecord.writeU16LE(into: &entry, at: 8, value: UInt16(totalLen))
+            MFTRecord.writeU16LE(into: &entry, at: 10, value: UInt16(e.body.count))
+            MFTRecord.writeU16LE(into: &entry, at: 12, value: 0x01)  // HAS_SUBNODE
+            MFTRecord.writeU16LE(into: &entry, at: 14, value: 0)
+            for (i, byte) in e.body.enumerated() {
+                entry[entry.startIndex + 16 + i] = byte
+            }
+            MFTRecord.writeU64LE(into: &entry, at: totalLen - 8, value: e.subnodeVCN)
+            entriesBytes.append(entry)
+        }
+        // LAST sentinel with HAS_SUBNODE.
+        var last = Data(count: 24)
+        MFTRecord.writeU64LE(into: &last, at: 0, value: 0)
+        MFTRecord.writeU16LE(into: &last, at: 8, value: 24)
+        MFTRecord.writeU16LE(into: &last, at: 10, value: 0)
+        MFTRecord.writeU16LE(into: &last, at: 12, value: 0x03)  // LAST | HAS_SUBNODE
+        MFTRecord.writeU16LE(into: &last, at: 14, value: 0)
+        MFTRecord.writeU64LE(into: &last, at: 16, value: lastSubnodeVCN)
+        entriesBytes.append(last)
+
+        // Preamble (16) + INDEX_HEADER (16) + entries.
+        var body = Data(count: 32 + entriesBytes.count)
+        MFTRecord.writeU32LE(into: &body, at: 0,  value: 0x30)
+        MFTRecord.writeU32LE(into: &body, at: 4,  value: 0x01)
+        MFTRecord.writeU32LE(into: &body, at: 8,  value: indexAllocationBlockSize)
+        body[body.startIndex + 12] = UInt8(bitPattern: clustersPerIndexBlock)
+        // INDEX_HEADER at offset 16
+        MFTRecord.writeU32LE(into: &body, at: 16, value: 16)
+        MFTRecord.writeU32LE(into: &body, at: 20, value: UInt32(16 + entriesBytes.count))
+        MFTRecord.writeU32LE(into: &body, at: 24, value: UInt32(16 + entriesBytes.count))
+        body[body.startIndex + 28] = 0x01  // LARGE_INDEX
+        for (i, byte) in entriesBytes.enumerated() {
+            body[body.startIndex + 32 + i] = byte
+        }
+        return body
+    }
+
+    /// Merge adjacent extents (same direction, contiguous LCNs). Keeps the
+    /// runlist short — important since $INDEX_ALLOCATION must fit in the
+    /// parent MFT record's slack.
+    private func mergeAdjacentExtents(_ extents: [Extent]) -> [Extent] {
+        var merged: [Extent] = []
+        for e in extents {
+            if let last = merged.last,
+               let lastLCN = last.startLCN,
+               let thisLCN = e.startLCN,
+               lastLCN + last.clusterCount == thisLCN {
+                merged[merged.count - 1] = Extent(startLCN: lastLCN, clusterCount: last.clusterCount + e.clusterCount)
+            } else {
+                merged.append(e)
+            }
+        }
+        return merged
+    }
+
+    private func findIndexAllocationAttributeID(attrs: [Attribute]) throws -> UInt16 {
+        guard let attr = attrs.first(where: {
+            $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
+        }) else {
+            throw NTFSError.corruptOnDisk(description: "splitLeaf: $INDEX_ALLOCATION:$I30 missing")
+        }
+        return attr.header.attributeID
+    }
+
+    /// Re-serialize the $INDEX_ALLOCATION:$I30 attribute with new extents.
+    private func serializeIndexAllocationAttribute(
+        attrID: UInt16,
+        extents: [Extent],
+        totalBytes: UInt64
+    ) -> Data {
+        let nameUTF16 = Array("$I30".utf16)
+        let nameByteCount = nameUTF16.count * 2
+        let runlist = encodeRunlist(extents: extents)
+        let runlistOffset = 64 + nameByteCount
+        let rawLen = runlistOffset + runlist.count
+        let alignedLen = ((rawLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        let totalClusters = extents.reduce(0) { $0 + $1.clusterCount }
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: AttributeType.indexAllocation.rawValue)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 1
+        data[data.startIndex + 9] = UInt8(nameUTF16.count)
+        MFTRecord.writeU16LE(into: &data, at: 10, value: 64)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: 0)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        MFTRecord.writeU64LE(into: &data, at: 16, value: 0)
+        MFTRecord.writeU64LE(into: &data, at: 24, value: totalClusters - 1)
+        MFTRecord.writeU16LE(into: &data, at: 32, value: UInt16(runlistOffset))
+        data[data.startIndex + 34] = 0
+        MFTRecord.writeU64LE(into: &data, at: 40, value: totalBytes)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: totalBytes)
+        MFTRecord.writeU64LE(into: &data, at: 56, value: totalBytes)
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[data.startIndex + 64 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[data.startIndex + 64 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        for (i, byte) in runlist.enumerated() {
+            data[data.startIndex + runlistOffset + i] = byte
+        }
+        return data
+    }
+
+    /// Update the $BITMAP:$I30 attribute by setting the bit at `blockIndex`.
+    /// Returns the serialized replacement attribute bytes.
+    private func updateBitmapAttribute(attrs: [Attribute], blockIndex: UInt64) throws -> Data {
+        guard let attr = attrs.first(where: {
+            $0.rawType == 0xB0 && $0.nameOrEmpty == "$I30"
+        }) else {
+            throw NTFSError.corruptOnDisk(description: "updateBitmap: $BITMAP:$I30 missing")
+        }
+        guard case let .resident(bytes, _) = attr.value else {
+            throw NTFSError.unsupportedFeature(description: "updateBitmap: $BITMAP:$I30 must be resident (non-resident bitmaps not yet supported)")
+        }
+        var updated = bytes
+        let byteIdx = Int(blockIndex / 8)
+        let bitIdx = Int(blockIndex % 8)
+        guard byteIdx < updated.count else {
+            throw NTFSError.unsupportedFeature(
+                description: "updateBitmap: block index \(blockIndex) exceeds bitmap capacity \(updated.count * 8); growing $BITMAP not yet supported"
+            )
+        }
+        updated[updated.startIndex + byteIdx] |= (UInt8(1) << bitIdx)
+        return buildNamedResidentAttribute(
+            type: 0xB0,
+            attrID: attr.header.attributeID,
+            flags: attr.header.flags,
+            attributeName: "$I30",
+            value: updated
+        )
+    }
+
+    /// Rewrite the parent MFT record swapping $INDEX_ROOT body, $INDEX_ALLOCATION
+    /// attribute, and $BITMAP attribute in one shot. The shared helper
+    /// `rewriteEntireAttribute` operates on one attribute at a time; we apply
+    /// it sequentially.
+    private func rewriteParentForLeafSplit(
+        parent: MFTRecord,
+        newRootBody: Data,
+        newIndexAllocAttrBytes: Data,
+        newBitmapAttrBytes: Data
+    ) throws -> Data {
+        // `usedSize` here follows the header-field convention: byte offset AFTER
+        // the end marker (i.e., end-marker-offset + 4). Both `rewriteResident
+        // Attribute` and `rewriteEntireAttribute` expect that form.
+
+        // Step A: replace $INDEX_ROOT body.
+        var bytes = try rewriteResidentAttribute(
+            in: parent.bytes,
+            firstAttributeOffset: Int(parent.firstAttributeOffset),
+            usedSize: Int(parent.usedSize),
+            recordSize: Int(parent.allocatedSize),
+            replacingType: AttributeType.indexRoot.rawValue,
+            attributeName: "$I30",
+            newValueBytes: newRootBody
+        )
+        var usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
+        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+
+        // Step B: replace $INDEX_ALLOCATION attribute.
+        bytes = try rewriteEntireAttribute(
+            in: bytes,
+            firstAttributeOffset: Int(parent.firstAttributeOffset),
+            usedSize: usedSize,
+            recordSize: Int(parent.allocatedSize),
+            replacingType: AttributeType.indexAllocation.rawValue,
+            attributeName: "$I30",
+            replacementBytes: newIndexAllocAttrBytes
+        )
+        usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
+        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+
+        // Step C: replace $BITMAP attribute.
+        bytes = try rewriteEntireAttribute(
+            in: bytes,
+            firstAttributeOffset: Int(parent.firstAttributeOffset),
+            usedSize: usedSize,
+            recordSize: Int(parent.allocatedSize),
+            replacingType: 0xB0,
+            attributeName: "$I30",
+            replacementBytes: newBitmapAttrBytes
+        )
+        usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
+        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+        return bytes
     }
 
     /// Build a $INDEX_ROOT body for an empty LARGE_INDEX directory (no real
@@ -1077,10 +1625,27 @@ public actor Volume {
             existingSize = realSize
         }
 
-        // For Stage 4 we accept offset == 0 (rewrite) or offset == existingSize (append).
+        // Three supported modes:
+        //  - offset == 0: full rewrite (existing path below).
+        //  - offset == existingSize: append (existing path below).
+        //  - 0 < offset < existingSize AND offset + bytes.count <= existingSize:
+        //    mid-file overwrite. No new allocations needed — patch the right
+        //    clusters in place for non-resident, or read-modify-write for
+        //    resident. Handled inline here and returns early.
+        if offset > 0, offset < existingSize,
+           offset.addingReportingOverflow(UInt64(bytes.count)).0 <= existingSize {
+            try await overwriteRange(
+                recordNumber: recordNumber,
+                record: record,
+                dataAttr: dataAttr,
+                offset: offset,
+                bytes: bytes
+            )
+            return
+        }
         guard offset == 0 || offset == existingSize else {
             throw NTFSError.unsupportedFeature(
-                description: "write: Stage 4 supports offset == 0 OR offset == existingSize \(existingSize); got \(offset)"
+                description: "write: supported offsets are 0 (rewrite), \(existingSize) (append), or 0 < N <= \(existingSize) - bytes.count (mid-file in-place overwrite); got \(offset) + \(bytes.count) bytes"
             )
         }
 
@@ -1142,6 +1707,123 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
 
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+        // Refresh the parent's $I30 entry size hints so `list` shows a
+        // sensible size for freshly-written files. Best-effort; cosmetic.
+        try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: UInt64(bytes.count))
+    }
+
+    /// Update the $FILE_NAME size hints (realSize, allocatedSize) inside the
+    /// parent directory's $I30 entry. Best-effort; ignored if the parent is
+    /// LARGE_INDEX (would require descending the B-tree to find + rewrite the
+    /// leaf entry). Real drivers compute from $DATA, so this is purely for
+    /// `ntfsctl list --long` cosmetics.
+    private func refreshParentI30Size(recordNumber: UInt64, newRealSize: UInt64) async throws {
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        let attrs = try record.attributes()
+        guard let fnAttr = attrs.first(where: { $0.type == .fileName }),
+              case let .resident(fnBytes, _) = fnAttr.value,
+              let fn = try? FileName.parse(fnBytes) else {
+            return
+        }
+        let parentRN = fn.parentRecordNumber
+        let parent = try await mft.record(at: parentRN)
+        let parentAttrs = try parent.attributes()
+        guard let irAttr = parentAttrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
+              case let .resident(rootBytes, _) = irAttr.value else {
+            return
+        }
+        let root = try IndexRoot.parse(rootBytes)
+        if root.isLargeIndex { return }
+
+        var entries: [(fileReference: UInt64, fileNameBody: Data, sortKey: String)] = []
+        for entry in root.entries {
+            guard !entry.isLast, let efn = entry.fileName else { continue }
+            if efn.name == fn.name && efn.namespace != .dos {
+                var body = reserializeFileNameBody(efn)
+                let allocSize = ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
+                MFTRecord.writeU64LE(into: &body, at: 40, value: allocSize)
+                MFTRecord.writeU64LE(into: &body, at: 48, value: newRealSize)
+                entries.append((entry.fileReference, body, efn.name))
+            } else {
+                entries.append((entry.fileReference, reserializeFileNameBody(efn), efn.name))
+            }
+        }
+        entries.sort { IndexBuilder.collationFilenameSortsBefore($0.sortKey, $1.sortKey) }
+        let newRootBody = IndexBuilder.buildIndexRootBody(
+            indexAllocationBlockSize: root.indexAllocationBlockSize,
+            clustersPerIndexBlock: root.clustersPerIndexBlock,
+            sortedEntries: entries.map { ($0.fileReference, $0.fileNameBody) }
+        )
+        let newParentBytes = try rewriteResidentAttribute(
+            in: parent.bytes,
+            firstAttributeOffset: Int(parent.firstAttributeOffset),
+            usedSize: Int(parent.usedSize),
+            recordSize: Int(parent.allocatedSize),
+            replacingType: AttributeType.indexRoot.rawValue,
+            attributeName: "$I30",
+            newValueBytes: newRootBody
+        )
+        guard let mark = locateEndMarker(in: newParentBytes, fromOffset: Int(parent.firstAttributeOffset)) else { return }
+        var updated = newParentBytes
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        try await mft.writeRawRecord(at: parentRN, postFixupBytes: updated)
+    }
+
+    /// Mid-file in-place overwrite. Caller guarantees offset + bytes.count <= existingSize.
+    /// For resident $DATA, read-modify-write the whole content via the resident
+    /// path. For non-resident, find each affected extent, compute the
+    /// physical LCN+offset, and write directly — no allocation, no MFT touch.
+    private func overwriteRange(
+        recordNumber: UInt64,
+        record: MFTRecord,
+        dataAttr: Attribute,
+        offset: UInt64,
+        bytes: Data
+    ) async throws {
+        switch dataAttr.value {
+        case let .resident(value, _):
+            // Patch in memory, then re-write via the resident path.
+            var patched = value
+            for (i, b) in bytes.enumerated() {
+                patched[patched.startIndex + Int(offset) + i] = b
+            }
+            try await write(at: recordNumber, offset: 0, bytes: patched)
+        case let .nonResident(_, _, _, _, _, _, _, extents):
+            let clusterBytes = UInt64(bytesPerCluster)
+            var fileCursor: UInt64 = 0
+            var srcCursor: Int = 0
+            let endOffset = offset + UInt64(bytes.count)
+            for extent in extents {
+                let (extentBytesRaw, mulOverflow) = extent.clusterCount.multipliedReportingOverflow(by: clusterBytes)
+                guard !mulOverflow else {
+                    throw NTFSError.corruptOnDisk(description: "overwriteRange: extent length overflow")
+                }
+                let extentEnd = fileCursor + extentBytesRaw
+                // Skip extents entirely before the requested region.
+                if extentEnd <= offset {
+                    fileCursor = extentEnd
+                    continue
+                }
+                if fileCursor >= endOffset { break }
+                let sliceStartInExtent = (offset > fileCursor) ? (offset - fileCursor) : 0
+                let sliceEndInExtent = min(extentBytesRaw, endOffset - fileCursor)
+                let writeBytes = Int(sliceEndInExtent - sliceStartInExtent)
+                guard let startLCN = extent.startLCN else {
+                    throw NTFSError.unsupportedFeature(description: "overwriteRange: sparse extent encountered (write would require allocation)")
+                }
+                let deviceOffset = startLCN * clusterBytes + sliceStartInExtent
+                let chunk = bytes.subdata(in: srcCursor..<(srcCursor + writeBytes))
+                try await device.write(offset: deviceOffset, bytes: chunk)
+                srcCursor += writeBytes
+                fileCursor = extentEnd
+            }
+            guard srcCursor == bytes.count else {
+                throw NTFSError.corruptOnDisk(
+                    description: "overwriteRange: wrote \(srcCursor) bytes, expected \(bytes.count) — runlist may not cover requested range"
+                )
+            }
+        }
     }
 
     /// Streaming write: replace the file's `$DATA` with `totalSize` bytes
@@ -1264,6 +1946,7 @@ public actor Volume {
         var updatedBytes = newRecordBytes
         MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+        try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
     }
 
     /// Streaming write from a host file path. Convenience wrapper around
@@ -1430,12 +2113,41 @@ public actor Volume {
             return
         }
 
-        // For non-zero sizes, only support cluster-aligned shrinks on
-        // non-resident $DATA for now.
         let clusterBytes = UInt64(bytesPerCluster)
+
+        // Resident-shrink path: simply slice the $DATA bytes and rewrite.
+        if case let .resident(value, _) = dataAttr.value {
+            let oldSize = UInt64(value.count)
+            guard newSize <= oldSize else {
+                throw NTFSError.unsupportedFeature(
+                    description: "truncate: extending via truncate() not yet supported (use write())"
+                )
+            }
+            let truncated = value.subdata(in: 0..<Int(newSize))
+            try await write(at: recordNumber, offset: 0, bytes: truncated)
+            return
+        }
+
+        // Non-resident, byte-precise shrink path: drop any extents past
+        // ceil(newSize / clusterBytes), keep the rest, update realSize.
+        // The trailing partial cluster (if newSize isn't cluster-aligned)
+        // keeps its slack — the realSize bound stops reads at the right byte.
+        let alignedClustersToKeep = (newSize + clusterBytes - 1) / clusterBytes
+        if alignedClustersToKeep > 0 {
+            try await shrinkNonResidentTo(
+                recordNumber: recordNumber,
+                dataAttr: dataAttr,
+                newRealSize: newSize,
+                keepClusters: alignedClustersToKeep
+            )
+            return
+        }
+
+        // Fall-through: original cluster-aligned path retained for the legacy
+        // contract (cluster-aligned shrinks against non-resident $DATA).
         guard newSize % clusterBytes == 0 else {
             throw NTFSError.unsupportedFeature(
-                description: "truncate: Stage 4 requires newSize to be cluster-aligned (multiple of \(clusterBytes)) — got \(newSize)"
+                description: "truncate: internal: cluster-aligned path reached with non-aligned newSize \(newSize)"
             )
         }
         guard case let .nonResident(_, _, _, _, _, oldRealSize, _, extents) = dataAttr.value else {
@@ -1489,6 +2201,73 @@ public actor Volume {
             attrID: dataAttr.header.attributeID,
             flags: dataAttr.header.flags,
             realSize: newSize,
+            allocatedSize: allocatedSize,
+            extentList: keptExtents
+        )
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: AttributeType.data.rawValue,
+            attributeName: "",
+            replacementBytes: newDataAttr
+        )
+        let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
+        guard let newUsedSize = newUsedSize else {
+            throw NTFSError.corruptOnDisk(description: "truncate: rewritten record has no end marker")
+        }
+        var updatedBytes = newRecordBytes
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+    }
+
+    /// Byte-precise non-resident truncate: keep the first `keepClusters`
+    /// worth of extents, free the rest, set realSize/allocatedSize
+    /// appropriately. The trailing partial cluster (when `newRealSize` isn't
+    /// cluster-aligned) keeps its slack — reads stop at realSize.
+    private func shrinkNonResidentTo(
+        recordNumber: UInt64,
+        dataAttr: Attribute,
+        newRealSize: UInt64,
+        keepClusters: UInt64
+    ) async throws {
+        guard case let .nonResident(_, _, _, _, _, _, _, extents) = dataAttr.value else {
+            throw NTFSError.unsupportedFeature(description: "shrinkNonResidentTo: called on resident $DATA")
+        }
+        let clusterBytes = UInt64(bytesPerCluster)
+
+        var keptExtents: [Extent] = []
+        var clustersKept: UInt64 = 0
+        var extentIdx = 0
+        for extent in extents {
+            if clustersKept >= keepClusters { break }
+            let needed = keepClusters - clustersKept
+            if extent.clusterCount <= needed {
+                keptExtents.append(extent)
+                clustersKept += extent.clusterCount
+            } else {
+                let trimmed = Extent(startLCN: extent.startLCN, clusterCount: needed)
+                keptExtents.append(trimmed)
+                if let lcn = extent.startLCN {
+                    let toFree = Extent(startLCN: lcn + needed, clusterCount: extent.clusterCount - needed)
+                    try await freeClusters(toFree)
+                }
+                clustersKept = keepClusters
+            }
+            extentIdx += 1
+        }
+        for extent in extents.suffix(from: extentIdx) {
+            try await freeClusters(extent)
+        }
+
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        let allocatedSize = clustersKept * clusterBytes
+        let newDataAttr = serializeNonResidentDataAttribute(
+            attrID: dataAttr.header.attributeID,
+            flags: dataAttr.header.flags,
+            realSize: newRealSize,
             allocatedSize: allocatedSize,
             extentList: keptExtents
         )
@@ -1889,6 +2668,124 @@ public actor Volume {
             )
             bytesRemaining = bytesRemaining.dropFirst(extentBytes)
         }
+    }
+
+    /// Rename or move a file/directory. Removes its current $I30 entry, updates
+    /// the $FILE_NAME body (and parent reference if moving), writes the
+    /// modified MFT record, and inserts a new $I30 entry under the new parent
+    /// with the new name. Works against both resident and LARGE_INDEX parents
+    /// (the existing insert path covers both). Refuses if the destination
+    /// already exists or the source is a reserved record.
+    public func rename(
+        at recordNumber: UInt64,
+        toName newName: String,
+        inDirectory newParentRN: UInt64? = nil
+    ) async throws {
+        guard recordNumber >= MFT.firstUserRecord else {
+            throw NTFSError.unsupportedFeature(description: "rename: refusing to mutate reserved MFT record \(recordNumber)")
+        }
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else {
+            throw NTFSError.corruptOnDisk(description: "rename: source record \(recordNumber) is not in use")
+        }
+        let attrs = try record.attributes()
+        guard let fnAttr = attrs.first(where: { $0.type == .fileName }),
+              case let .resident(fnBytes, _) = fnAttr.value,
+              let fn = try? FileName.parse(fnBytes) else {
+            throw NTFSError.corruptOnDisk(description: "rename: source record \(recordNumber) missing $FILE_NAME")
+        }
+        let oldParentRN = fn.parentRecordNumber
+        let oldName = fn.name
+        let targetParentRN = newParentRN ?? oldParentRN
+
+        // Refuse if destination name already exists.
+        let destEntries = try await enumerate(directory: targetParentRN)
+        if destEntries.contains(where: { $0.name == newName && $0.fileName.namespace != .dos }) {
+            throw NTFSError.unsupportedFeature(description: "rename: destination '\(newName)' already exists in parent \(targetParentRN)")
+        }
+
+        // 1. Remove from old parent.
+        try await removeFromParentI30(parentRecordNumber: oldParentRN, childFileName: oldName)
+
+        // 2. Update the file's $FILE_NAME body with the new name + parent reference.
+        let parentRec = try await mft.record(at: targetParentRN)
+        let newParentRef = (UInt64(parentRec.sequenceNumber) << 48) | (targetParentRN & 0x0000_FFFF_FFFF_FFFF)
+        let newFileNameBody = buildRenamedFileNameBody(
+            from: fn,
+            newName: newName,
+            newParentReference: newParentRef
+        )
+        let newFNAttrBytes = serializeFileNameAttribute(
+            attrID: fnAttr.header.attributeID,
+            flags: fnAttr.header.flags,
+            body: newFileNameBody
+        )
+        let updatedRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: AttributeType.fileName.rawValue,
+            attributeName: "",
+            replacementBytes: newFNAttrBytes
+        )
+        guard let mark = locateEndMarker(in: updatedRecordBytes, fromOffset: Int(record.firstAttributeOffset)) else {
+            throw NTFSError.corruptOnDisk(description: "rename: rewritten record missing end marker")
+        }
+        var finalBytes = updatedRecordBytes
+        MFTRecord.writeU32LE(into: &finalBytes, at: 24, value: UInt32(mark + 4))
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: finalBytes)
+
+        // 3. Insert new $I30 entry under the target parent.
+        try await insertIntoParentI30(
+            parentRecordNumber: targetParentRN,
+            childRecordNumber: recordNumber,
+            childSequence: record.sequenceNumber,
+            childFileName: newName,
+            isDirectory: record.isDirectory,
+            nowFiletime: MFTRecordBuilder.windowsFiletimeNow()
+        )
+    }
+
+    /// Build a $FILE_NAME body with the same attributes as `from` but using
+    /// `newName` and `newParentReference`. Time fields preserved (mtime
+    /// is conceptually unchanged by a rename in NTFS semantics).
+    private func buildRenamedFileNameBody(
+        from fn: FileName,
+        newName: String,
+        newParentReference: UInt64
+    ) -> Data {
+        let nameUTF16 = Array(newName.utf16)
+        let nameByteCount = nameUTF16.count * 2
+        var data = Data(count: 66 + nameByteCount)
+        MFTRecord.writeU64LE(into: &data, at: 0,  value: newParentReference)
+        MFTRecord.writeU64LE(into: &data, at: 8,  value: filetimeFromDate(fn.creationTime))
+        MFTRecord.writeU64LE(into: &data, at: 16, value: filetimeFromDate(fn.modificationTime))
+        MFTRecord.writeU64LE(into: &data, at: 24, value: filetimeFromDate(fn.mftChangeTime))
+        MFTRecord.writeU64LE(into: &data, at: 32, value: filetimeFromDate(fn.accessTime))
+        MFTRecord.writeU64LE(into: &data, at: 40, value: fn.allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: fn.realSize)
+        MFTRecord.writeU32LE(into: &data, at: 56, value: fn.fileAttributes)
+        MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
+        data[64] = UInt8(nameUTF16.count)
+        data[65] = 1   // Win32 namespace
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        return data
+    }
+
+    /// Wrap a $FILE_NAME body in a resident attribute header.
+    private func serializeFileNameAttribute(attrID: UInt16, flags: UInt16, body: Data) -> Data {
+        serializeResidentAttribute(
+            type: AttributeType.fileName.rawValue,
+            attrID: attrID,
+            flags: flags,
+            attributeName: "",
+            value: body
+        )
     }
 
     /// Resolve a slash-separated path under the volume root to its MFT

@@ -18,6 +18,7 @@
 		54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */; };
 		55282FEDBAEF76F7172E5825 /* SetDirty.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DE33D7BA5684962834C762F /* SetDirty.swift */; };
 		5F4936483FEF4613A8864F81 /* Create.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFA3E28642F4967D00BBD28 /* Create.swift */; };
+		60FAA53823CD24F32B7E98CE /* Rm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F28047C68A668003CC716BB /* Rm.swift */; };
 		6D724EC442E40A0DDDC0B54A /* Cp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DCA58042BB15FFD8F32EDD3 /* Cp.swift */; };
 		7D4143F793CD345F7651B4B1 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */; };
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
@@ -25,11 +26,13 @@
 		92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5684F8D00837370737BB2555 /* ContentView.swift */; };
 		A283CF3E3376BC4686313635 /* Verify.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20E22577EA73CB6742243E11 /* Verify.swift */; };
 		A9E17066DF075F9BA303EAA2 /* NTFSItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = F82499EDC514F10F561B7784 /* NTFSItem.swift */; };
+		AECEABF53F3ADE62CDA9ED6D /* Mv.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3689DB5A25248D9E73F473CE /* Mv.swift */; };
 		AFE66833D21DBA777309099F /* ntfsctl.swift in Sources */ = {isa = PBXBuildFile; fileRef = D05B381FF347C123E61FD621 /* ntfsctl.swift */; };
 		B2FACFD1EEA0B776368CEC67 /* List.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B9DB06823B01F8100989970 /* List.swift */; };
 		B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */; };
 		B9751912CAE0F2EA9A170F9E /* FSKitBlockDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */; };
 		BBB98DE04B189933E57E523D /* Cat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */; };
+		C1F50E65FD4AB246BAC40911 /* Scan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 448EA9B837A137CDD562E07C /* Scan.swift */; };
 		CFB3B74CC0B795207981A6FC /* NTFSFileSystemExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */; };
 		E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */; };
 		EF91959587345A62A4C6F9C7 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = 5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */; };
@@ -68,13 +71,16 @@
 		20E22577EA73CB6742243E11 /* Verify.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Verify.swift; sourceTree = "<group>"; };
 		2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cat.swift; sourceTree = "<group>"; };
 		2DCA58042BB15FFD8F32EDD3 /* Cp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cp.swift; sourceTree = "<group>"; };
+		3689DB5A25248D9E73F473CE /* Mv.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mv.swift; sourceTree = "<group>"; };
 		4126B01F860CB4A427613EB6 /* Info.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Info.swift; sourceTree = "<group>"; };
 		43ACC1740AE27F5F1F244E0A /* NTFSUnaryFS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSUnaryFS.swift; sourceTree = "<group>"; };
+		448EA9B837A137CDD562E07C /* Scan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Scan.swift; sourceTree = "<group>"; };
 		4CC62877FC7ADECC37C4FC47 /* NTFSCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NTFSCore; path = Packages/NTFSCore; sourceTree = SOURCE_ROOT; };
 		5684F8D00837370737BB2555 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		62C008E3A77CB7E1A8D38487 /* Truncate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Truncate.swift; sourceTree = "<group>"; };
 		70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKitBlockDevice.swift; sourceTree = "<group>"; };
 		73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskArbitrationService.swift; sourceTree = "<group>"; };
+		7F28047C68A668003CC716BB /* Rm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Rm.swift; sourceTree = "<group>"; };
 		82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = NTFSFileSystem.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		82E0F813FDD6E122C9D24085 /* Write.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Write.swift; sourceTree = "<group>"; };
 		8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSMountManagerApp.swift; sourceTree = "<group>"; };
@@ -204,7 +210,10 @@
 				DE068D882A088571281101D0 /* Delete.swift */,
 				4126B01F860CB4A427613EB6 /* Info.swift */,
 				1B9DB06823B01F8100989970 /* List.swift */,
+				3689DB5A25248D9E73F473CE /* Mv.swift */,
 				D05B381FF347C123E61FD621 /* ntfsctl.swift */,
+				7F28047C68A668003CC716BB /* Rm.swift */,
+				448EA9B837A137CDD562E07C /* Scan.swift */,
 				8DE33D7BA5684962834C762F /* SetDirty.swift */,
 				62C008E3A77CB7E1A8D38487 /* Truncate.swift */,
 				20E22577EA73CB6742243E11 /* Verify.swift */,
@@ -377,6 +386,9 @@
 				11CB6DA3EB985C6BC4F34535 /* Delete.swift in Sources */,
 				21A4A75C7F50E50DA8213556 /* Info.swift in Sources */,
 				B2FACFD1EEA0B776368CEC67 /* List.swift in Sources */,
+				AECEABF53F3ADE62CDA9ED6D /* Mv.swift in Sources */,
+				60FAA53823CD24F32B7E98CE /* Rm.swift in Sources */,
+				C1F50E65FD4AB246BAC40911 /* Scan.swift in Sources */,
 				55282FEDBAEF76F7172E5825 /* SetDirty.swift in Sources */,
 				53A681659B3739644B432A50 /* Truncate.swift in Sources */,
 				A283CF3E3376BC4686313635 /* Verify.swift in Sources */,

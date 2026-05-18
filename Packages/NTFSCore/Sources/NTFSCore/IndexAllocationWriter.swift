@@ -22,7 +22,19 @@ struct IndexAllocationWriter {
 
     enum InsertOutcome {
         case inserted
-        case leafFull(usedSize: Int, allocatedSize: Int, needed: Int)
+        /// Leaf has no slack — caller decides whether to split. Carries
+        /// everything the caller needs to perform a split:
+        /// - `leafVCN` / `leafByteOffset`: where the existing leaf lives
+        /// - `mergedSortedEntries`: original leaf entries + new entry, sorted
+        /// - `usedSize`/`allocatedSize`/`needed`: for diagnostic reporting
+        case leafFull(
+            leafVCN: UInt64,
+            leafByteOffset: UInt64,
+            usedSize: Int,
+            allocatedSize: Int,
+            needed: Int,
+            mergedSortedEntries: [(fileRef: UInt64, body: Data, sortKey: String)]
+        )
     }
 
     /// One parsed entry inside an index node, INCLUDING the LAST sentinel.
@@ -328,10 +340,14 @@ struct IndexAllocationWriter {
         } + 16 // LAST sentinel
         let neededUsedSize = entriesOffsetWithinHeader + entryBytes
         if neededUsedSize > allocatedSizeWithinHeader {
+            let byteOffset = try vcnToByteOffset(vcn: blockVCN, extents: allocationExtents, clusterBytes: clusterBytes)
             return .leafFull(
+                leafVCN: blockVCN,
+                leafByteOffset: byteOffset,
                 usedSize: usedSizeWithinHeader,
                 allocatedSize: allocatedSizeWithinHeader,
-                needed: neededUsedSize
+                needed: neededUsedSize,
+                mergedSortedEntries: merged.map { (fileRef: $0.0, body: $0.1, sortKey: $0.2) }
             )
         }
 
@@ -357,7 +373,7 @@ struct IndexAllocationWriter {
     /// Preserves the source block's magic, USA layout, LSN, VCN and INDEX_HEADER
     /// metadata (incl. allocatedSize); replaces the entries list and updates
     /// usedSize.
-    private static func buildLeafIndexBlock(
+    static func buildLeafIndexBlock(
         sourceBlockBytes raw: Data,
         sortedEntries: [(UInt64, Data, String)],
         blockSize: Int
