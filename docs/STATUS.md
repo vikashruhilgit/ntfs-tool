@@ -153,11 +153,12 @@ Code is complete. Builds clean. **Has not been run with the extension actually l
 
 | Validation tier | What it checks | Status |
 |---|---|---|
-| **Unit tests** (`swift test`) | All NTFSCore parsers + write paths against fixtures | ✅ 87/87 passing |
+| **Unit tests** (`swift test`) | All NTFSCore parsers + write paths against fixtures | ✅ 107/107 passing |
 | **`ntfsfix --no-action`** | Volume passes the canonical Linux NTFS fsck after our writes | ✅ via integration test |
 | **`ntfs-3g` mount + cat** | Canonical Linux NTFS driver reads back our writes byte-exact | ✅ via integration test |
 | **Real Windows-formatted drive** | NTFSCore parses a real 4 TB Western Digital My Passport drive | ✅ via manual `ntfsctl verify` |
 | **Byte-exact vs Apple's driver** | SHA-256 of our read matches Apple's mount-path read of same file | ✅ proven on real Windows .exe |
+| **`ntfsctl` write → Apple's driver read on real hardware** | Apple's NTFS driver reads our writes byte-exact on re-mount of the user's 4 TB WD My Passport | ✅ proven 2026-05-18 against v0.2.0 candidate `bac8d31` (see §4 below) |
 | **`xcodebuild` of FSKit ext + app** | All three Xcode schemes build clean | ✅ in CI |
 | **FSKit extension mount in Finder** | Drive actually mounts via our extension | ❌ requires SIP-off / entitlement |
 | **Windows `chkdsk /f`** | Microsoft's own fsck accepts our writes | ❌ requires Windows machine |
@@ -221,29 +222,40 @@ README and `docs/CLI.md` both say license is TBD. Recommendations:
 
 Since the NTFS code is a clean-room implementation from public format docs (no GPL contamination), you have all options available. Pick one and add a `LICENSE` file at repo root.
 
-### 4. Manual write test against the real WD drive
+### 4. Manual write test against the real WD drive — ✅ DONE (2026-05-18, v0.2.0 candidate)
 
-The read path is byte-identical to Apple's driver on your 4 TB drive — read is fully production-validated. **The write path has never been tested against this physical drive.** Quick validation:
+Hardware round-trip validated on the user's 4 TB WD My Passport against v0.2.0
+(release binary built from `bac8d31`). End-to-end sequence:
 
-```bash
+```
 diskutil unmount /dev/disk10s1
-# Find a folder you don't care about (or use /WD - Software/ which we know is record 44)
-sudo ntfsctl create /dev/disk10s1 hello-from-ntfsctl.txt --parent 44
-# Note the assigned record number, say 38
-echo "Write test from macOS ntfsctl" | sudo ntfsctl write /dev/disk10s1 38
-sudo ntfsctl setdirty /dev/disk10s1 0
+echo "hardware round-trip $(date)" > /tmp/htest.txt
+sudo ntfsctl cp /tmp/htest.txt /dev/disk10s1 /hello-from-ntfsctl.txt -v
+# → cp /tmp/htest.txt -> recnum 16 (49 B); done: 1/1 files, 49 B/49 B
 diskutil mount /dev/disk10s1
-ls "/Volumes/My Passport/WD - Software/hello-from-ntfsctl.txt"
-cat "/Volumes/My Passport/WD - Software/hello-from-ntfsctl.txt"
+cat "/Volumes/My Passport/hello-from-ntfsctl.txt"
+# → hardware round-trip Mon May 18 12:27:18 IST 2026   ← byte-exact via Apple's driver
+diskutil unmount /dev/disk10s1
+sudo ntfsctl rm /dev/disk10s1 /hello-from-ntfsctl.txt
+diskutil mount /dev/disk10s1
+# → drive re-mounts cleanly, ntfsctl verify post-test returned to baseline
+#   (42 in-use, 26 user, 0 orphans, 0 dangling)
 ```
 
-If the file appears in Finder AND `cat` (via Apple's driver) returns the bytes we wrote, the write path is production-validated on your real drive. Clean up after:
+That validates:
+- The `cp` host→volume write path on real hardware (bitmap allocator T1.1,
+  LARGE_INDEX insert, dirty-bit + fsync session safety).
+- Apple's NTFS driver accepts our writes byte-exact on re-mount (the strong
+  cross-driver signal — would-be corruption surfaces here).
+- The `rm` path correctly removes the entry; subsequent re-mount + verify
+  show the volume back to baseline.
+- The `verify` full-MFT sweep (104,192 records on this drive) runs cleanly.
 
-```bash
-diskutil unmount /dev/disk10s1
-sudo ntfsctl delete /dev/disk10s1 38
-diskutil mount /dev/disk10s1
-```
+Remaining hardware tests deferred to user:
+- **Windows `chkdsk /f` round-trip** (item §2 below) — only authority that
+  Microsoft itself trusts. Requires a Windows machine.
+- **Long-running stress test** (copy a few GB of phone-backup data over a
+  real session, eject + remount, verify integrity). Optional.
 
 ## What's pending — engineering follow-ups
 
