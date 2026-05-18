@@ -30,16 +30,34 @@ struct Scan: AsyncParsableCommand {
     @Flag(name: [.short, .long], help: "Verbose: print why each probed device was rejected.")
     var verbose: Bool = false
 
+    @Flag(name: .long, help: "Scan ALL /dev/disk*s* slices including macOS system disks. Default scans only external drives (via diskutil).")
+    var all: Bool = false
+
     func run() async throws {
         let fm = FileManager.default
         var candidates: [String] = []
 
-        // Enumerate /dev/diskNsM slices. macOS exposes block-device slices as
-        // /dev/disk0s1 etc.
-        if let entries = try? fm.contentsOfDirectory(atPath: "/dev") {
-            for entry in entries.sorted() {
-                if entry.range(of: #"^disk\d+s\d+$"#, options: .regularExpression) != nil {
-                    candidates.append("/dev/\(entry)")
+        if all {
+            // Brute scan: every /dev/disk*s* slice. Includes macOS system
+            // disks. Useful for power users; noisy by default.
+            if let entries = try? fm.contentsOfDirectory(atPath: "/dev") {
+                for entry in entries.sorted() {
+                    if entry.range(of: #"^disk\d+s\d+$"#, options: .regularExpression) != nil {
+                        candidates.append("/dev/\(entry)")
+                    }
+                }
+            }
+        } else {
+            // Default: ask macOS's `diskutil list` for only external physical
+            // drives. Filters out APFS containers, simulators, boot disk —
+            // the noisy 15 we'd otherwise lump with the user's actual NTFS
+            // drive. Falls back to brute scan if diskutil parse fails.
+            candidates = (try? Self.externalDeviceSlicesViaDiskutil()) ?? []
+            if candidates.isEmpty, let entries = try? fm.contentsOfDirectory(atPath: "/dev") {
+                for entry in entries.sorted() {
+                    if entry.range(of: #"^disk\d+s\d+$"#, options: .regularExpression) != nil {
+                        candidates.append("/dev/\(entry)")
+                    }
                 }
             }
         }
@@ -145,6 +163,49 @@ struct Scan: AsyncParsableCommand {
             }
             return .otherError
         }
+    }
+
+    /// Shell out to `diskutil list -plist external physical`, parse the
+    /// plist to collect every device-slice identifier (e.g. "disk10s1"),
+    /// return them as `/dev/...` paths. Filters out macOS's own boot
+    /// drive, APFS containers, simulators — the things we don't care about
+    /// when looking for USB-attached NTFS drives.
+    ///
+    /// Throws if diskutil isn't present or returns malformed plist.
+    private static func externalDeviceSlicesViaDiskutil() throws -> [String] {
+        let process = Process()
+        process.launchPath = "/usr/sbin/diskutil"
+        process.arguments = ["list", "-plist", "external", "physical"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            return []
+        }
+        // diskutil's plist has an "AllDisksAndPartitions" array; each entry
+        // is a whole-disk dict with a "Partitions" sub-array of slice dicts;
+        // each slice has a "DeviceIdentifier" (e.g. "disk10s1").
+        var paths: [String] = []
+        if let allDisks = plist["AllDisksAndPartitions"] as? [[String: Any]] {
+            for disk in allDisks {
+                if let parts = disk["Partitions"] as? [[String: Any]] {
+                    for p in parts {
+                        if let id = p["DeviceIdentifier"] as? String, !id.isEmpty {
+                            paths.append("/dev/\(id)")
+                        }
+                    }
+                }
+                // For unpartitioned disks the whole disk itself is the device.
+                else if let id = disk["DeviceIdentifier"] as? String, !id.isEmpty {
+                    paths.append("/dev/\(id)")
+                }
+            }
+        }
+        return paths.sorted()
     }
 
     private struct ProbedInfo {
