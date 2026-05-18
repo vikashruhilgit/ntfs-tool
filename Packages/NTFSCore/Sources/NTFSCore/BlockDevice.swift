@@ -58,7 +58,12 @@ public actor FileHandleBlockDevice: BlockDevice {
     public init(openingFileAt path: String) throws {
         self.path = path
         guard let handle = FileHandle(forReadingAtPath: path) else {
-            throw NTFSError.ioFailure(description: "cannot open \(path) for reading")
+            // The two common causes on macOS: file doesn't exist (typo), or
+            // Apple's auto-mount has claimed the raw device. Suggest the
+            // unmount-first dance — that fixes the majority of cases.
+            throw NTFSError.ioFailure(
+                description: "cannot open \(path) for reading (hint: if this is a mounted NTFS volume, run `diskutil unmount \(path)` first to release Apple's read-only mount, then retry)"
+            )
         }
         self.handle = handle
         self.isWritable = false
