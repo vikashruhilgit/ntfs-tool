@@ -141,6 +141,10 @@ struct Cp: AsyncParsableCommand {
             return
         }
 
+        // Mark the volume dirty for the duration of the copy so a crash leaves
+        // Windows aware that chkdsk should scan the volume on next mount.
+        try await volume.beginWriteSession()
+
         // Execute the copy.
         var copiedFiles = 0
         var copiedBytes: UInt64 = 0
@@ -167,7 +171,7 @@ struct Cp: AsyncParsableCommand {
                 totalBytes: totalBytes
             )
         }
-        try await volume.setDirty(false)
+        try await volume.endWriteSession()
 
         if progress || verbose {
             FileHandle.standardError.write(Data("done: \(copiedFiles)/\(totalFiles) files, \(humanBytes(copiedBytes))/\(humanBytes(totalBytes))\n".utf8))

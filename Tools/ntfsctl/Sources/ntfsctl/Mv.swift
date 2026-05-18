@@ -57,8 +57,9 @@ struct Mv: AsyncParsableCommand {
                 parentRN = try await volume.createFile(named: comp, inDirectory: parentRN, isDirectory: true)
             }
         }
+        try await volume.beginWriteSession()
         try await volume.rename(at: srcRN, toName: leafName, inDirectory: parentRN)
-        try await volume.setDirty(false)
+        try await volume.endWriteSession()
         print("mv \(source) -> \(destination) (recnum \(srcRN))")
     }
 }

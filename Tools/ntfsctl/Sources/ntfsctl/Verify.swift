@@ -24,8 +24,8 @@ struct Verify: AsyncParsableCommand {
     @Flag(name: [.short, .long], help: "Print per-record / per-orphan details.")
     var verbose: Bool = false
 
-    @Option(help: "Maximum MFT records to sweep. Default 4096; raise for larger volumes.")
-    var maxRecords: UInt64 = 4096
+    @Option(help: "Cap MFT sweep to this many records (0 = unlimited, auto-bounded by $MFT's logical size). Default 0.")
+    var maxRecords: UInt64 = 0
 
     func run() async throws {
         let blockDevice = try FileHandleBlockDevice(openingFileAt: device)
@@ -42,7 +42,10 @@ struct Verify: AsyncParsableCommand {
         var firstFewErrors: [(UInt64, String)] = []
 
         // Compute the actual MFT logical size from $MFT (record 0)'s $DATA
-        // realSize so we don't read past the real MFT end into garbage.
+        // realSize so we don't read past the real MFT end into garbage —
+        // AND so we don't silently false-pass volumes with corruption past
+        // an arbitrary 4096-record cap. `--max-records 0` (default) means
+        // scan the whole MFT bounded only by what $MFT.$DATA claims is real.
         let mftLogicalRecords: UInt64
         do {
             let mftRec = try await mft.record(at: 0)
@@ -53,12 +56,13 @@ struct Verify: AsyncParsableCommand {
                 case let .resident(b, _): realSize = UInt64(b.count)
                 case let .nonResident(_, _, _, _, _, r, _, _): realSize = r
                 }
-                mftLogicalRecords = min(maxRecords, realSize / UInt64(volume.mftRecordSizeBytes))
+                let inferred = realSize / UInt64(volume.mftRecordSizeBytes)
+                mftLogicalRecords = maxRecords == 0 ? inferred : min(maxRecords, inferred)
             } else {
-                mftLogicalRecords = maxRecords
+                mftLogicalRecords = maxRecords == 0 ? 4096 : maxRecords
             }
         } catch {
-            mftLogicalRecords = maxRecords
+            mftLogicalRecords = maxRecords == 0 ? 4096 : maxRecords
         }
 
         for n in 0..<mftLogicalRecords {
@@ -111,7 +115,7 @@ struct Verify: AsyncParsableCommand {
         let orphans = inUseUserRecords.subtracting(reachableUserRecords)
         let dangling = reachableUserRecords.subtracting(inUseUserRecords)
 
-        print("MFT sweep (records 0..\(maxRecords - 1)):")
+        print("MFT sweep (records 0..\(mftLogicalRecords - 1)):")
         print("  In use (total):         \(inUseCount)")
         print("    User (>=16):          \(inUseUserRecords.count)")
         print("    Directories:          \(dirCount)")

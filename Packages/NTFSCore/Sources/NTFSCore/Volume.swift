@@ -1501,6 +1501,32 @@ public actor Volume {
         try await volumeInformation().flags.contains(.isDirty)
     }
 
+    /// Mark the volume dirty + flush. Call this immediately after opening a
+    /// volume for writes, BEFORE any mutation. Pairs with `endWriteSession()`
+    /// which clears the dirty bit + flushes again. The window between the two
+    /// is the only state in which an interrupted ntfsctl invocation can leave
+    /// inconsistent metadata — and dirty=1 tells Windows / chkdsk to scan it.
+    ///
+    /// Idempotent: setting dirty=1 when already dirty is a no-op (just a re-
+    /// write of the same byte).
+    public func beginWriteSession() async throws {
+        try await setDirty(true)
+        try await device.synchronize()
+    }
+
+    /// Clear the dirty bit + flush. Call AFTER all mutations are complete.
+    /// The flush before clearing is critical: without it a kernel buffer
+    /// reorder could land dirty=0 on disk while the data writes are still
+    /// in cache, and a fast unplug at that moment loses the data while
+    /// Windows trusts the volume.
+    public func endWriteSession() async throws {
+        // Flush data first.
+        try await device.synchronize()
+        try await setDirty(false)
+        // Flush the dirty-bit clear too.
+        try await device.synchronize()
+    }
+
     /// Set or clear the $VOLUME_INFORMATION dirty bit. After every batch of
     /// writes is complete, callers should `setDirty(false)` so that chkdsk /
     /// ntfsfix treat the volume as cleanly-unmounted.

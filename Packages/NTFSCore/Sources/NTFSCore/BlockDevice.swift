@@ -20,11 +20,26 @@ public protocol BlockDevice: Sendable {
     /// implementations don't have to opt in until they're ready to support
     /// writes.
     func write(offset: UInt64, bytes: Data) async throws
+
+    /// Force all kernel-buffered writes to physical media. Equivalent to
+    /// fcntl(F_FULLFSYNC) on macOS — stronger than `fsync()` because it
+    /// also flushes the drive's own cache. CRITICAL before clearing the
+    /// volume's dirty bit: a power loss or fast unplug after dirty=0 hits
+    /// the disk but before the actual data does corrupts the volume silently
+    /// (Windows trusts dirty=0 and skips chkdsk on the next mount).
+    ///
+    /// Default impl is a no-op so existing in-memory test backings don't
+    /// need to opt in — only real block-device backings need it.
+    func synchronize() async throws
 }
 
 public extension BlockDevice {
     func write(offset: UInt64, bytes: Data) async throws {
         throw NTFSError.readOnlyDevice
+    }
+
+    func synchronize() async throws {
+        // No-op default for read-only / in-memory backings.
     }
 }
 
@@ -51,12 +66,32 @@ public actor FileHandleBlockDevice: BlockDevice {
 
     /// Open `path` read-write. The file must already exist; we don't create
     /// new NTFS volumes (that's `mkntfs`'s job). Used by mutable-fixture
-    /// tests and (Phase 5+) by `ntfsctl` write operations against raw
-    /// devices.
-    public init(openingFileForUpdateAt path: String) throws {
+    /// tests and by `ntfsctl` write operations against raw devices.
+    ///
+    /// Takes an exclusive advisory lock (`flock(LOCK_EX | LOCK_NB)`) on the
+    /// file descriptor so a second concurrent writer can't race on bitmap
+    /// allocation. Throws `ioFailure(description: "device in use ...")` if
+    /// another process already holds the lock — caller should suggest
+    /// killing the other process or checking for stray `ntfsctl` invocations.
+    ///
+    /// `lockExclusive: false` disables the flock — only used by tests that
+    /// open the same fixture twice in one process for verify-reads. Don't
+    /// pass false from CLI code.
+    public init(openingFileForUpdateAt path: String, lockExclusive: Bool = true) throws {
         self.path = path
         guard let handle = FileHandle(forUpdatingAtPath: path) else {
-            throw NTFSError.ioFailure(description: "cannot open \(path) for updating")
+            throw NTFSError.ioFailure(description: "cannot open \(path) for updating (hint: file may not exist, or you may need sudo for /dev/disk* devices)")
+        }
+        if lockExclusive {
+            // Non-blocking exclusive flock to detect concurrent writers.
+            let lockResult = flock(handle.fileDescriptor, LOCK_EX | LOCK_NB)
+            if lockResult != 0 {
+                let err = errno
+                try? handle.close()
+                throw NTFSError.ioFailure(
+                    description: "device \(path) is already locked by another process (flock errno=\(err)) — close any other ntfsctl invocations on this device and retry"
+                )
+            }
         }
         self.handle = handle
         self.isWritable = true
@@ -108,6 +143,23 @@ public actor FileHandleBlockDevice: BlockDevice {
             try handle.write(contentsOf: bytes)
         } catch {
             throw NTFSError.ioFailure(description: "write at offset \(offset) length \(bytes.count) failed: \(error)")
+        }
+    }
+
+    public func synchronize() async throws {
+        guard isWritable else { return }
+        // F_FULLFSYNC is stronger than fsync(): it also asks the drive itself
+        // to flush its own cache to media. Costs latency but is the only
+        // safe way to commit metadata-then-clear-dirty-bit ordering.
+        let r = fcntl(handle.fileDescriptor, F_FULLFSYNC)
+        if r == -1 {
+            // Fall back to plain fsync if F_FULLFSYNC isn't supported (rare
+            // on macOS; happens on some network mounts). Still much better
+            // than nothing.
+            if fsync(handle.fileDescriptor) != 0 {
+                let err = errno
+                throw NTFSError.ioFailure(description: "synchronize failed (fcntl F_FULLFSYNC + fsync both errored, errno=\(err))")
+            }
         }
     }
 }

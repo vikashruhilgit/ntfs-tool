@@ -218,7 +218,8 @@ final class FileCreateDeleteTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(recordNumber, 16, "new file should land in user-record range")
 
         // Re-open the volume so we read from disk, not in-memory state.
-        let reader = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        // lockExclusive=false: the original handle still holds the flock.
+        let reader = try FileHandleBlockDevice(openingFileForUpdateAt: path, lockExclusive: false)
         let reopened = try await Volume(device: reader)
         let entries = try await reopened.enumerate(directory: 5)
         let names = entries.map { $0.name }
