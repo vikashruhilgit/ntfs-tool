@@ -1063,6 +1063,11 @@ public actor Volume {
         indexRoot: IndexRoot,
         allocationExtents: [Extent]
     ) async throws {
+        // Snapshot whole-tree state BEFORE the split so the post-split
+        // verification can compare delta correctly. Expected after split:
+        // exactly +1 entry (the new one we're trying to insert).
+        let beforeSplitRefs = try await collectAllFileRefsInLargeIndex(parentRecordNumber: parentRecordNumber)
+        let newEntryRef = mergedSortedEntries.first(where: { !beforeSplitRefs.contains($0.fileRef) })?.fileRef ?? 0
         let clusterBytes = UInt64(bytesPerCluster)
         guard UInt64(indexRecordSizeBytes) == clusterBytes else {
             throw NTFSError.unsupportedFeature(
@@ -1106,6 +1111,20 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "splitLeaf: allocator returned sparse extent")
         }
         let newVCN = allocationExtents.reduce(0) { $0 + $1.clusterCount }
+        // Sanity check: the allocator should never hand us a cluster that's
+        // already in use by THIS directory's $INDEX_ALLOCATION extents.
+        // If it does, our subsequent write would clobber existing leaves
+        // — the orphan bug. Loud failure here is far better than silent
+        // data loss.
+        for existing in allocationExtents {
+            guard let exLCN = existing.startLCN else { continue }
+            let exEnd = exLCN + existing.clusterCount
+            if newLCN >= exLCN && newLCN < exEnd {
+                throw NTFSError.corruptOnDisk(
+                    description: "splitLeaf: allocator returned LCN \(newLCN) which overlaps existing $INDEX_ALLOCATION extent [\(exLCN)..\(exEnd)). Cluster-reuse bug — refusing to write."
+                )
+            }
+        }
 
         // 3. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
         let blockSize = Int(indexRecordSizeBytes)
@@ -1161,6 +1180,23 @@ public actor Volume {
             allocationExtents: allocationExtents,
             newExtent: newExtent
         )
+
+        // T1.2 deep verification: walk the tree post-split and compare to
+        // the pre-split snapshot. After exactly one split that promoted
+        // the median into $INDEX_ROOT, the tree should hold (before +
+        // newEntryRef) entries — no more, no less. Captures the
+        // silent-orphan bug at the moment of corruption.
+        let afterSplitRefs = try await collectAllFileRefsInLargeIndex(parentRecordNumber: parentRecordNumber)
+        let expectedAfter = beforeSplitRefs.union([newEntryRef])
+        if afterSplitRefs != expectedAfter {
+            let missing = expectedAfter.subtracting(afterSplitRefs).sorted()
+            let extra = afterSplitRefs.subtracting(expectedAfter).sorted()
+            let report = "[split-verify FAIL] parent=\(parentRecordNumber) splitLeafVCN=\(leafVCN) newLeafVCN=\(newVCN) before=\(beforeSplitRefs.count) after=\(afterSplitRefs.count) expected=\(expectedAfter.count) newEntry=\(newEntryRef) missing=\(missing) extra=\(extra)\n"
+            FileHandle.standardError.write(Data(report.utf8))
+            throw NTFSError.corruptOnDisk(
+                description: "splitLeafAndPromote: post-split state mismatch — before=\(beforeSplitRefs.count) after=\(afterSplitRefs.count) expected=\(expectedAfter.count) missing=\(missing.count) extra=\(extra.count). Leaf-split orphan bug at moment of corruption."
+            )
+        }
     }
 
     /// Update the parent's $INDEX_ROOT after a leaf split, AND its
@@ -1323,6 +1359,48 @@ public actor Volume {
         // surfaces here with a precise location rather than as a later
         // mysterious USA-fixup mismatch in the next descent.
         try await verifyParentRecord(parentRecordNumber, context: "after split of leaf VCN \(splitLeafVCN)")
+    }
+
+    /// Walk the entire LARGE_INDEX tree of `parentRecordNumber` and return
+    /// the set of distinct fileReferences visible. Used as a post-split
+    /// self-check.
+    private func collectAllFileRefsInLargeIndex(parentRecordNumber: UInt64) async throws -> Set<UInt64> {
+        let mft = self.mft()
+        let parent = try await mft.record(at: parentRecordNumber)
+        let attrs = try parent.attributes()
+        guard let irAttr = attrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
+              case let .resident(rootBytes, _) = irAttr.value else {
+            return []
+        }
+        let root = try IndexRoot.parse(rootBytes)
+        var refs: Set<UInt64> = []
+        // Collect from $INDEX_ROOT entries (interior + leaf-style).
+        for e in root.entries where !e.isLast {
+            refs.insert(e.fileReference)
+        }
+        // Collect from $INDEX_ALLOCATION leaves if LARGE_INDEX.
+        if root.isLargeIndex,
+           let allocAttr = attrs.first(where: { $0.type == .indexAllocation && $0.nameOrEmpty == "$I30" }),
+           case let .nonResident(_, _, _, _, _, _, _, extents) = allocAttr.value {
+            let clusterBytes = UInt64(bytesPerCluster)
+            let blockSize = Int(indexRecordSizeBytes)
+            let sectorSize = Int(boot.bytesPerSector)
+            let clustersPerBlock = max(UInt64(1), UInt64(blockSize) / clusterBytes)
+            for extent in extents {
+                guard let startLCN = extent.startLCN else { continue }
+                var cluster: UInt64 = 0
+                while cluster < extent.clusterCount {
+                    let lcn = startLCN + cluster
+                    let raw = try await device.read(offset: lcn * clusterBytes, length: blockSize)
+                    let block = try IndexAllocationBlock.parse(raw, sectorSize: sectorSize)
+                    for e in block.entries where !e.isLast {
+                        refs.insert(e.fileReference)
+                    }
+                    cluster += clustersPerBlock
+                }
+            }
+        }
+        return refs
     }
 
     /// Re-read + re-parse an MFT record + walk every attribute. Throws with

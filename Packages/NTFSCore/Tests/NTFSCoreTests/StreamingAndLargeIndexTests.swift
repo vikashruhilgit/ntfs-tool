@@ -169,6 +169,61 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         }
     }
 
+    /// Reproduces the leaf-split orphan bug observed against the user's
+    /// real 4 TB WD drive: a `cp -r`-style sequence (createFile +
+    /// writeFile, the writeFile triggering refreshParentI30Size + mtime
+    /// bump) into a LARGE_INDEX directory eventually loses some entries
+    /// silently. The split self-check should fire at the moment of
+    /// corruption.
+    func testLeafSplitOrphansBugUnderCpRWorkload() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        // Skipped pending v0.3 fix. This test reproduces the known leaf-
+        // split silent-orphan bug — entries created after the 4th split
+        // vanish on disk re-read. Remove the skip + run the test once
+        // the fix lands; it serves as the regression target. The split-
+        // time verifier in splitLeafAndPromote stays active for any
+        // accidental future regression to surface loudly.
+        throw XCTSkip("Known v0.2 leaf-split silent-orphan bug; tracked for v0.3. Remove skip + re-run when fix lands.")
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        // Pre-grow $MFT.$DATA so we have enough slots to trigger multiple
+        // leaf splits — the small fixture caps at ~60 records by default,
+        // not enough to reach the second split. The growth path itself is
+        // tested elsewhere; here we just need the slots.
+        try await volume.growMFTDataByClusters(8)   // +32 records
+        try await volume.growMFTDataByClusters(8)   // +32 more
+
+        var inserted: [(name: String, rn: UInt64)] = []
+        let payload = Data("test content for split-orphan repro\n".utf8)
+        for i in 0..<200 {
+            let name = String(format: "cp-repro-%04d.txt", i)
+            do {
+                let rn = try await volume.createFile(named: name, inDirectory: 5)
+                try await volume.write(at: rn, offset: 0, bytes: payload)
+                inserted.append((name, rn))
+            } catch NTFSError.unsupportedFeature {
+                break
+            }
+        }
+        // Final reopen check: reopen the fixture from disk and verify
+        // every inserted name is visible. The split-time verifier guards
+        // each split's atomicity; this guards the END state.
+        let finalReader = try FileHandleBlockDevice(openingFileAt: path)
+        let finalReopen = try await Volume(device: finalReader)
+        let finalNames = Set(try await finalReopen.enumerate(directory: 5).map { $0.name })
+        let stillMissing = inserted.map(\.name).filter { !finalNames.contains($0) }
+        // Known v0.2 bug: after the 4th leaf split (around insert 75),
+        // entries from the 4th leaf's range silently vanish on disk.
+        // Tracked in STATUS.md as v0.3 work; this test serves as the
+        // regression target once the fix lands.
+        XCTAssertTrue(
+            stillMissing.isEmpty,
+            "Known v0.2 leaf-split silent-orphan bug: \(stillMissing.count) entries missing on disk after \(inserted.count) cp-style inserts. Missing: \(stillMissing.prefix(5).joined(separator: ", "))\(stillMissing.count > 5 ? "..." : "")"
+        )
+    }
+
     /// T1.2: leaf split now works. Insert enough entries to overflow the
     /// initial leaf (~50 with typical filenames), confirm split fires and
     /// all entries remain reachable in the directory enumeration. The cap
