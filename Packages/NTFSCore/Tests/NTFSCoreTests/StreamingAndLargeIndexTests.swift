@@ -266,6 +266,64 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         XCTAssertNil(missing)
     }
 
+    // MARK: - mtime + size hint refresh (T1.3 + T1.4)
+
+    func testWriteBumpsStandardInformationMTime() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+        let rn = try await volume.createFile(named: "mtime.txt", inDirectory: parentRN)
+
+        // Read the created mtime, then write content, then re-read mtime.
+        let mft = await volume.mft()
+        func mtimeOf(_ recordNumber: UInt64) async throws -> Date? {
+            let rec = try await mft.record(at: recordNumber)
+            let attrs = try rec.attributes()
+            guard let si = attrs.first(where: { $0.type == .standardInformation }),
+                  case let .resident(b, _) = si.value else { return nil }
+            return try StandardInformation.parse(b).modificationTime
+        }
+        let mtimeAtCreate = try await mtimeOf(rn)
+        // Sleep a hair to ensure clock advances (FILETIME 100ns resolution).
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try await volume.write(at: rn, offset: 0, bytes: Data("payload".utf8))
+
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let mftReopened = await reopened.mft()
+        let postRec = try await mftReopened.record(at: rn)
+        let postSI = try StandardInformation.parse(
+            (try postRec.attributes().first(where: { $0.type == .standardInformation }))!.value.residentBytes!
+        )
+        guard let postMTime = postSI.modificationTime, let preMTime = mtimeAtCreate else {
+            return XCTFail("mtime missing")
+        }
+        XCTAssertGreaterThan(postMTime, preMTime, "write must bump $STANDARD_INFORMATION mtime")
+    }
+
+    func testWriteRefreshesSizeHintInLargeIndexParent() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        // Root (recnum 5) is LARGE_INDEX on this fixture — perfect for the test.
+        let rn = try await volume.createFile(named: "sized.bin", inDirectory: 5)
+        let payload = Data(repeating: 0xAA, count: 8192)
+        try await volume.write(at: rn, offset: 0, bytes: payload)
+
+        // Re-open, enumerate root, find sized.bin, check its $FILE_NAME realSize.
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let entries = try await reopened.enumerate(directory: 5)
+        guard let entry = entries.first(where: { $0.name == "sized.bin" }) else {
+            return XCTFail("sized.bin missing from enumeration")
+        }
+        XCTAssertEqual(entry.fileName.realSize, UInt64(payload.count),
+                       "$I30 entry's $FILE_NAME.realSize must reflect post-write size in LARGE_INDEX parent")
+    }
+
     // MARK: - MFT $BITMAP allocator (T1.1)
 
     func testMFTBitmapReflectsAllocations() async throws {

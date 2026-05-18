@@ -199,6 +199,95 @@ struct IndexAllocationWriter {
         }
     }
 
+    /// Update the keyBytes of an entry matching `targetName` in whichever
+    /// leaf it lives. Used by `Volume.refreshParentI30Size` to patch stale
+    /// `$FILE_NAME` size hints after a write. The new keyBytes must have
+    /// the same length as the old (caller's responsibility — for size-hint
+    /// updates this is naturally true since name + namespace are unchanged).
+    /// Returns true if updated, false if not found.
+    static func updateEntry(
+        rootBody: Data,
+        allocationExtents: [Extent],
+        indexRecordSizeBytes: UInt32,
+        bytesPerCluster: UInt32,
+        sectorSize: Int,
+        device: any BlockDevice,
+        targetName: String,
+        newKeyBytes: Data
+    ) async throws -> Bool {
+        let root = try IndexRoot.parse(rootBody)
+        guard root.isLargeIndex else {
+            throw NTFSError.corruptOnDisk(description: "updateEntry called on non-LARGE_INDEX root")
+        }
+        let clusterBytes = UInt64(bytesPerCluster)
+        let blockSize = Int(indexRecordSizeBytes)
+        let clustersPerBlock = max(UInt64(1), UInt64(blockSize) / clusterBytes)
+
+        for extent in allocationExtents {
+            guard let startLCN = extent.startLCN else { continue }
+            var cluster: UInt64 = 0
+            while cluster < extent.clusterCount {
+                let lcn = startLCN + cluster
+                let byteOffset = lcn * clusterBytes
+                let raw = try await device.read(offset: byteOffset, length: blockSize)
+                let usaOffset = try raw.readU16LE(at: 4)
+                let usaCount = try raw.readU16LE(at: 6)
+                let fixed = try UpdateSequenceArray.applyFixup(
+                    recordBytes: raw,
+                    usaOffset: Int(usaOffset),
+                    usaCount: Int(usaCount),
+                    blockSize: sectorSize
+                )
+                let entriesOffsetWithinHeader = try fixed.readU32LE(at: 24)
+                let usedSizeWithinHeader = try fixed.readU32LE(at: 28)
+                let entriesStart = 24 + Int(entriesOffsetWithinHeader)
+                let entriesEnd = 24 + Int(usedSizeWithinHeader)
+                let entries = try parseEntries(in: fixed, start: entriesStart, limit: entriesEnd)
+                // Only rewrite leaf nodes — interior entries replicate the
+                // key from a leaf below; touching the interior copy without
+                // the leaf would unbalance the tree's representation.
+                let isInterior = entries.contains(where: { $0.hasSubnode })
+                if !isInterior, let match = entries.first(where: { $0.keyName == targetName }) {
+                    guard match.keyBytes.count == newKeyBytes.count else {
+                        // Different length means the entry's size on disk
+                        // changes, which can shift everything after it.
+                        // For the size-hint refresh use case lengths are
+                        // identical; reject any mismatch as a safety guard.
+                        throw NTFSError.unsupportedFeature(
+                            description: "updateEntry: new keyBytes length \(newKeyBytes.count) != existing \(match.keyBytes.count) — variable-length updates not supported"
+                        )
+                    }
+                    // Rebuild this leaf with the patched entry.
+                    var kept: [(UInt64, Data, String)] = []
+                    for e in entries where !e.isLast {
+                        if e.keyName == targetName {
+                            kept.append((e.fileReference, newKeyBytes, e.keyName ?? ""))
+                        } else {
+                            kept.append((e.fileReference, e.keyBytes, e.keyName ?? ""))
+                        }
+                    }
+                    let newBlock = try buildLeafIndexBlock(
+                        sourceBlockBytes: fixed,
+                        sortedEntries: kept,
+                        blockSize: blockSize
+                    )
+                    let outUsaOffset = try newBlock.readU16LE(at: 4)
+                    let outUsaCount = try newBlock.readU16LE(at: 6)
+                    let onDisk = try UpdateSequenceArray.reverseFixup(
+                        recordBytes: newBlock,
+                        usaOffset: Int(outUsaOffset),
+                        usaCount: Int(outUsaCount),
+                        blockSize: sectorSize
+                    )
+                    try await device.write(offset: byteOffset, bytes: onDisk)
+                    return true
+                }
+                cluster += clustersPerBlock
+            }
+        }
+        return false
+    }
+
     /// Remove an entry matching `targetName` from wherever it lives. Returns
     /// true if removed, false if not found. Walks every INDX block linearly
     /// (matches the read path) — only mutates leaf blocks (interior copies

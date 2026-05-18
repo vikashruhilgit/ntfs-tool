@@ -2083,9 +2083,59 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
 
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
-        // Refresh the parent's $I30 entry size hints so `list` shows a
-        // sensible size for freshly-written files. Best-effort; cosmetic.
+        // Refresh size hints + mtime on both this record's $STANDARD_INFORMATION
+        // and the parent's $I30 entry so list / Finder / sync tools see the
+        // right state. Best-effort.
         try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: UInt64(bytes.count))
+        try? await bumpMTimeOnWrite(recordNumber: recordNumber)
+    }
+
+    /// Bump $STANDARD_INFORMATION's mtime + mft-change time to "now" on the
+    /// given file's MFT record AND refresh the parent's $I30 entry's
+    /// $FILE_NAME mtime hints. Real apps (Finder, Lightroom, Google Photos,
+    /// every photo organizer) read mtime to dedupe / sort / detect changes;
+    /// without this every file ntfsctl writes has its mtime frozen at
+    /// creation, breaking timestamp-dependent workflows.
+    ///
+    /// Best-effort: any sub-failure is swallowed because the underlying
+    /// write already succeeded. The volume is still consistent — the
+    /// timestamps just stay stale.
+    private func bumpMTimeOnWrite(recordNumber: UInt64) async throws {
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        let attrs = try record.attributes()
+        guard let stdInfo = attrs.first(where: { $0.type == .standardInformation }),
+              case let .resident(stdBytes, _) = stdInfo.value else {
+            return
+        }
+        let now = MFTRecordBuilder.windowsFiletimeNow()
+        var newStd = stdBytes
+        // $STANDARD_INFORMATION layout: 0=create, 8=mod, 16=mft-change, 24=access
+        MFTRecord.writeU64LE(into: &newStd, at: 8,  value: now)
+        MFTRecord.writeU64LE(into: &newStd, at: 16, value: now)
+        // Wrap in a fresh resident attribute and replace.
+        let newAttrBytes = serializeResidentAttribute(
+            type: AttributeType.standardInformation.rawValue,
+            attrID: stdInfo.header.attributeID,
+            flags: stdInfo.header.flags,
+            attributeName: "",
+            value: newStd
+        )
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: AttributeType.standardInformation.rawValue,
+            attributeName: "",
+            replacementBytes: newAttrBytes
+        )
+        guard let mark = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset)) else {
+            return
+        }
+        var updated = newRecordBytes
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updated)
     }
 
     /// Update the $FILE_NAME size hints (realSize, allocatedSize) inside the
@@ -2110,7 +2160,32 @@ public actor Volume {
             return
         }
         let root = try IndexRoot.parse(rootBytes)
-        if root.isLargeIndex { return }
+        if root.isLargeIndex {
+            // T1.3: LARGE_INDEX path. Walk the leaves via IndexAllocationWriter,
+            // find the entry by name, rewrite its keyBytes with bumped sizes.
+            guard let allocAttr = parentAttrs.first(where: {
+                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
+            }), case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
+                return
+            }
+            // Build the new $FILE_NAME body with bumped sizes — same length
+            // as the existing one (only size hints change).
+            var newBody = reserializeFileNameBody(fn)
+            let allocSize = ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
+            MFTRecord.writeU64LE(into: &newBody, at: 40, value: allocSize)
+            MFTRecord.writeU64LE(into: &newBody, at: 48, value: newRealSize)
+            _ = try await IndexAllocationWriter.updateEntry(
+                rootBody: rootBytes,
+                allocationExtents: allocExtents,
+                indexRecordSizeBytes: indexRecordSizeBytes,
+                bytesPerCluster: bytesPerCluster,
+                sectorSize: Int(boot.bytesPerSector),
+                device: device,
+                targetName: fn.name,
+                newKeyBytes: newBody
+            )
+            return
+        }
 
         var entries: [(fileReference: UInt64, fileNameBody: Data, sortKey: String)] = []
         for entry in root.entries {
@@ -2323,6 +2398,7 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
         try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
+        try? await bumpMTimeOnWrite(recordNumber: recordNumber)
     }
 
     /// Streaming write from a host file path. Convenience wrapper around
