@@ -169,28 +169,37 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         }
     }
 
-    /// v1 limit: a single fully-packed leaf rejects further inserts with
-    /// `unsupportedFeature` (leaf split is future work). This test documents
-    /// the threshold so a future split implementation has a regression target.
-    func testLargeIndexLeafFullReportsUnsupportedFeature() async throws {
+    /// T1.2: leaf split now works. Insert enough entries to overflow the
+    /// initial leaf (~50 with typical filenames), confirm split fires and
+    /// all entries remain reachable in the directory enumeration. The cap
+    /// now comes from $MFT growth (separate feature), not leaf split.
+    func testLargeIndexLeafSplitWorks() async throws {
         guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
         let path = try MutableFixture.scopedCopy("small.img", testCase: self)
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
 
-        var inserted = 0
-        var sawLeafFull = false
+        var inserted: [String] = []
         for i in 0..<200 {
+            let name = String(format: "leaf-split-%04d.txt", i)
             do {
-                _ = try await volume.createFile(named: String(format: "fill-%04d.txt", i), inDirectory: 5)
-                inserted += 1
-            } catch NTFSError.unsupportedFeature(let desc) where desc.contains("leaf full") {
-                sawLeafFull = true
+                _ = try await volume.createFile(named: name, inDirectory: 5)
+                inserted.append(name)
+            } catch NTFSError.unsupportedFeature(let desc) where desc.contains("growing $MFT") {
+                // Hit MFT growth boundary — separate feature. As long as we
+                // got well past the single-leaf cap, leaf split worked.
                 break
             }
         }
-        XCTAssertTrue(sawLeafFull, "expected to hit 'leaf full' after \(inserted) inserts")
-        XCTAssertGreaterThan(inserted, 10, "should accept at least 10 inserts before saturating the only leaf")
+        XCTAssertGreaterThan(inserted.count, 40, "leaf split should accept far more than the ~30-entry single-leaf cap; got \(inserted.count)")
+
+        // Re-open and verify every inserted name is reachable.
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let names = Set(try await reopened.enumerate(directory: 5).map { $0.name })
+        for n in inserted {
+            XCTAssertTrue(names.contains(n), "inserted '\(n)' missing from enumeration after leaf splits")
+        }
     }
 
     func testLargeIndexInsertSurvivesDeleteRoundTrip() async throws {
@@ -255,6 +264,83 @@ final class StreamingAndLargeIndexTests: XCTestCase {
 
         let missing = try await volume.resolvePath("/no-such-thing-exists")
         XCTAssertNil(missing)
+    }
+
+    // MARK: - MFT $BITMAP allocator (T1.1)
+
+    func testMFTBitmapReflectsAllocations() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+
+        // Snapshot current bitmap state.
+        let bmBefore = try await volume.mftBitmap()
+
+        // Create a file — should allocate via bitmap.
+        let rn = try await volume.createFile(named: "alloc-via-bitmap.txt", inDirectory: parentRN)
+
+        // The just-allocated slot should be marked in the bitmap.
+        let bmAfter = try await volume.mftBitmap()
+        XCTAssertTrue(bmAfter.isAllocated(cluster: rn), "newly-allocated recnum \(rn) should be marked in $MFT.$BITMAP")
+        XCTAssertFalse(bmBefore.isAllocated(cluster: rn), "the slot should have been free in the pre-allocation bitmap snapshot")
+
+        // Re-open the volume — bitmap should persist.
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopened = try await Volume(device: reader)
+        let bmReopened = try await reopened.mftBitmap()
+        XCTAssertTrue(bmReopened.isAllocated(cluster: rn), "bitmap allocation must hit disk")
+    }
+
+    func testMFTBitmapClearsOnDelete() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+        let rn = try await volume.createFile(named: "to-delete.txt", inDirectory: parentRN)
+        let preDelete = try await volume.mftBitmap()
+        XCTAssertTrue(preDelete.isAllocated(cluster: rn))
+
+        try await volume.deleteFile(at: rn)
+
+        let bm = try await volume.mftBitmap()
+        XCTAssertFalse(bm.isAllocated(cluster: rn), "delete should clear the $MFT.$BITMAP bit")
+    }
+
+    func testMFTBitmapSurvivesManyAllocations() async throws {
+        // Stress: allocate as many slots as the fixture's $MFT.$DATA holds
+        // (~68 records on this fixture). Each allocation should consult the
+        // bitmap, never re-use an in-use slot.
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        let parentRN = try await subDirRecordNumber(volume: volume)
+
+        var assigned: Set<UInt64> = []
+        var hitMFTGrowthGuard = false
+        for i in 0..<60 {
+            do {
+                let rn = try await volume.createFile(named: "stress-\(i).txt", inDirectory: parentRN)
+                XCTAssertFalse(assigned.contains(rn), "recnum \(rn) handed out twice")
+                XCTAssertGreaterThanOrEqual(rn, 16, "must allocate in user region")
+                assigned.insert(rn)
+            } catch NTFSError.unsupportedFeature(let d) where d.contains("growing $MFT") {
+                // Hit the $MFT growth boundary — expected with our small fixture.
+                hitMFTGrowthGuard = true
+                break
+            } catch NTFSError.unsupportedFeature(let d) where d.contains("leaf full") {
+                // Hit LARGE_INDEX leaf-full — also expected before T1.2 lands.
+                break
+            }
+        }
+        // Either we allocated all 60 OR we hit the materialization guard
+        // with a clear error. Either is acceptable; the bug we're testing
+        // for is silent slot duplication.
+        XCTAssertGreaterThan(assigned.count, 20, "should accept at least 20 bitmap-driven allocations")
+        _ = hitMFTGrowthGuard  // not asserting either way; depends on fixture
     }
 
     // MARK: - Mid-file write

@@ -112,6 +112,289 @@ public actor Volume {
         }
     }
 
+    // MARK: — MFT $BITMAP-based allocator
+    //
+    // $MFT (MFT record 0) has a $BITMAP attribute that tracks which MFT slots
+    // are allocated. One bit per record: bit N == 1 means record N is in
+    // use. The bitmap is the canonical NTFS authoritative source of "which
+    // slots are free"; the IN_USE flag in each individual MFT record is a
+    // (redundant) mirror. Real volumes — especially Windows-formatted ones
+    // with thousands of existing files — rely on the bitmap because the
+    // linear-scan approach gives up after a few thousand records.
+    //
+    // Pre-T1.1 (v0.1): findFreeRecordNumber linear-scanned the first 2048
+    // slots. On a 4 TB drive with 3000+ existing files, the first ntfsctl
+    // write attempt failed with `outOfSpace` — even though the drive had
+    // terabytes free — because slots 16-2063 were all in use.
+    //
+    // Post-T1.1: allocate via the bitmap. Works for arbitrarily-sized MFTs.
+
+    private var _mftBitmap: Bitmap?
+
+    /// Read (and cache) the $MFT $BITMAP attribute. Returns a Bitmap whose
+    /// `clusterCount` is actually "record count" (the abstraction is bit-
+    /// indexed; semantics are the caller's problem).
+    public func mftBitmap() async throws -> Bitmap {
+        if let cached = _mftBitmap { return cached }
+        let mft = self.mft()
+        let r0 = try await mft.record(at: 0)
+        let attrs = try r0.attributes()
+        guard let bmAttr = attrs.first(where: { $0.rawType == 0xB0 && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(description: "$MFT (record 0) lacks $BITMAP attribute")
+        }
+        let bytes: Data
+        switch bmAttr.value {
+        case let .resident(b, _):
+            bytes = b
+        case let .nonResident(_, _, _, _, _, realSize, _, extents):
+            var collected = Data()
+            let take = Int(min(realSize, UInt64(Int.max)))
+            collected.reserveCapacity(take)
+            let clusterBytes = UInt64(bytesPerCluster)
+            var remaining = take
+            for extent in extents where remaining > 0 {
+                let extentLen = Int(min(extent.clusterCount * clusterBytes, UInt64(remaining)))
+                if let startLCN = extent.startLCN {
+                    let chunk = try await device.read(offset: startLCN * clusterBytes, length: extentLen)
+                    collected.append(chunk)
+                } else {
+                    collected.append(Data(repeating: 0, count: extentLen))
+                }
+                remaining -= extentLen
+            }
+            bytes = collected
+        }
+        let bm = Bitmap(bytes: bytes, clusterCount: UInt64(bytes.count) * 8)
+        _mftBitmap = bm
+        return bm
+    }
+
+    /// Allocate the next free MFT record (>= firstUserRecord). Marks the bit
+    /// as in-use and persists the bitmap to disk atomically (in the sense
+    /// that the on-disk bitmap is updated before this returns). The caller
+    /// then writes the new MFT record's content with IN_USE=1.
+    ///
+    /// Throws `outOfSpace` if the bitmap has no free user-region bit. If the
+    /// bitmap covers fewer slots than the user wants to allocate, the
+    /// `unsupportedFeature` error nudges the user toward $MFT growth (which
+    /// is a separate future feature; for now, full bitmaps are terminal).
+    public func allocateMFTRecord() async throws -> UInt64 {
+        var bm = try await mftBitmap()
+        // Walk user region (>= 16). Skip already-allocated bits.
+        for n in MFT.firstUserRecord..<bm.clusterCount {
+            if !bm.isAllocated(cluster: n) {
+                // Also check the slot is within $MFT.$DATA's logical size;
+                // bits past that point are "free in the bitmap but the
+                // record doesn't physically exist." Growing $MFT.$DATA is
+                // out of scope for T1.1 — refuse cleanly.
+                if try await !isMFTRecordSlotMaterialized(n) {
+                    throw NTFSError.unsupportedFeature(
+                        description: "MFT slot \(n) is free in $MFT.$BITMAP but past $MFT.$DATA's realSize; growing $MFT to add slots is not yet implemented (try freeing other slots, or use a volume with more pre-allocated $MFT space)"
+                    )
+                }
+                try bm.markAllocated(startLCN: n, count: 1)
+                try await persistMFTBitmap(bm)
+                _mftBitmap = bm
+                // Bump $MFT.$DATA realSize if we just allocated past the
+                // current high-water mark. Without this, verify and other
+                // tools that trust realSize will undercount the in-use MFT
+                // region, treating freshly-allocated slots as non-existent.
+                try await bumpMFTDataRealSizeIfNeeded(toCoverSlot: n)
+                return n
+            }
+        }
+        throw NTFSError.outOfSpace(requestedClusters: 1, freeClusters: 0)
+    }
+
+    /// Ensure $MFT.$DATA's realSize covers at least `(slot+1) * recordSize`.
+    /// Idempotent / cheap when realSize is already large enough. Called from
+    /// allocateMFTRecord whenever a freshly-allocated slot is past the
+    /// previous high-water mark.
+    private func bumpMFTDataRealSizeIfNeeded(toCoverSlot slot: UInt64) async throws {
+        let mft = self.mft()
+        let r0 = try await mft.record(at: 0)
+        let attrs = try r0.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            return
+        }
+        guard case let .nonResident(svcn, lvcn, dro, cu, allocated, realSize, _, extents) = dataAttr.value else {
+            return  // resident $MFT.$DATA only happens on degenerate fixtures
+        }
+        let need = (slot + 1) * UInt64(mftRecordSizeBytes)
+        if realSize >= need { return }
+        // Refuse to bump past allocatedSize (that would require growing the
+        // $DATA runlist — separate feature).
+        guard need <= allocated else {
+            throw NTFSError.unsupportedFeature(
+                description: "bumpMFTDataRealSize: slot \(slot) needs realSize=\(need) but allocatedSize=\(allocated); growing $MFT.$DATA runlist not yet implemented"
+            )
+        }
+        // Re-serialize the $DATA attribute with new realSize + initializedSize.
+        // Use the existing serializeNonResidentDataAttribute helper but feed
+        // the existing extents + the new realSize.
+        let newDataAttr = serializeMFTDataNonResident(
+            attrID: dataAttr.header.attributeID,
+            flags: dataAttr.header.flags,
+            startingVCN: svcn,
+            lastVCN: lvcn,
+            dataRunsOffset: dro,
+            compressionUnit: cu,
+            allocatedSize: allocated,
+            realSize: need,
+            initializedSize: need,
+            extents: extents
+        )
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: r0.bytes,
+            firstAttributeOffset: Int(r0.firstAttributeOffset),
+            usedSize: Int(r0.usedSize),
+            recordSize: Int(r0.allocatedSize),
+            replacingType: AttributeType.data.rawValue,
+            attributeName: "",
+            replacementBytes: newDataAttr
+        )
+        guard let mark = locateEndMarker(in: newRecordBytes, fromOffset: Int(r0.firstAttributeOffset)) else {
+            throw NTFSError.corruptOnDisk(description: "bumpMFTDataRealSize: rewritten $MFT has no end marker")
+        }
+        var updated = newRecordBytes
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
+    }
+
+    /// Build a $DATA non-resident attribute preserving all the existing
+    /// header fields (startingVCN, lastVCN, compressionUnit, runlist) — used
+    /// by bumpMFTDataRealSizeIfNeeded which needs to update realSize while
+    /// keeping everything else identical to the on-disk attribute.
+    private func serializeMFTDataNonResident(
+        attrID: UInt16,
+        flags: UInt16,
+        startingVCN: UInt64,
+        lastVCN: UInt64,
+        dataRunsOffset: UInt16,
+        compressionUnit: UInt8,
+        allocatedSize: UInt64,
+        realSize: UInt64,
+        initializedSize: UInt64,
+        extents: [Extent]
+    ) -> Data {
+        let runlist = encodeRunlist(extents: extents)
+        let bodyLen = 64 + runlist.count
+        let alignedLen = ((bodyLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: AttributeType.data.rawValue)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 1           // non-resident
+        data[data.startIndex + 9] = 0           // nameLength = 0 (unnamed $DATA)
+        MFTRecord.writeU16LE(into: &data, at: 10, value: 0)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: flags)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        MFTRecord.writeU64LE(into: &data, at: 16, value: startingVCN)
+        MFTRecord.writeU64LE(into: &data, at: 24, value: lastVCN)
+        MFTRecord.writeU16LE(into: &data, at: 32, value: 64)   // dataRunsOffset right after non-res ext
+        data[data.startIndex + 34] = compressionUnit
+        // 35-39 reserved zero
+        MFTRecord.writeU64LE(into: &data, at: 40, value: allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: realSize)
+        MFTRecord.writeU64LE(into: &data, at: 56, value: initializedSize)
+        for (i, byte) in runlist.enumerated() {
+            data[data.startIndex + 64 + i] = byte
+        }
+        _ = dataRunsOffset
+        return data
+    }
+
+    /// Mark an MFT record as free in the $BITMAP. Called from deleteFile and
+    /// the rollback path in createFile. Idempotent.
+    public func freeMFTRecord(_ recordNumber: UInt64) async throws {
+        var bm = try await mftBitmap()
+        if recordNumber >= bm.clusterCount { return }
+        if !bm.isAllocated(cluster: recordNumber) { return }
+        try bm.markFree(startLCN: recordNumber, count: 1)
+        try await persistMFTBitmap(bm)
+        _mftBitmap = bm
+    }
+
+    /// Mark a record as allocated in the $BITMAP. Mirror of freeMFTRecord;
+    /// used when promoting an existing record (e.g. a manually-written
+    /// record-by-recnum to the bitmap-tracked state). Idempotent.
+    public func markMFTRecordAllocated(_ recordNumber: UInt64) async throws {
+        var bm = try await mftBitmap()
+        if recordNumber >= bm.clusterCount { return }
+        if bm.isAllocated(cluster: recordNumber) { return }
+        try bm.markAllocated(startLCN: recordNumber, count: 1)
+        try await persistMFTBitmap(bm)
+        _mftBitmap = bm
+    }
+
+    /// Is the MFT slot physically allocated in $MFT.$DATA (i.e., disk space
+    /// for the record exists, not just a free bitmap bit)? Uses
+    /// `allocatedSize` rather than `realSize` because NTFS pre-allocates
+    /// clusters for $MFT in chunks; slots within allocatedSize have backing
+    /// storage even if they're past the high-water mark realSize. Slots past
+    /// allocatedSize require growing $MFT.$DATA itself (a separate feature).
+    private func isMFTRecordSlotMaterialized(_ recordNumber: UInt64) async throws -> Bool {
+        let mft = self.mft()
+        let r0 = try await mft.record(at: 0)
+        let attrs = try r0.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            return false
+        }
+        let allocatedSize: UInt64
+        switch dataAttr.value {
+        case let .resident(b, _): allocatedSize = UInt64(b.count)
+        case let .nonResident(_, _, _, _, a, _, _, _): allocatedSize = a
+        }
+        let logicalRecords = allocatedSize / UInt64(mftRecordSizeBytes)
+        return recordNumber < logicalRecords
+    }
+
+    /// Write the $BITMAP bytes back to whatever storage backs them (resident
+    /// → rewrite the $MFT MFT record; non-resident → write to the extents).
+    private func persistMFTBitmap(_ bm: Bitmap) async throws {
+        let mft = self.mft()
+        let r0 = try await mft.record(at: 0)
+        let attrs = try r0.attributes()
+        guard let bmAttr = attrs.first(where: { $0.rawType == 0xB0 && $0.nameOrEmpty == "" }) else {
+            throw NTFSError.corruptOnDisk(description: "persistMFTBitmap: $MFT lacks $BITMAP")
+        }
+        switch bmAttr.value {
+        case .resident:
+            // Rewrite the $MFT MFT record with the new $BITMAP value.
+            let newAttrBytes = serializeResidentAttribute(
+                type: 0xB0,
+                attrID: bmAttr.header.attributeID,
+                flags: bmAttr.header.flags,
+                attributeName: "",
+                value: bm.bytes
+            )
+            let newRecordBytes = try rewriteEntireAttribute(
+                in: r0.bytes,
+                firstAttributeOffset: Int(r0.firstAttributeOffset),
+                usedSize: Int(r0.usedSize),
+                recordSize: Int(r0.allocatedSize),
+                replacingType: 0xB0,
+                attributeName: "",
+                replacementBytes: newAttrBytes
+            )
+            guard let mark = locateEndMarker(in: newRecordBytes, fromOffset: Int(r0.firstAttributeOffset)) else {
+                throw NTFSError.corruptOnDisk(description: "persistMFTBitmap: rewritten $MFT has no end marker")
+            }
+            var updated = newRecordBytes
+            MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+            try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
+        case let .nonResident(_, _, _, _, _, _, _, extents):
+            let clusterBytes = UInt64(bytesPerCluster)
+            var bytesRemaining = bm.bytes
+            for extent in extents where !bytesRemaining.isEmpty {
+                guard let startLCN = extent.startLCN else { continue }
+                let extentBytes = Int(min(extent.clusterCount * clusterBytes, UInt64(bytesRemaining.count)))
+                let chunk = bytesRemaining.prefix(extentBytes)
+                try await device.write(offset: startLCN * clusterBytes, bytes: Data(chunk))
+                bytesRemaining = bytesRemaining.dropFirst(extentBytes)
+            }
+        }
+    }
+
     /// Snapshot of cluster-allocation statistics. Cheap if `bitmap()` has
     /// already been called; otherwise pays one bitmap read.
     public struct AllocationStats: Sendable, Equatable {
@@ -157,7 +440,16 @@ public actor Volume {
         isDirectory: Bool = false
     ) async throws -> UInt64 {
         let mft = self.mft()
-        let recordNumber = try await mft.findFreeRecordNumber()
+        // T1.1: allocate via $MFT.$BITMAP (authoritative). Fall back to the
+        // linear scan only if no $BITMAP attribute exists (degenerate fixture
+        // — shouldn't happen on real volumes).
+        let recordNumber: UInt64
+        do {
+            recordNumber = try await allocateMFTRecord()
+        } catch NTFSError.corruptOnDisk {
+            // No $BITMAP — degenerate; fall back to the legacy linear scan.
+            recordNumber = try await mft.findFreeRecordNumber()
+        }
 
         // For a slot that's been used before, the existing record's
         // sequenceNumber + 1 should be the new one (NTFS recycles MFT slots
@@ -269,10 +561,18 @@ public actor Volume {
             switch outcome {
             case .inserted:
                 return
-            case let .leafFull(_, _, used, allocated, needed, _):
-                throw NTFSError.unsupportedFeature(
-                    description: "LARGE_INDEX leaf full (used \(used) / allocated \(allocated), needed \(needed)) — leaf split not yet implemented"
+            case let .leafFull(leafVCN, leafByteOffset, _, _, _, merged):
+                // T1.2: split the full leaf, promote the median into $INDEX_ROOT.
+                try await splitLeafAndPromote(
+                    parentRecordNumber: parentRecordNumber,
+                    leafVCN: leafVCN,
+                    leafByteOffset: leafByteOffset,
+                    mergedSortedEntries: merged,
+                    rootBytes: rootBytes,
+                    indexRoot: root,
+                    allocationExtents: allocExtents
                 )
+                return
             }
         }
 
@@ -498,7 +798,7 @@ public actor Volume {
     /// corrupted MFT record. The first split works in isolation but the
     /// second corrupts state in a way that USA fix-up later rejects. Needs
     /// more careful design + testing; see STATUS.md #2.
-    @available(*, deprecated, message: "Leaf split scaffold — disabled pending second-split correctness fix")
+    // T1.2: enabled.
     ///
     /// v1 scope:
     ///  - Only handles single-level trees ($INDEX_ROOT directly points at
@@ -773,6 +1073,56 @@ public actor Volume {
             newBitmapAttrBytes: updatedBitmapAttrBytes
         )
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newRecordBytes)
+        // Self-check: re-read + re-parse + walk attributes. Any malformation
+        // surfaces here with a precise location rather than as a later
+        // mysterious USA-fixup mismatch in the next descent.
+        try await verifyParentRecord(parentRecordNumber, context: "after split of leaf VCN \(splitLeafVCN)")
+    }
+
+    /// Re-read + re-parse an MFT record + walk every attribute. Throws with
+    /// detail if any of: USA fix-up rejects the bytes, the attribute chain is
+    /// malformed, the end marker is missing, or expected attributes (e.g.
+    /// $INDEX_ROOT:$I30 for directories) can't be re-parsed.
+    ///
+    /// Used as a self-check after each complex parent-record rewrite path
+    /// (split, promote). If a future write corrupts the record, we want to
+    /// fail at the corrupt site, not later when something tries to read it.
+    private func verifyParentRecord(_ recordNumber: UInt64, context: String) async throws {
+        let mft = self.mft()
+        let rec: MFTRecord
+        do {
+            rec = try await mft.record(at: recordNumber)
+        } catch {
+            throw NTFSError.corruptOnDisk(
+                description: "verifyParentRecord(\(recordNumber), \(context)): re-read failed: \(error)"
+            )
+        }
+        let attrs: [Attribute]
+        do {
+            attrs = try rec.attributes()
+        } catch {
+            throw NTFSError.corruptOnDisk(
+                description: "verifyParentRecord(\(recordNumber), \(context)): attribute iteration failed: \(error)"
+            )
+        }
+        // For LARGE_INDEX directories we expect $INDEX_ROOT, $INDEX_ALLOCATION, $BITMAP.
+        if rec.isDirectory {
+            guard let irAttr = attrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
+                  case let .resident(rootBytes, _) = irAttr.value else {
+                throw NTFSError.corruptOnDisk(
+                    description: "verifyParentRecord(\(recordNumber), \(context)): missing or non-resident $INDEX_ROOT:$I30"
+                )
+            }
+            do {
+                _ = try IndexRoot.parse(rootBytes)
+            } catch {
+                throw NTFSError.corruptOnDisk(
+                    description: "verifyParentRecord(\(recordNumber), \(context)): $INDEX_ROOT body failed to parse: \(error)"
+                )
+            }
+        }
+        // Each attribute's resident value or non-resident extents already
+        // parsed cleanly by the iterator; if anything was wrong it threw above.
     }
 
     /// Parse $INDEX_ROOT entries including the LAST sentinel (which carries
@@ -2561,6 +2911,10 @@ public actor Volume {
             bytes: record.bytes
         )
         try await mft.writeRecord(at: recordNumber, updated)
+        // Mirror the free state in the $MFT $BITMAP. Best-effort: if no
+        // bitmap exists (degenerate fixture), the linear-scan fallback will
+        // still find the slot via IN_USE=0 on the next allocate.
+        try? await freeMFTRecord(recordNumber)
     }
 
     /// Delete a file. Stage 3b complete: frees non-resident clusters, marks
@@ -2636,6 +2990,8 @@ public actor Volume {
             bytes: record.bytes
         )
         try await mft.writeRecord(at: recordNumber, updated)
+        // Mirror the free state in the $MFT $BITMAP.
+        try? await freeMFTRecord(recordNumber)
     }
 
     /// Allocate a contiguous run of `count` clusters from $Bitmap, persist
