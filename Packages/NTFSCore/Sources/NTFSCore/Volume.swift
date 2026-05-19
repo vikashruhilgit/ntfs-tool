@@ -2926,6 +2926,7 @@ public actor Volume {
             remaining -= taken
         }
         try await persistBitmap(bm)
+        bm.clearDirty()
         _bitmap = bm
         return extents
     }
@@ -3553,6 +3554,7 @@ public actor Volume {
         var bm = try await bitmap()
         let extent = try bm.allocate(count)
         try await persistBitmap(bm)
+        bm.clearDirty()
         _bitmap = bm
         return extent
     }
@@ -3562,6 +3564,7 @@ public actor Volume {
         var bm = try await bitmap()
         try bm.free(extent)
         try await persistBitmap(bm)
+        bm.clearDirty()
         _bitmap = bm
     }
 
@@ -3572,6 +3575,17 @@ public actor Volume {
     /// non-resident), we'd need to rewrite the MFT record — out of scope
     /// for stage 2.
     private func persistBitmap(_ bm: Bitmap) async throws {
+        // v0.4 perf: only write the dirty byte range. On a 4 TB drive
+        // bm.bytes is ~128 MB; rewriting all of it per allocate/free was
+        // the dominant cost in cp -r (~5 sec per file on USB). With
+        // dirty-range tracking from Bitmap, a single contiguous allocate
+        // typically dirties just a few bytes, so we write under a sector
+        // per call. Sector-align the write range so we don't issue
+        // sub-sector writes (some block devices reject them).
+        guard let dirtyRange = bm.dirtyByteRange else {
+            return  // nothing dirty, nothing to write
+        }
+
         let mft = self.mft()
         let bitmapRecord = try await mft.record(at: Self.bitmapRecordNumber)
         let attrs = try bitmapRecord.attributes()
@@ -3587,16 +3601,39 @@ public actor Volume {
         }
 
         let clusterBytes = UInt64(bytesPerCluster)
-        var bytesRemaining = bm.bytes
-        for extent in extents where !bytesRemaining.isEmpty {
+        let sectorBytes = UInt64(boot.bytesPerSector)
+        // Round the dirty range down to a sector boundary at the start
+        // and up to a sector boundary at the end — block writes must be
+        // sector-aligned on raw devices.
+        let alignedStart = Int((UInt64(dirtyRange.lowerBound) / sectorBytes) * sectorBytes)
+        let endByte = UInt64(dirtyRange.upperBound)
+        let alignedEndU64 = ((endByte + sectorBytes - 1) / sectorBytes) * sectorBytes
+        let alignedEnd = Int(min(alignedEndU64, UInt64(bm.bytes.count)))
+        let alignedRange = alignedStart..<alignedEnd
+        guard !alignedRange.isEmpty else { return }
+
+        // Walk the $Bitmap's $DATA extents until we hit the byte range we
+        // need to write, then write the dirty bytes (potentially spanning
+        // multiple extents on a fragmented volume).
+        var byteCursor = 0
+        for extent in extents {
             guard let startLCN = extent.startLCN else { continue }  // sparse
-            let extentBytes = Int(min(extent.clusterCount * clusterBytes, UInt64(bytesRemaining.count)))
-            let chunk = bytesRemaining.prefix(extentBytes)
-            try await device.write(
-                offset: startLCN * clusterBytes,
-                bytes: Data(chunk)
-            )
-            bytesRemaining = bytesRemaining.dropFirst(extentBytes)
+            let extentByteLen = Int(min(extent.clusterCount * clusterBytes, UInt64(bm.bytes.count - byteCursor)))
+            let extentByteEnd = byteCursor + extentByteLen
+            // Compute the intersection of this extent's byte range with
+            // the aligned dirty range.
+            let overlapStart = max(byteCursor, alignedRange.lowerBound)
+            let overlapEnd = min(extentByteEnd, alignedRange.upperBound)
+            if overlapStart < overlapEnd {
+                let inExtentOffset = UInt64(overlapStart - byteCursor)
+                let writeBytes = bm.bytes.subdata(in: bm.bytes.startIndex.advanced(by: overlapStart)..<bm.bytes.startIndex.advanced(by: overlapEnd))
+                try await device.write(
+                    offset: startLCN * clusterBytes + inExtentOffset,
+                    bytes: writeBytes
+                )
+            }
+            byteCursor = extentByteEnd
+            if byteCursor >= alignedRange.upperBound { break }
         }
     }
 

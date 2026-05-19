@@ -102,6 +102,38 @@ final class BitmapTests: XCTestCase {
         XCTAssertEqual(stats.freeBytes, stats.freeClusters * 4096)
     }
 
+    /// v0.4: Bitmap.dirtyByteRange tracks the smallest contiguous range of
+    /// bytes mutated since the last `clearDirty()`. persistBitmap uses this
+    /// to write only that range, turning a ~128 MiB write (the full 4 TB
+    /// drive's $Bitmap) into a few-byte write per allocate/free.
+    func testBitmapDirtyRangeTracksMutations() throws {
+        var bm = Bitmap(bytes: Data(count: 1_000), clusterCount: 8_000)
+        XCTAssertNil(bm.dirtyByteRange, "fresh bitmap should not be dirty")
+
+        // markAllocated on clusters 0-7 hits byte 0 only.
+        try bm.markAllocated(startLCN: 0, count: 8)
+        XCTAssertEqual(bm.dirtyByteRange, 0..<1, "8 clusters from LCN 0 → byte 0 only")
+
+        // markAllocated on clusters 16-31 hits bytes 2-3.
+        try bm.markAllocated(startLCN: 16, count: 16)
+        XCTAssertEqual(bm.dirtyByteRange, 0..<4, "expansion to cover bytes 0..<4")
+
+        // clearDirty resets, subsequent mutations track from scratch.
+        bm.clearDirty()
+        XCTAssertNil(bm.dirtyByteRange)
+        try bm.markAllocated(startLCN: 800, count: 8)
+        XCTAssertEqual(bm.dirtyByteRange, 100..<101, "8 clusters from LCN 800 → byte 100 only")
+
+        // markFree expands the range too.
+        try bm.markFree(startLCN: 0, count: 8)
+        XCTAssertEqual(bm.dirtyByteRange, 0..<101, "free at byte 0 expands the range backward")
+
+        // Zero-count is a no-op (doesn't dirty).
+        bm.clearDirty()
+        try bm.markAllocated(startLCN: 0, count: 0)
+        XCTAssertNil(bm.dirtyByteRange, "zero-count mutation is a no-op")
+    }
+
     func testBitmapCacheReturnsSameInstance() async throws {
         let path = fixturePath("small.img")
         guard FileManager.default.fileExists(atPath: path) else {

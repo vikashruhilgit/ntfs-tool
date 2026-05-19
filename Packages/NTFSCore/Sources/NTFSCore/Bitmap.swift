@@ -17,9 +17,42 @@ public struct Bitmap: Sendable, Equatable {
     /// cluster boundary, so we can't recover it from `bytes.count` alone.
     public let clusterCount: UInt64
 
+    /// v0.4: dirty-range tracking for `persistBitmap`. On a 4 TB drive
+    /// `bytes` is ~128 MB; writing all of it on every allocate/free was
+    /// the dominant cost in cp -r (~5 sec per file on USB). Tracks the
+    /// half-open `[first, last+1)` byte range of any mutation since the
+    /// last `clearDirty()` call. `nil` = clean (nothing to persist).
+    /// Multiple mutations expand the range to cover all of them — this
+    /// can over-write a contiguous span that includes some unchanged
+    /// bytes, but stays under a few hundred KiB in practice for cp -r
+    /// (sequential cluster allocations hit adjacent bytes).
+    public var dirtyByteRange: Range<Int>?
+
     public init(bytes: Data, clusterCount: UInt64) {
         self.bytes = bytes
         self.clusterCount = clusterCount
+        self.dirtyByteRange = nil
+    }
+
+    /// Clear the dirty range after a successful persist. Volume.persistBitmap
+    /// calls this on its in-memory copy after writing.
+    public mutating func clearDirty() {
+        dirtyByteRange = nil
+    }
+
+    /// Internal helper — expand `dirtyByteRange` to cover bytes [start, end).
+    /// Called from mark/markFree on every bit-flip.
+    fileprivate mutating func markDirtyBytes(start: Int, end: Int) {
+        let newStart: Int
+        let newEnd: Int
+        if let current = dirtyByteRange {
+            newStart = Swift.min(current.lowerBound, start)
+            newEnd = Swift.max(current.upperBound, end)
+        } else {
+            newStart = start
+            newEnd = end
+        }
+        dirtyByteRange = newStart..<newEnd
     }
 
     /// Is the given cluster allocated? Returns true for any cluster index >=
@@ -69,33 +102,45 @@ public struct Bitmap: Sendable, Equatable {
     /// `count == 0`. Out-of-range clusters throw `corruptOnDisk` rather
     /// than silently scribbling past the bitmap.
     public mutating func markAllocated(startLCN: UInt64, count: UInt64) throws {
+        guard count > 0 else { return }
+        // Validate range first so we don't mutate on a partial failure.
+        let endLCN = startLCN + count
+        guard endLCN <= clusterCount else {
+            throw NTFSError.corruptOnDisk(
+                description: "markAllocated: cluster \(endLCN - 1) >= clusterCount \(clusterCount)"
+            )
+        }
         for offset in 0..<count {
             let cluster = startLCN + offset
-            guard cluster < clusterCount else {
-                throw NTFSError.corruptOnDisk(
-                    description: "markAllocated: cluster \(cluster) >= clusterCount \(clusterCount)"
-                )
-            }
             let byteIndex = Int(cluster / 8)
             let bitIndex = Int(cluster % 8)
             bytes[bytes.startIndex + byteIndex] |= (1 << bitIndex)
         }
+        // Mark dirty: contiguous byte range covering all flipped bits.
+        let firstByte = Int(startLCN / 8)
+        let lastByte = Int((endLCN - 1) / 8)
+        markDirtyBytes(start: firstByte, end: lastByte + 1)
     }
 
     /// Mark `count` clusters starting at `startLCN` as free. Same out-of-
     /// range behavior as `markAllocated`.
     public mutating func markFree(startLCN: UInt64, count: UInt64) throws {
+        guard count > 0 else { return }
+        let endLCN = startLCN + count
+        guard endLCN <= clusterCount else {
+            throw NTFSError.corruptOnDisk(
+                description: "markFree: cluster \(endLCN - 1) >= clusterCount \(clusterCount)"
+            )
+        }
         for offset in 0..<count {
             let cluster = startLCN + offset
-            guard cluster < clusterCount else {
-                throw NTFSError.corruptOnDisk(
-                    description: "markFree: cluster \(cluster) >= clusterCount \(clusterCount)"
-                )
-            }
             let byteIndex = Int(cluster / 8)
             let bitIndex = Int(cluster % 8)
             bytes[bytes.startIndex + byteIndex] &= ~(UInt8(1) << bitIndex)
         }
+        let firstByte = Int(startLCN / 8)
+        let lastByte = Int((endLCN - 1) / 8)
+        markDirtyBytes(start: firstByte, end: lastByte + 1)
     }
 
     /// Allocate a single contiguous run of `count` clusters. Returns the
