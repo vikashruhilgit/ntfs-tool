@@ -18,6 +18,100 @@ import Foundation
 // All B-tree descent here works directly on raw bytes (not via IndexEntry)
 // because the parsed IndexEntry struct drops the LAST sentinel, and the LAST
 // sentinel's subnode VCN is the rightmost-subtree pointer we need.
+/// v0.4 Phase 2: in-memory leaf cache for bulk-insert mode.
+///
+/// During `cp -r`, dozens of consecutive `insert` calls land in the same
+/// INDX leaf — without caching, each one reads + parses + rewrites the
+/// 4 KiB leaf to disk. The cache holds parsed leaf state across calls;
+/// disk writes are deferred until `flushAll` runs at the end of the
+/// bulk-insert window. ~Nx fewer disk writes per leaf.
+///
+/// Owned by `Volume` actor; reference-typed so it can be passed by value
+/// into the non-isolated `IndexAllocationWriter.insert` static while
+/// preserving in-place mutation semantics. Actor isolation guarantees
+/// single-task access — `@unchecked Sendable` is appropriate because
+/// the cache is only ever touched from within the owning Volume's actor
+/// context (any concurrent bulk insert would violate `beginBulkInsert`'s
+/// nesting guard before ever reaching the cache).
+final class BulkLeafCache: @unchecked Sendable {
+    struct LeafState {
+        /// Non-LAST entries currently in this leaf (in memory, post-merge).
+        var entries: [(fileRef: UInt64, body: Data, sortKey: String)]
+        /// Where the leaf lives on disk.
+        let byteOffset: UInt64
+        /// USA-applied source bytes of the leaf as we first read it.
+        /// `buildLeafIndexBlock` needs this to preserve headers + USA layout.
+        let sourceBlockBytes: Data
+        let blockSize: Int
+        let sectorSize: Int
+        let entriesOffsetWithinHeader: Int
+        let allocatedSizeWithinHeader: Int
+        var dirty: Bool
+    }
+
+    private var leaves: [UInt64: LeafState] = [:]
+
+    /// Number of dirty leaves flushed across `flushAll` calls in this session.
+    /// Diagnostic counter for tests.
+    private(set) var totalDirtyLeavesFlushed: Int = 0
+    /// Number of times a cache lookup served an insert without a disk read.
+    /// Diagnostic counter for tests.
+    private(set) var cacheHits: Int = 0
+
+    func lookup(vcn: UInt64) -> LeafState? {
+        if leaves[vcn] != nil { cacheHits += 1 }
+        return leaves[vcn]
+    }
+
+    func record(vcn: UInt64, state: LeafState) {
+        leaves[vcn] = state
+    }
+
+    /// Write a single leaf to disk and drop it from the cache. Called
+    /// immediately before a split fires so the split path can read the
+    /// up-to-date pre-split state from disk.
+    func flushOne(vcn: UInt64, device: any BlockDevice) async throws {
+        guard let state = leaves.removeValue(forKey: vcn) else { return }
+        if !state.dirty { return }
+        try await writeState(state, device: device)
+        totalDirtyLeavesFlushed += 1
+    }
+
+    /// Write all dirty leaves to disk and clear the cache. Called from
+    /// `Volume.endBulkInsert`.
+    @discardableResult
+    func flushAll(device: any BlockDevice) async throws -> Int {
+        var written = 0
+        for (_, state) in leaves where state.dirty {
+            try await writeState(state, device: device)
+            written += 1
+        }
+        leaves.removeAll(keepingCapacity: false)
+        totalDirtyLeavesFlushed += written
+        return written
+    }
+
+    private func writeState(_ state: LeafState, device: any BlockDevice) async throws {
+        let newBlock = try IndexAllocationWriter.buildLeafIndexBlock(
+            sourceBlockBytes: state.sourceBlockBytes,
+            sortedEntries: state.entries.map { ($0.fileRef, $0.body, $0.sortKey) },
+            blockSize: state.blockSize
+        )
+        let usaOffset = try newBlock.readU16LE(at: 4)
+        let usaCount = try newBlock.readU16LE(at: 6)
+        let onDisk = try UpdateSequenceArray.reverseFixup(
+            recordBytes: newBlock,
+            usaOffset: Int(usaOffset),
+            usaCount: Int(usaCount),
+            blockSize: state.sectorSize
+        )
+        try await device.write(offset: state.byteOffset, bytes: onDisk)
+    }
+
+    /// Test/diagnostic: number of leaves currently cached.
+    var cachedLeafCount: Int { leaves.count }
+}
+
 struct IndexAllocationWriter {
 
     enum InsertOutcome {
@@ -117,7 +211,8 @@ struct IndexAllocationWriter {
         device: any BlockDevice,
         newSortKey: String,
         newEntryFileRef: UInt64,
-        newEntryBody: Data
+        newEntryBody: Data,
+        leafCache: BulkLeafCache? = nil
     ) async throws -> InsertOutcome {
         // Walk $INDEX_ROOT first.
         let rootHeader = try IndexRoot.parse(rootBody)
@@ -194,7 +289,8 @@ struct IndexAllocationWriter {
                 device: device,
                 newSortKey: newSortKey,
                 newEntryFileRef: newEntryFileRef,
-                newEntryBody: newEntryBody
+                newEntryBody: newEntryBody,
+                leafCache: leafCache
             )
         }
     }
@@ -408,16 +504,28 @@ struct IndexAllocationWriter {
         device: any BlockDevice,
         newSortKey: String,
         newEntryFileRef: UInt64,
-        newEntryBody: Data
+        newEntryBody: Data,
+        leafCache: BulkLeafCache?
     ) async throws -> InsertOutcome {
-        let entriesStart = 24 + entriesOffsetWithinHeader
-        let entriesEnd = 24 + usedSizeWithinHeader
-        let leafEntries = try parseEntries(in: fixed, start: entriesStart, limit: entriesEnd)
-
-        // Build the merged list (existing leaf entries + new entry), sorted.
+        // v0.4 Phase 2: when a leaf cache is active, prefer the cached
+        // entry list over re-parsing from disk bytes — prior inserts in
+        // this bulk window have already mutated the in-memory state but
+        // not yet flushed it to disk. The first insert against a leaf
+        // still parses from `fixed` (the disk read that descent just did)
+        // and SEEDS the cache for subsequent inserts.
         var merged: [(UInt64, Data, String)] = []
-        for e in leafEntries where !e.isLast {
-            merged.append((e.fileReference, e.keyBytes, e.keyName ?? ""))
+        let cachedState: BulkLeafCache.LeafState? = leafCache?.lookup(vcn: blockVCN)
+        if let cached = cachedState {
+            for e in cached.entries {
+                merged.append((e.fileRef, e.body, e.sortKey))
+            }
+        } else {
+            let entriesStart = 24 + entriesOffsetWithinHeader
+            let entriesEnd = 24 + usedSizeWithinHeader
+            let leafEntries = try parseEntries(in: fixed, start: entriesStart, limit: entriesEnd)
+            for e in leafEntries where !e.isLast {
+                merged.append((e.fileReference, e.keyBytes, e.keyName ?? ""))
+            }
         }
         merged.append((newEntryFileRef, newEntryBody, newSortKey))
         merged.sort { IndexBuilder.collationFilenameSortsBefore($0.2, $1.2) }
@@ -428,8 +536,15 @@ struct IndexAllocationWriter {
             return acc + ((rawLen + 7) / 8) * 8
         } + 16 // LAST sentinel
         let neededUsedSize = entriesOffsetWithinHeader + entryBytes
+        let byteOffset = try vcnToByteOffset(vcn: blockVCN, extents: allocationExtents, clusterBytes: clusterBytes)
         if neededUsedSize > allocatedSizeWithinHeader {
-            let byteOffset = try vcnToByteOffset(vcn: blockVCN, extents: allocationExtents, clusterBytes: clusterBytes)
+            // Leaf full — caller will split. Flush cached state for this
+            // VCN (if any) so the split path reads up-to-date pre-split
+            // entries from disk. After flush, drop the cache entry — the
+            // split is going to rewrite this leaf to its left-half anyway.
+            if let cache = leafCache, cachedState != nil {
+                try await cache.flushOne(vcn: blockVCN, device: device)
+            }
             return .leafFull(
                 leafVCN: blockVCN,
                 leafByteOffset: byteOffset,
@@ -440,6 +555,28 @@ struct IndexAllocationWriter {
             )
         }
 
+        if let cache = leafCache {
+            // Cache path: update in-memory entries, mark dirty, defer write.
+            // First-touch seeds the cache with `fixed` (the USA-applied source
+            // bytes) so `flushAll` can reproduce headers + USA layout via
+            // buildLeafIndexBlock. Subsequent updates keep the same
+            // sourceBlockBytes since headers don't change on simple inserts.
+            let sourceBytes = cachedState?.sourceBlockBytes ?? fixed
+            let newState = BulkLeafCache.LeafState(
+                entries: merged.map { (fileRef: $0.0, body: $0.1, sortKey: $0.2) },
+                byteOffset: byteOffset,
+                sourceBlockBytes: sourceBytes,
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                entriesOffsetWithinHeader: entriesOffsetWithinHeader,
+                allocatedSizeWithinHeader: allocatedSizeWithinHeader,
+                dirty: true
+            )
+            cache.record(vcn: blockVCN, state: newState)
+            return .inserted
+        }
+
+        // No cache — original path: build and write to disk immediately.
         let newBlock = try buildLeafIndexBlock(
             sourceBlockBytes: fixed,
             sortedEntries: merged,
@@ -453,7 +590,6 @@ struct IndexAllocationWriter {
             usaCount: Int(outUsaCount),
             blockSize: sectorSize
         )
-        let byteOffset = try vcnToByteOffset(vcn: blockVCN, extents: allocationExtents, clusterBytes: clusterBytes)
         try await device.write(offset: byteOffset, bytes: onDisk)
         return .inserted
     }

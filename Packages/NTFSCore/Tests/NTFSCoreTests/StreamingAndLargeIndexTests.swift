@@ -372,6 +372,77 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         }
     }
 
+    /// v0.4 Phase 2: INDX-leaf coalescing during bulk insert. When N
+    /// consecutive inserts land in the same LARGE_INDEX leaf, the per-file
+    /// 4 KiB INDX-block rewrite should collapse into one final flush at
+    /// endBulkInsert. Asserts via cache-hit counter + dirty-leaves-flushed
+    /// counter that the cache actually did work — not just shipped no-ops.
+    func testBulkInsertCoalescesLeafWrites() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(8)
+
+        // Prime root to LARGE_INDEX shape: insert just enough files (outside
+        // bulk mode) to force SMALL→LARGE promotion + populate the first
+        // leaf. After this the dir is LARGE_INDEX with one leaf and plenty
+        // of slack, so the subsequent bulk-insert burst exercises the cache
+        // path cleanly without tripping into a leaf-split.
+        for i in 0..<8 {
+            let n = String(format: "prime-%04d.txt", i)
+            _ = try await volume.createFile(named: n, inDirectory: 5)
+        }
+
+        // Open a bulk-insert window. Pick a count low enough that no split
+        // fires (~15 entries comfortably fit in one fresh-promoted leaf
+        // alongside the 8 prime entries + baseline fixture entries).
+        try await volume.beginBulkInsert(into: 5)
+        let nInserts = 15
+        let payload = Data("phase2 coalescing\n".utf8)
+        for i in 0..<nInserts {
+            let n = String(format: "coalesce-%04d.txt", i)
+            let rn = try await volume.createFile(named: n, inDirectory: 5)
+            try await volume.write(at: rn, offset: 0, bytes: payload)
+        }
+        _ = try await volume.endBulkInsert()
+        let hits = await volume.bulkInsertLeafCacheHits()
+        let dirtyFlushed = await volume.bulkInsertDirtyLeavesFlushed()
+
+        FileHandle.standardError.write(Data(
+            "[phase2] inserts=\(nInserts) cache_hits=\(hits) dirty_leaves_flushed=\(dirtyFlushed)\n".utf8
+        ))
+
+        // Expected: nInserts inserts. First lookup is a cache MISS (seeds
+        // the cache). Subsequent inserts are cache HITS. So hits should be
+        // at least (nInserts - 1). If a split fires unexpectedly each
+        // split costs one extra miss; tolerate up to 2 splits worth of
+        // extra misses for fixture variance.
+        XCTAssertGreaterThanOrEqual(
+            hits, nInserts - 3,
+            "Expected ≥\(nInserts - 3) cache hits across \(nInserts) same-leaf inserts; got \(hits). Cache is not being consulted on subsequent inserts."
+        )
+        // One dirty leaf must flush at endBulkInsert (assuming no split,
+        // which would flush mid-stream and reset). Tolerate up to 3 for
+        // variance with splits.
+        XCTAssertGreaterThanOrEqual(
+            dirtyFlushed, 1,
+            "Expected ≥1 dirty leaf flushed at endBulkInsert; got \(dirtyFlushed). Cache may not be marking writes dirty."
+        )
+
+        // Correctness backstop: every inserted entry must be reachable
+        // after a fresh reopen — no orphans, no stale on-disk state.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let names = Set(try await reopen.enumerate(directory: 5).map { $0.name })
+        for i in 0..<nInserts {
+            let n = String(format: "coalesce-%04d.txt", i)
+            XCTAssertTrue(
+                names.contains(n),
+                "Phase 2 coalesced insert lost entry '\(n)' — cache didn't flush correctly"
+            )
+        }
+    }
+
     /// v0.3 hardware-shape repro: mimic `cp -r` of a deeply-nested source
     /// tree (a parent dir + many child files all under it, plus a sibling
     /// dir + a deeper subdir). The user's 22,419-file phone backup workload

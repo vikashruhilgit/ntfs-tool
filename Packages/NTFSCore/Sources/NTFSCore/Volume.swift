@@ -27,6 +27,16 @@ public actor Volume {
     // correct without them. Run `ntfsctl refresh-sizes` later if you care.
     private var _bulkInsertParentRN: UInt64?
     private var _bulkInsertSkippedRefreshCount: Int = 0
+    // v0.4 Phase 2: INDX-leaf coalescing. While in bulk-insert mode, leaf
+    // modifications are held in memory and flushed to disk in a single
+    // pass at `endBulkInsert`. For cp -r, where 50+ consecutive files
+    // land in the same leaf, this collapses 50 leaf-rewrites (~4 KiB
+    // each) into one final write.
+    private var _bulkInsertLeafCache: BulkLeafCache?
+    // Counters snapshotted into the actor at `endBulkInsert` so tests
+    // can read them after the cache reference has been cleared.
+    private var _bulkInsertLastCacheHits: Int = 0
+    private var _bulkInsertLastDirtyLeavesFlushed: Int = 0
 
     public init(device: any BlockDevice) async throws {
         self.device = device
@@ -813,7 +823,8 @@ public actor Volume {
                 device: device,
                 newSortKey: childFileName,
                 newEntryFileRef: childRef,
-                newEntryBody: childBody
+                newEntryBody: childBody,
+                leafCache: _bulkInsertLeafCache
             )
             switch outcome {
             case .inserted:
@@ -2270,15 +2281,26 @@ public actor Volume {
         }
         _bulkInsertParentRN = parentRN
         _bulkInsertSkippedRefreshCount = 0
+        _bulkInsertLeafCache = BulkLeafCache()
+        _bulkInsertLastCacheHits = 0
+        _bulkInsertLastDirtyLeavesFlushed = 0
     }
 
-    /// v0.4 Phase 1: leave bulk-insert mode. Returns the number of size-hint
-    /// refreshes that were skipped during the session (for diagnostics +
-    /// tests). Idempotent — calling outside bulk-insert mode is a no-op
-    /// returning 0.
+    /// v0.4 Phase 1+2: leave bulk-insert mode. Flushes any cached leaf
+    /// writes to disk, returns the number of size-hint refreshes that
+    /// were skipped during the session (for diagnostics + tests).
+    /// Idempotent — calling outside bulk-insert mode is a no-op returning 0.
     @discardableResult
     public func endBulkInsert() async throws -> Int {
         let n = _bulkInsertSkippedRefreshCount
+        if let cache = _bulkInsertLeafCache {
+            _ = try await cache.flushAll(device: device)
+            // Snapshot counters before dropping the cache reference so
+            // post-end introspection hooks have something to read.
+            _bulkInsertLastCacheHits = cache.cacheHits
+            _bulkInsertLastDirtyLeavesFlushed = cache.totalDirtyLeavesFlushed
+        }
+        _bulkInsertLeafCache = nil
         _bulkInsertParentRN = nil
         _bulkInsertSkippedRefreshCount = 0
         return n
@@ -2289,6 +2311,28 @@ public actor Volume {
     /// insert session, or 0 if not in one.
     public func bulkInsertSkippedRefreshCount() async -> Int {
         _bulkInsertSkippedRefreshCount
+    }
+
+    /// v0.4 Phase 2: introspection hook for tests. Returns the count of
+    /// leaf-cache hits during the most recent bulk-insert session.
+    /// Reads from a snapshot captured at `endBulkInsert`, so it's valid
+    /// AFTER the session ends.
+    public func bulkInsertLeafCacheHits() async -> Int {
+        if let cache = _bulkInsertLeafCache {
+            return cache.cacheHits
+        }
+        return _bulkInsertLastCacheHits
+    }
+
+    /// v0.4 Phase 2: introspection hook for tests. Returns the number of
+    /// dirty leaves flushed during the most recent bulk-insert session
+    /// (cumulative across both flushOne calls and the final flushAll).
+    /// Reads from a snapshot captured at `endBulkInsert`.
+    public func bulkInsertDirtyLeavesFlushed() async -> Int {
+        if let cache = _bulkInsertLeafCache {
+            return cache.totalDirtyLeavesFlushed
+        }
+        return _bulkInsertLastDirtyLeavesFlushed
     }
 
     /// Set or clear the $VOLUME_INFORMATION dirty bit. After every batch of
