@@ -372,6 +372,76 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         }
     }
 
+    /// v0.4 Phase 3(A): $INDEX_ROOT height-grow lifts the ~60-file/dir cap.
+    /// When the parent record can't fit another interior entry on a leaf
+    /// split's median promotion, `splitLeafAndPromote` allocates 2 new
+    /// intermediate INDX blocks, bisects $INDEX_ROOT's interior entries
+    /// into them, and replaces $INDEX_ROOT with a tiny new root. Asserts
+    /// inserts continue successfully past where v0.3 would have aborted
+    /// (~60 files/dir on this fixture).
+    func testHeightGrowIndexRootLiftsLeafSplitCap() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(8)
+        try await volume.growMFTDataByClusters(8)
+
+        // Insert until we hit the Phase 3(B) (intermediate-block split)
+        // limit. v0.3 capped at ~60; v0.4 Phase 3(A) should reach >75.
+        var inserted = 0
+        for i in 0..<300 {
+            let name = String(format: "heightgrow-%04d.txt", i)
+            do {
+                _ = try await volume.createFile(named: name, inDirectory: 5)
+                inserted += 1
+            } catch NTFSError.unsupportedFeature {
+                // Hit the Phase 3(B) limit (intermediate-block split needed
+                // but not yet implemented). Clean abort.
+                break
+            }
+        }
+
+        FileHandle.standardError.write(Data("[heightgrow] inserted=\(inserted)\n".utf8))
+        XCTAssertGreaterThan(
+            inserted, 75,
+            "v0.4 Phase 3(A) height-grow should lift the leaf-split cap past v0.3's ~75 ceiling. Got \(inserted)."
+        )
+
+        // Correctness backstop: every inserted name must be reachable +
+        // no orphans after reopen.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let names = Set(try await reopen.enumerate(directory: 5).map { $0.name })
+        for i in 0..<inserted {
+            let n = String(format: "heightgrow-%04d.txt", i)
+            XCTAssertTrue(names.contains(n), "lost entry '\(n)' after height-grow + reopen")
+        }
+
+        // Walk reachability vs IN_USE: zero orphans even with the deeper tree.
+        let mft = await reopen.mft()
+        var inUseUser: Set<UInt64> = []
+        for rn: UInt64 in 0..<256 {
+            guard let rec = try? await mft.record(at: rn) else { continue }
+            if rec.isInUse, rn >= 16 { inUseUser.insert(rn) }
+        }
+        var reachable: Set<UInt64> = [5]
+        var queue: [UInt64] = [5]
+        while let dir = queue.popLast() {
+            guard let entries = try? await reopen.enumerate(directory: dir) else { continue }
+            for e in entries where e.fileName.namespace != .dos {
+                if !reachable.contains(e.recordNumber) {
+                    reachable.insert(e.recordNumber)
+                    if e.isDirectory { queue.append(e.recordNumber) }
+                }
+            }
+        }
+        let orphans = inUseUser.subtracting(reachable.filter { $0 >= 16 })
+        XCTAssertTrue(
+            orphans.isEmpty,
+            "Phase 3(A) orphan check: \(orphans.count) MFT slots IN_USE=1 but unreachable. Recnums: \(orphans.sorted().prefix(10))"
+        )
+    }
+
     /// v0.4 Phase 2: INDX-leaf coalescing during bulk insert. When N
     /// consecutive inserts land in the same LARGE_INDEX leaf, the per-file
     /// 4 KiB INDX-block rewrite should collapse into one final flush at

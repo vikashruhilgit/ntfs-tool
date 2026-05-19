@@ -1157,9 +1157,9 @@ public actor Volume {
         //    in-memory build (and its overflow check) ahead of the leaf
         //    writes, an overflow now aborts cleanly: only the freshly
         //    allocated cluster has been touched, and we free it below.
-        let newParentRecordBytes: Data
+        let computed: ComputedSplit
         do {
-            newParentRecordBytes = try await computeParentRecordBytesForSplit(
+            computed = try await computeParentRecordBytesForSplit(
                 parentRecordNumber: parentRecordNumber,
                 indexRoot: indexRoot,
                 rootBytes: rootBytes,
@@ -1170,12 +1170,15 @@ public actor Volume {
                 newExtent: newExtent
             )
         } catch {
-            // Compute step failed (typically parent-record overflow).
-            // Release the cluster we provisionally allocated so it doesn't
-            // leak — disk is otherwise pristine, no orphans.
+            // Compute step failed (out-of-space allocating intermediates,
+            // or some other unrecoverable error). Release the leaf cluster
+            // we provisionally allocated — disk is otherwise pristine.
+            // height-grow path's intermediate allocations are freed inside
+            // computeParentRecordBytesForSplit on its own throw.
             try? await freeClusters(newExtent)
             throw error
         }
+        let newParentRecordBytes = computed.parentRecordBytes
 
         // 4. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
         let blockSize = Int(indexRecordSizeBytes)
@@ -1215,9 +1218,22 @@ public actor Volume {
         )
         try await device.write(offset: newLCN * clusterBytes, bytes: rightOnDisk)
 
-        // 6. Commit the precomputed parent MFT record (overflow already
-        //    ruled out in step 3). This finalizes the split atomically
-        //    from the tree-shape perspective.
+        // 6. (v0.4 Phase 3(A)) If height-grow fired, write the new
+        //    intermediate INDX blocks BEFORE committing the parent record.
+        //    Order matters: the parent record's new $INDEX_ROOT will point
+        //    at these intermediates, so they must exist on disk first or a
+        //    crash between writes would orphan dependent references.
+        for intermediate in computed.intermediates {
+            try await device.write(
+                offset: intermediate.byteOffset,
+                bytes: intermediate.postFixupBytes
+            )
+        }
+
+        // 7. Commit the precomputed parent MFT record (overflow already
+        //    ruled out in step 3, possibly after a height-grow). This
+        //    finalizes the split atomically from the tree-shape
+        //    perspective.
         let mft = self.mft()
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParentRecordBytes)
         // Self-check: re-read + re-parse + walk attributes. Any malformation
@@ -1243,16 +1259,34 @@ public actor Volume {
         }
     }
 
+    /// v0.4 Phase 3(A): result of `computeParentRecordBytesForSplit`. The
+    /// common case has `intermediates` empty + `extraClustersAllocated`
+    /// empty. The height-grow case has 2 intermediate INDX blocks the
+    /// caller must write to disk BEFORE the parent record write, plus
+    /// the 2 extra cluster extents (caller frees these on failure).
+    private struct ComputedSplit {
+        let parentRecordBytes: Data
+        /// Each entry: (byteOffset on disk, post-USA-fixup bytes to write).
+        /// Empty when no height-grow occurred.
+        let intermediates: [(byteOffset: UInt64, postFixupBytes: Data)]
+        /// Extra cluster extents allocated DURING this compute (beyond the
+        /// caller's primary leaf cluster). Caller must free on any
+        /// failure between compute and parent-record commit.
+        let extraClustersAllocated: [Extent]
+    }
+
     /// Build the new MFT record bytes that would result from updating the
     /// parent's $INDEX_ROOT after a leaf split, AND its $INDEX_ALLOCATION
     /// runlist + $BITMAP to cover the new leaf block.
     ///
-    /// **Pure compute — never mutates disk.** Throws if the new $INDEX_ROOT
-    /// body would overflow the parent MFT record (the v0.3 silent-orphan
-    /// trigger: previously this check fired AFTER the leaf disk writes,
-    /// leaving the new right-leaf cluster unreachable and the original leaf
-    /// rewritten to its left half). `splitLeafAndPromote` calls this BEFORE
-    /// any disk mutation so overflow aborts cleanly with no data loss.
+    /// **Pure compute — never mutates disk EXCEPT for allocating clusters
+    /// (which mutate the volume `$Bitmap`). Allocations are returned in
+    /// `extraClustersAllocated` so callers can roll them back on failure.**
+    ///
+    /// Throws only on unrecoverable error (corrupted on-disk shape, out of
+    /// space). The v0.3 silent-orphan trigger ($INDEX_ROOT overflow on
+    /// median promotion) is handled internally by height-growing the tree
+    /// into 2 intermediate INDX blocks — caller doesn't see the throw.
     private func computeParentRecordBytesForSplit(
         parentRecordNumber: UInt64,
         indexRoot: IndexRoot,
@@ -1262,7 +1296,7 @@ public actor Volume {
         medianEntry: (fileRef: UInt64, body: Data, sortKey: String),
         allocationExtents: [Extent],
         newExtent: Extent
-    ) async throws -> Data {
+    ) async throws -> ComputedSplit {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
         let attrs = try parent.attributes()
@@ -1351,8 +1385,18 @@ public actor Volume {
             }
         }
         guard spliced else {
-            throw NTFSError.corruptOnDisk(
-                description: "splitLeaf: split leaf VCN \(splitLeafVCN) not found among parent's subnode pointers"
+            // v0.4 Phase 3(A) limit: splitLeafVCN is not a direct child of
+            // $INDEX_ROOT — it lives under an intermediate INDX block (the
+            // tree has more than 2 levels after a prior height-grow). The
+            // split should promote its median into the LEAF'S DIRECT
+            // PARENT (an intermediate), not into $INDEX_ROOT. That's the
+            // recursive split-promote path (Phase 3(B)) which isn't
+            // implemented yet. Clean abort — no data loss; the rollback
+            // chain (splitLeafAndPromote → insertIntoParentI30 →
+            // createFile catch → reclaimOrphanedMFTRecord) keeps the
+            // disk consistent.
+            throw NTFSError.unsupportedFeature(
+                description: "splitLeaf: split leaf VCN \(splitLeafVCN) lives under an intermediate INDX block (deeper than 2-level tree); recursive interior-block split not yet implemented (v0.4 Phase 3(B))"
             )
         }
 
@@ -1400,17 +1444,200 @@ public actor Volume {
         )
 
         // 5e) Rebuild the parent MFT record with all three updates.
-        //     This throws "would overflow parent record" if the new
-        //     $INDEX_ROOT body (with the promoted median interior entry)
-        //     no longer fits. Critical to do this BEFORE leaf disk writes
-        //     so the failure mode is a clean abort, not silent orphaning.
-        let newRecordBytes = try rewriteParentForLeafSplit(
-            parent: parent,
-            newRootBody: newRootBody,
-            newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
-            newBitmapAttrBytes: updatedBitmapAttrBytes
-        )
-        return newRecordBytes
+        //     If the new $INDEX_ROOT body (with the just-promoted median
+        //     interior entry) no longer fits in the parent record's slack,
+        //     `rewriteParentForLeafSplit` throws "would overflow parent
+        //     record". In v0.3 this aborted the operation cleanly; in
+        //     v0.4 Phase 3(A) we recover via $INDEX_ROOT height-grow.
+        do {
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newRootBody,
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: [],
+                extraClustersAllocated: []
+            )
+        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+            // v0.4 Phase 3(A): height-grow $INDEX_ROOT.
+            //
+            // Bisect newInterior into two halves around a new median; move
+            // each half into a fresh interior INDX block; replace $INDEX_ROOT
+            // with a tiny new root containing just (newMedian → leftInter)
+            // + LAST → rightInter. New cap: ~3-6k files/dir, up from ~60.
+            return try await heightGrowIndexRoot(
+                parent: parent,
+                attrs: attrs,
+                indexRoot: indexRoot,
+                newInterior: newInterior,
+                newLastVCN: newLastVCN,
+                allocationExtents: allocationExtents,
+                primaryNewExtent: newExtent,
+                newLeafVCN: newLeafVCN
+            )
+        }
+    }
+
+    /// v0.4 Phase 3(A): height-grow $INDEX_ROOT into a 2-level interior tree.
+    ///
+    /// Allocates 2 new clusters for left/right intermediate interior INDX
+    /// blocks, bisects `newInterior` around its midpoint, and replaces the
+    /// parent's $INDEX_ROOT with a tiny new root: 1 interior entry pointing
+    /// at the left intermediate + LAST sentinel pointing at the right.
+    ///
+    /// Returns a `ComputedSplit` carrying:
+    /// - new parent record bytes (much smaller $INDEX_ROOT now fits cleanly)
+    /// - the 2 intermediate blocks (caller writes BEFORE the parent record)
+    /// - the 2 extra cluster extents (caller frees on commit failure)
+    ///
+    /// Cluster allocations happen here; on any thrown error the caller's
+    /// outer rollback frees them along with the primary leaf extent.
+    private func heightGrowIndexRoot(
+        parent: MFTRecord,
+        attrs: [Attribute],
+        indexRoot: IndexRoot,
+        newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        newLastVCN: UInt64,
+        allocationExtents: [Extent],
+        primaryNewExtent: Extent,
+        newLeafVCN: UInt64
+    ) async throws -> ComputedSplit {
+        guard newInterior.count >= 2 else {
+            // Height-grow can't help — $INDEX_ROOT has only 0 or 1 interior
+            // entries. The overflow must be a different cause (e.g., other
+            // attributes consuming the record). Re-throw the original error.
+            throw NTFSError.unsupportedFeature(
+                description: "heightGrowIndexRoot: too few interior entries (\(newInterior.count)) to bisect — parent record overflow is not caused by $INDEX_ROOT growth"
+            )
+        }
+
+        let medianIdx = newInterior.count / 2
+        let medianEntry = newInterior[medianIdx]
+        let leftEntries = Array(newInterior[0..<medianIdx])
+        let rightEntries = Array(newInterior[(medianIdx + 1)..<newInterior.count])
+        // The left intermediate's LAST sentinel points at where the median's
+        // subnode used to live (subtree to the LEFT of the median key).
+        let leftIntermediateLastVCN = medianEntry.subnodeVCN
+        // The right intermediate's LAST sentinel inherits the original
+        // $INDEX_ROOT's LAST → newLastVCN target.
+        let rightIntermediateLastVCN = newLastVCN
+
+        // Allocate 2 new clusters. The primary leaf extent is independent;
+        // it's already in `primaryNewExtent`. Track our extra allocations
+        // so the caller can free them on commit failure.
+        let leftInterExtent = try await allocateClusters(1)
+        let rightInterExtent: Extent
+        do {
+            rightInterExtent = try await allocateClusters(1)
+        } catch {
+            try? await freeClusters(leftInterExtent)
+            throw error
+        }
+        var extraClusters = [leftInterExtent, rightInterExtent]
+
+        guard let leftInterLCN = leftInterExtent.startLCN,
+              let rightInterLCN = rightInterExtent.startLCN else {
+            for ext in extraClusters { try? await freeClusters(ext) }
+            throw NTFSError.corruptOnDisk(description: "heightGrowIndexRoot: allocator returned sparse extent")
+        }
+
+        let clusterBytes = UInt64(bytesPerCluster)
+        // The new VCNs for the intermediates: they extend the existing
+        // $INDEX_ALLOCATION runlist. The primary leaf already took the
+        // first new VCN; the intermediates take the next two.
+        let existingVCNCount = allocationExtents.reduce(0) { $0 + $1.clusterCount }
+        let leftInterVCN = existingVCNCount + primaryNewExtent.clusterCount
+        let rightInterVCN = leftInterVCN + 1
+
+        // Build the two intermediate interior INDX blocks (in memory).
+        let blockSize = Int(indexRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        do {
+            let leftBlock = try buildInteriorIndxBlock(
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                vcn: leftInterVCN,
+                interior: leftEntries,
+                lastSubnodeVCN: leftIntermediateLastVCN
+            )
+            let leftOnDisk = try UpdateSequenceArray.reverseFixup(
+                recordBytes: leftBlock,
+                usaOffset: Int(try leftBlock.readU16LE(at: 4)),
+                usaCount: Int(try leftBlock.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+            let rightBlock = try buildInteriorIndxBlock(
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                vcn: rightInterVCN,
+                interior: rightEntries,
+                lastSubnodeVCN: rightIntermediateLastVCN
+            )
+            let rightOnDisk = try UpdateSequenceArray.reverseFixup(
+                recordBytes: rightBlock,
+                usaOffset: Int(try rightBlock.readU16LE(at: 4)),
+                usaCount: Int(try rightBlock.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+
+            // Build the NEW tiny $INDEX_ROOT body: 1 interior entry +
+            // LAST sentinel.
+            let newRootInterior = [(
+                key: medianEntry.key,
+                body: medianEntry.body,
+                fileRef: medianEntry.fileRef,
+                subnodeVCN: leftInterVCN
+            )]
+            let newTinyRootBody = serializeLargeIndexRoot(
+                indexAllocationBlockSize: indexRoot.indexAllocationBlockSize,
+                clustersPerIndexBlock: indexRoot.clustersPerIndexBlock,
+                interior: newRootInterior,
+                lastSubnodeVCN: rightInterVCN
+            )
+
+            // Updated $INDEX_ALLOCATION runlist: existing + primary leaf
+            // extent + left/right intermediate extents.
+            let updatedExtents = mergeAdjacentExtents(
+                allocationExtents + [primaryNewExtent, leftInterExtent, rightInterExtent]
+            )
+            let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
+            let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
+                attrID: try findIndexAllocationAttributeID(attrs: attrs),
+                extents: updatedExtents,
+                totalBytes: totalIndexAllocClusters * clusterBytes
+            )
+
+            // Updated $BITMAP: set bits for primary leaf, left inter, right inter.
+            let updatedBitmapAttrBytes = try updateBitmapAttribute(
+                attrs: attrs,
+                blockIndices: [newLeafVCN, leftInterVCN, rightInterVCN]
+            )
+
+            // Build the parent record bytes — should now fit (tiny root).
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newTinyRootBody,
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: [
+                    (byteOffset: leftInterLCN * clusterBytes, postFixupBytes: leftOnDisk),
+                    (byteOffset: rightInterLCN * clusterBytes, postFixupBytes: rightOnDisk)
+                ],
+                extraClustersAllocated: extraClusters
+            )
+        } catch {
+            // Any build/serialize failure → free both intermediates + rethrow.
+            for ext in extraClusters { try? await freeClusters(ext) }
+            extraClusters.removeAll()
+            throw error
+        }
     }
 
     /// Walk the entire LARGE_INDEX tree of `parentRecordNumber` and return
@@ -1680,6 +1907,13 @@ public actor Volume {
     /// Update the $BITMAP:$I30 attribute by setting the bit at `blockIndex`.
     /// Returns the serialized replacement attribute bytes.
     private func updateBitmapAttribute(attrs: [Attribute], blockIndex: UInt64) throws -> Data {
+        try updateBitmapAttribute(attrs: attrs, blockIndices: [blockIndex])
+    }
+
+    /// v0.4 Phase 3(A): set multiple bits in $BITMAP:$I30 in one rebuild.
+    /// Used by `heightGrowIndexRoot` where 3 new blocks (the primary new
+    /// leaf + 2 intermediates) need their bits set together.
+    private func updateBitmapAttribute(attrs: [Attribute], blockIndices: [UInt64]) throws -> Data {
         guard let attr = attrs.first(where: {
             $0.rawType == 0xB0 && $0.nameOrEmpty == "$I30"
         }) else {
@@ -1689,14 +1923,16 @@ public actor Volume {
             throw NTFSError.unsupportedFeature(description: "updateBitmap: $BITMAP:$I30 must be resident (non-resident bitmaps not yet supported)")
         }
         var updated = bytes
-        let byteIdx = Int(blockIndex / 8)
-        let bitIdx = Int(blockIndex % 8)
-        guard byteIdx < updated.count else {
-            throw NTFSError.unsupportedFeature(
-                description: "updateBitmap: block index \(blockIndex) exceeds bitmap capacity \(updated.count * 8); growing $BITMAP not yet supported"
-            )
+        for blockIndex in blockIndices {
+            let byteIdx = Int(blockIndex / 8)
+            let bitIdx = Int(blockIndex % 8)
+            guard byteIdx < updated.count else {
+                throw NTFSError.unsupportedFeature(
+                    description: "updateBitmap: block index \(blockIndex) exceeds bitmap capacity \(updated.count * 8); growing $BITMAP not yet supported"
+                )
+            }
+            updated[updated.startIndex + byteIdx] |= (UInt8(1) << bitIdx)
         }
-        updated[updated.startIndex + byteIdx] |= (UInt8(1) << bitIdx)
         return buildNamedResidentAttribute(
             type: 0xB0,
             attrID: attr.header.attributeID,
@@ -1787,6 +2023,83 @@ public actor Volume {
         MFTRecord.writeU16LE(into: &body, at: 46, value: 0)              // reserved
         MFTRecord.writeU64LE(into: &body, at: 48, value: firstSubnodeVCN)
         return body
+    }
+
+    /// v0.4 Phase 3(A): Build an INTERIOR INDX block (pre-USA) with the
+    /// given (key + subnode VCN) entries + LAST sentinel pointing at
+    /// `lastSubnodeVCN`. Used by the $INDEX_ROOT height-grow path when
+    /// the parent MFT record can't fit another interior entry — we move
+    /// existing interior entries from $INDEX_ROOT into intermediate INDX
+    /// blocks (one per half of the bisection), allocated in
+    /// $INDEX_ALLOCATION.
+    ///
+    /// Interior entry layout: header(16) + keyBytes + 8-byte alignment +
+    /// 8-byte subnode VCN. The HAS_SUBNODE flag (0x01) is set on every
+    /// non-LAST entry; the LAST sentinel has flags = LAST|HAS_SUBNODE
+    /// (0x03) with no key + 8-byte subnode VCN.
+    private func buildInteriorIndxBlock(
+        blockSize: Int,
+        sectorSize: Int,
+        vcn: UInt64,
+        interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        lastSubnodeVCN: UInt64
+    ) throws -> Data {
+        var block = Data(count: blockSize)
+        let fixupCount = blockSize / sectorSize
+        let usaCount = UInt16(1 + fixupCount)
+        let usaOffset: UInt16 = 40
+        MFTRecord.writeU32LE(into: &block, at: 0,  value: IndexAllocationBlock.magicINDX)
+        MFTRecord.writeU16LE(into: &block, at: 4,  value: usaOffset)
+        MFTRecord.writeU16LE(into: &block, at: 6,  value: usaCount)
+        MFTRecord.writeU64LE(into: &block, at: 8,  value: 0)              // LSN
+        MFTRecord.writeU64LE(into: &block, at: 16, value: vcn)
+        MFTRecord.writeU16LE(into: &block, at: Int(usaOffset), value: 1)
+
+        let usaBytes = Int(usaCount) * 2
+        let entriesStart = ((40 + usaBytes + 7) / 8) * 8
+        let entriesOffsetWithinHeader = entriesStart - 24
+
+        // Serialize interior entries + LAST sentinel (each with HAS_SUBNODE).
+        var entryBytes = Data()
+        for e in interior {
+            let rawLen = 16 + e.body.count
+            let aligned = ((rawLen + 7) / 8) * 8
+            let totalLen = aligned + 8  // 8-byte subnode VCN at end
+            var entry = Data(count: totalLen)
+            MFTRecord.writeU64LE(into: &entry, at: 0, value: e.fileRef)
+            MFTRecord.writeU16LE(into: &entry, at: 8, value: UInt16(totalLen))
+            MFTRecord.writeU16LE(into: &entry, at: 10, value: UInt16(e.body.count))
+            MFTRecord.writeU16LE(into: &entry, at: 12, value: 0x01)  // HAS_SUBNODE
+            MFTRecord.writeU16LE(into: &entry, at: 14, value: 0)
+            for (i, byte) in e.body.enumerated() {
+                entry[entry.startIndex + 16 + i] = byte
+            }
+            MFTRecord.writeU64LE(into: &entry, at: totalLen - 8, value: e.subnodeVCN)
+            entryBytes.append(entry)
+        }
+        // LAST sentinel with HAS_SUBNODE.
+        var lastSentinel = Data(count: 24)
+        MFTRecord.writeU64LE(into: &lastSentinel, at: 0, value: 0)
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 8, value: 24)
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 10, value: 0)
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 12, value: 0x03)  // LAST | HAS_SUBNODE
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 14, value: 0)
+        MFTRecord.writeU64LE(into: &lastSentinel, at: 16, value: lastSubnodeVCN)
+        entryBytes.append(lastSentinel)
+
+        guard entriesStart + entryBytes.count <= blockSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "buildInteriorIndxBlock: \(interior.count) interior entries (\(entryBytes.count) bytes) overflow block (start \(entriesStart), block \(blockSize)) — interior INDX block can hold ~40-60 entries depending on key length"
+            )
+        }
+        for (i, byte) in entryBytes.enumerated() {
+            block[block.startIndex + entriesStart + i] = byte
+        }
+        MFTRecord.writeU32LE(into: &block, at: 24, value: UInt32(entriesOffsetWithinHeader))
+        MFTRecord.writeU32LE(into: &block, at: 28, value: UInt32(entriesOffsetWithinHeader + entryBytes.count))
+        MFTRecord.writeU32LE(into: &block, at: 32, value: UInt32(blockSize - 24))
+        block[block.startIndex + 36] = 0x01  // flags: LARGE_INDEX (this is an interior block)
+        return block
     }
 
     /// Build an INDX block (pre-USA, ready for reverseFixup) with `entries`
