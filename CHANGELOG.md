@@ -2,9 +2,11 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — v0.4.0 candidate
+## [Unreleased] — v0.5.0 candidate
 
 ### Added
+
+- **v0.5 Fix B Step 1+2: `$ATTRIBUTE_LIST` entry parse/serialize and read-path foundation (`Volume.resolveAttribute` / `allAttributesOf`)** so attributes migrated to extension MFT records via `$ATTRIBUTE_LIST` are correctly resolved. Backwards-compatible: no-op when `$ATTRIBUTE_LIST` is absent. The write/migrate path (Step 3) — the actual fix for the file-~350 `cp -r` cap — is the next PR.
 
 - **Phase 1 — `Volume.beginBulkInsert(into:)` / `endBulkInsert()`** — bulk-insert mode that defers the per-file `$I30` size-hint refresh (`refreshParentI30Size`) during high-volume operations. cp -r wraps each destination directory's batch of file inserts in begin/end; the per-file size-hint INDX-block rewrite is skipped (size hints can be re-applied via a future `ntfsctl refresh-sizes`). Size hints in `$I30` are cosmetic (Windows Explorer file-size column); file content is byte-correct on disk regardless.
 - **Phase 2 — INDX-leaf coalescing.** New `BulkLeafCache` in `IndexAllocationWriter` holds parsed leaf state across consecutive inserts during a bulk-insert window. When 50 files all land in the same leaf, that's 50 4-KiB-leaf reads + 50 4-KiB-leaf writes collapsed into one read + one final write at `endBulkInsert`. Leaf splits transparently flush the pre-split leaf to disk so the split path sees up-to-date entries. Combined with Phase 1, expected ~3-5× cp -r speedup on USB-attached drives. New unit tests `testBulkInsertSkipsSizeHintRefresh` (Phase 1) + `testBulkInsertCoalescesLeafWrites` (Phase 2). Tests: 111/111 pass.
