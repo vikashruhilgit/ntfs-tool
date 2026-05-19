@@ -311,22 +311,51 @@ struct Cp: AsyncParsableCommand {
     ) async throws {
         let fm = FileManager.default
         let entries = (try? fm.contentsOfDirectory(atPath: hostDir)) ?? []
+
+        // v0.4 Phase 1: separate subdirs from files so we can recurse first
+        // and then process this level's file batch under one beginBulkInsert
+        // / endBulkInsert window. Nesting begin/end isn't supported (Volume
+        // throws), so we MUST finish recursion (each of which enters its
+        // own begin/end at the child level) BEFORE opening this level's
+        // bulk-insert window.
+        var subdirs: [(name: String, fullPath: String)] = []
+        var files: [(name: String, fullPath: String)] = []
         for name in entries.sorted() {
             let fullPath = (hostDir as NSString).appendingPathComponent(name)
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
-                let childRN = try await ensureDirectory(volume: volume, parent: ntfsParent, name: name)
-                try await copyDirectoryRecursive(
-                    volume: volume,
-                    hostDir: fullPath,
-                    ntfsParent: childRN,
-                    copiedFiles: &copiedFiles,
-                    copiedBytes: &copiedBytes,
-                    totalFiles: totalFiles,
-                    totalBytes: totalBytes
-                )
+                subdirs.append((name, fullPath))
             } else {
+                files.append((name, fullPath))
+            }
+        }
+
+        // 1) Recurse into subdirs first. Each recursion may open its own
+        //    bulk-insert window at the child level — that's fine because
+        //    THIS level's window is still closed.
+        for (name, fullPath) in subdirs {
+            let childRN = try await ensureDirectory(volume: volume, parent: ntfsParent, name: name)
+            try await copyDirectoryRecursive(
+                volume: volume,
+                hostDir: fullPath,
+                ntfsParent: childRN,
+                copiedFiles: &copiedFiles,
+                copiedBytes: &copiedBytes,
+                totalFiles: totalFiles,
+                totalBytes: totalBytes
+            )
+        }
+
+        // 2) Now copy this level's files inside one bulk-insert window.
+        //    Per-file refreshParentI30Size calls become no-ops; size hints
+        //    will show as 0 in Windows Explorer until a subsequent write
+        //    or explicit hint-refresh updates them. File contents are
+        //    byte-correct on disk.
+        guard !files.isEmpty else { return }
+        try await volume.beginBulkInsert(into: ntfsParent)
+        do {
+            for (name, fullPath) in files {
                 try await copyOneFile(
                     volume: volume,
                     hostFile: fullPath,
@@ -338,6 +367,10 @@ struct Cp: AsyncParsableCommand {
                     totalBytes: totalBytes
                 )
             }
+            _ = try await volume.endBulkInsert()
+        } catch {
+            _ = try? await volume.endBulkInsert()
+            throw error
         }
     }
 

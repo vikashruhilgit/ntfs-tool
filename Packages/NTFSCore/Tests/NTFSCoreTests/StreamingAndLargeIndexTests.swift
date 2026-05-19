@@ -302,6 +302,76 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         )
     }
 
+    /// v0.4 Phase 1: bulk-insert mode skips per-file refreshParentI30Size.
+    /// Wrap a batch of file inserts in beginBulkInsert / endBulkInsert and
+    /// confirm every write that would have triggered a size-hint refresh
+    /// is counted as skipped. This is the perf foundation for cp -r: the
+    /// 22k-file phone-backup workload was paying one INDX-block rewrite per
+    /// file write just to update Windows Explorer's "Size" column.
+    func testBulkInsertSkipsSizeHintRefresh() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(8)
+
+        // Before bulk insert: skip-count starts at zero.
+        let initialSkipped = await volume.bulkInsertSkippedRefreshCount()
+        XCTAssertEqual(initialSkipped, 0)
+
+        // Open bulk-insert window targeting root (recnum 5). The same parent
+        // recnum cp -r uses when copying into the root of a fresh dir.
+        try await volume.beginBulkInsert(into: 5)
+
+        // Insert + write 25 files. Each write would normally trigger one
+        // refreshParentI30Size; with bulk insert active each becomes a
+        // no-op + counter bump.
+        let payload = Data("phase1 bulk insert\n".utf8)
+        for i in 0..<25 {
+            let name = String(format: "bulk-%04d.txt", i)
+            let rn = try await volume.createFile(named: name, inDirectory: 5)
+            try await volume.write(at: rn, offset: 0, bytes: payload)
+        }
+
+        let skipped = try await volume.endBulkInsert()
+        XCTAssertEqual(
+            skipped, 25,
+            "Expected 25 skipped size-hint refreshes during bulk insert (one per write); got \(skipped)"
+        )
+
+        // After endBulkInsert, the counter resets and subsequent writes
+        // resume their normal (refreshing) behavior.
+        let postSkipped = await volume.bulkInsertSkippedRefreshCount()
+        XCTAssertEqual(postSkipped, 0)
+        let rn = try await volume.createFile(named: "post-bulk.txt", inDirectory: 5)
+        try await volume.write(at: rn, offset: 0, bytes: payload)
+        let postSkipped2 = await volume.bulkInsertSkippedRefreshCount()
+        XCTAssertEqual(
+            postSkipped2, 0,
+            "After endBulkInsert, subsequent writes should NOT increment the skip counter"
+        )
+
+        // Sanity: nested bulk insert is rejected.
+        try await volume.beginBulkInsert(into: 5)
+        do {
+            try await volume.beginBulkInsert(into: 5)
+            XCTFail("Expected nested beginBulkInsert to throw")
+        } catch NTFSError.unsupportedFeature {
+            // expected
+        }
+        _ = try await volume.endBulkInsert()
+
+        // All 25 inserted files must still be reachable + readable — the
+        // optimization is purely about deferring cosmetic size hints, not
+        // skipping any actual content writes.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let names = Set(try await reopen.enumerate(directory: 5).map { $0.name })
+        for i in 0..<25 {
+            let n = String(format: "bulk-%04d.txt", i)
+            XCTAssertTrue(names.contains(n), "bulk-inserted file \(n) missing from reopen")
+        }
+    }
+
     /// v0.3 hardware-shape repro: mimic `cp -r` of a deeply-nested source
     /// tree (a parent dir + many child files all under it, plus a sibling
     /// dir + a deeper subdir). The user's 22,419-file phone backup workload

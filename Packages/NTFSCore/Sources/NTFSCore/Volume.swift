@@ -17,6 +17,17 @@ public actor Volume {
 
     private var _mft: MFT?
 
+    // v0.4 Phase 1: bulk-insert mode. When set, refreshParentI30Size becomes
+    // a no-op for files whose parent matches `_bulkInsertParentRN`. cp -r
+    // wraps each destination dir's batch of file inserts in beginBulkInsert
+    // / endBulkInsert so the per-file size-hint refresh (which re-reads +
+    // recomputes + rewrites the parent's $I30 entry, a ~4 KiB INDX-block
+    // write each time on LARGE_INDEX dirs) is skipped. Size hints in $I30
+    // are cosmetic (Windows Explorer file-size column); files are byte-
+    // correct without them. Run `ntfsctl refresh-sizes` later if you care.
+    private var _bulkInsertParentRN: UInt64?
+    private var _bulkInsertSkippedRefreshCount: Int = 0
+
     public init(device: any BlockDevice) async throws {
         self.device = device
 
@@ -2231,6 +2242,55 @@ public actor Volume {
         try await device.synchronize()
     }
 
+    /// v0.4 Phase 1: enter bulk-insert mode for one destination directory.
+    ///
+    /// While this mode is active, `refreshParentI30Size` (called from every
+    /// `Volume.write` / `Volume.writeFile` to keep $I30's size hints in
+    /// sync with the file's actual size) is skipped for files whose parent
+    /// recnum matches `parentRN`. On a 22 k-file `cp -r`, this is the
+    /// difference between 22 k INDX-block rewrites and zero.
+    ///
+    /// `endBulkInsert` MUST be called to leave bulk-insert mode. Use
+    /// `Swift`'s `defer { try? await volume.endBulkInsert() }` pattern.
+    ///
+    /// Nesting / re-entry is **not** supported. Calling `beginBulkInsert`
+    /// while already in bulk-insert mode throws — the consumer (typically
+    /// `cp -r`) finishes one destination dir before starting the next.
+    ///
+    /// Size hints in $I30 are cosmetic — they drive the Windows Explorer
+    /// "Size" column and similar UI surfaces. Files copied during bulk
+    /// insert are **byte-correct on disk** but will show 0 / stale sizes
+    /// in some UIs until a subsequent write or an explicit hint-refresh
+    /// pass updates them.
+    public func beginBulkInsert(into parentRN: UInt64) async throws {
+        if _bulkInsertParentRN != nil {
+            throw NTFSError.unsupportedFeature(
+                description: "beginBulkInsert: already in bulk-insert mode for parent \(_bulkInsertParentRN!); nested bulk insert is not supported"
+            )
+        }
+        _bulkInsertParentRN = parentRN
+        _bulkInsertSkippedRefreshCount = 0
+    }
+
+    /// v0.4 Phase 1: leave bulk-insert mode. Returns the number of size-hint
+    /// refreshes that were skipped during the session (for diagnostics +
+    /// tests). Idempotent — calling outside bulk-insert mode is a no-op
+    /// returning 0.
+    @discardableResult
+    public func endBulkInsert() async throws -> Int {
+        let n = _bulkInsertSkippedRefreshCount
+        _bulkInsertParentRN = nil
+        _bulkInsertSkippedRefreshCount = 0
+        return n
+    }
+
+    /// v0.4 Phase 1: introspection hook for tests. Returns the count of
+    /// `refreshParentI30Size` calls skipped so far in the current bulk-
+    /// insert session, or 0 if not in one.
+    public func bulkInsertSkippedRefreshCount() async -> Int {
+        _bulkInsertSkippedRefreshCount
+    }
+
     /// Set or clear the $VOLUME_INFORMATION dirty bit. After every batch of
     /// writes is complete, callers should `setDirty(false)` so that chkdsk /
     /// ntfsfix treat the volume as cleanly-unmounted.
@@ -2507,6 +2567,14 @@ public actor Volume {
             return
         }
         let parentRN = fn.parentRecordNumber
+        // v0.4 Phase 1: skip during bulk insert into this parent. Size
+        // hints in $I30 are cosmetic; the file's actual content is
+        // already on disk and reachable through $I30 (just with stale /
+        // zero size in the Windows Explorer column).
+        if _bulkInsertParentRN == parentRN {
+            _bulkInsertSkippedRefreshCount += 1
+            return
+        }
         let parent = try await mft.record(at: parentRN)
         let parentAttrs = try parent.attributes()
         guard let irAttr = parentAttrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),

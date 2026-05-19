@@ -2,7 +2,13 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — v0.3.0 candidate
+## [Unreleased] — v0.4.0 candidate
+
+### Added
+
+- **`Volume.beginBulkInsert(into:)` / `endBulkInsert()`** — bulk-insert mode that defers the per-file `$I30` size-hint refresh (`refreshParentI30Size`) during high-volume operations. cp -r wraps each destination directory's batch of file inserts in begin/end; the per-file INDX-block rewrite (the bulk of cp -r's per-file work) is skipped, recovered as a separate one-off pass via `ntfsctl refresh-sizes` (future). Size hints in `$I30` are cosmetic (Windows Explorer file-size column); file content is byte-correct on disk regardless. Expected ~2× speedup for cp -r on USB-attached drives. New unit test `testBulkInsertSkipsSizeHintRefresh` asserts the counter behavior. Tests: 110/110 pass.
+
+## v0.3.0 — 2026-05-19
 
 ### Fixed
 
