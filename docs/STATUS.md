@@ -2,7 +2,7 @@
 
 This document is the single source of truth for project state. Updated when major work lands.
 
-**Last updated:** 2026-05-18, after the v0.2 audit-driven push: T0 safety (dirty bit + fsync + flock + rm safety + --recnum + verify cap + MIT LICENSE), T1.1 MFT $BITMAP allocator, T1.2 LARGE_INDEX leaf split, T1.3 LARGE_INDEX size hint refresh, T1.4 mtime updates, T2.1 release CI workflow.
+**Last updated:** 2026-05-19, after v0.3 leaf-split silent-orphan fix validated on real 4 TB WD hardware (22,419-file phone-backup cp -r → clean `unsupportedFeature` abort at file 63, **0 orphans** vs. 11 silent orphans pre-v0.3). Also shipped `ntfsctl reclaim-orphans` subcommand (native equivalent of `ntfsfix --no-action --clear-bad-sectors` for the orphan-reclaim case). Builds on the v0.2 audit-driven push: T0 safety (dirty bit + fsync + flock + rm safety + --recnum + verify cap + MIT LICENSE), T1.1 MFT $BITMAP allocator, T1.2 LARGE_INDEX leaf split, T1.3 LARGE_INDEX size hint refresh, T1.4 mtime updates, T2.1 release CI workflow.
 
 **Audit status:** every FATAL + CRITICAL item from [`AUDIT-REPORT.md`](../AUDIT-REPORT.md) is closed. WARNING #9 (streaming bitmap reader) and #11 (pre-baked test Docker image) deferred to v0.3.
 **Rubric score:** 30/30 baseline from `.supervisor/requirements/auto-2026-05-14-203703-ntfs-multi-phase-rubric.md`, plus three follow-on capabilities (see "What's done — post-v0.1 enhancements").
@@ -76,6 +76,7 @@ If you want **terminal read/write access to NTFS on macOS today**, the CLI is re
 | `mv` | ✅ | **NEW.** Rename or move a file/directory by path. Works across directories; auto-creates intermediate destination dirs. |
 | `truncate` | ✅ | Byte-precise resize (any size, including non-cluster-aligned shrinks). Doesn't grow yet. |
 | `setdirty` | ✅ | $VOLUME_INFORMATION dirty bit toggle |
+| `reclaim-orphans` | ✅ | **NEW (v0.3).** Sweep MFT, clear IN_USE on records unreachable from root, free $MFT.$BITMAP bit. Recovery tool for volumes left with orphans by older buggy builds (pre-v0.3 leaf-split bug). Dry-run by default; pass `--confirm` to clean. Native equivalent of `ntfsfix` / `chkdsk /f` for this specific failure class — no Linux/Windows machine required. |
 
 See [`docs/CLI.md`](CLI.md) for usage walkthrough.
 
@@ -110,7 +111,7 @@ These three follow-on capabilities lifted the v0.1 limits that made the CLI awkw
 | **Full-MFT `verify`** | `Tools/ntfsctl/Sources/ntfsctl/Verify.swift` | Sweeps every MFT slot (bounded by `$MFT`'s logical size), reachability-walks from root, reports orphans + dangling $I30 entries + parse errors. Closer to an `fsck` than the old 0-63 sweep. |
 | **Actionable error hints** | various CLI files | Path-not-found and "in use" errors now include actionable suggestions in the message text. |
 
-**Remaining LARGE_INDEX limit (deferred again):** if a single INDX leaf fills up, the next insert into that leaf throws `unsupportedFeature(...leaf full)`. ~50-entry cap per 4 KiB leaf. Leaf-split scaffold exists in [Volume.swift](../Packages/NTFSCore/Sources/NTFSCore/Volume.swift) (`splitLeafAndPromote`) but is disabled — the first split works correctly, but the second-or-later split (when $INDEX_ROOT already has an interior entry) corrupts state in a way that later USA fix-up rejects. Root cause needs more investigation. See engineering follow-up #2.
+**LARGE_INDEX leaf-split silent-orphan bug — FIXED (2026-05-18).** Previously, after ~4 leaf splits in the same directory, the next insert that would overflow `$INDEX_ROOT`'s interior-entry budget partially mutated disk (rewriting the original leaf to its left half, writing right-half data to a new cluster that was never linked into `$INDEX_ALLOCATION`) before throwing — silently orphaning 10-15 previously-inserted $I30 entries. Root cause: `splitLeafAndPromote` performed leaf disk writes BEFORE the in-memory parent-record overflow check. Fix: reordered so the parent record is built (and overflow check fires) ahead of any leaf disk write; on overflow the freshly-allocated cluster is released via `freeClusters`. The repro test (`testLeafSplitOrphansBugUnderCpRWorkload`) now passes — 75 inserts, 75 visible on reopen, 0 missing. See [`docs/V0.3-LEAF-SPLIT-DEBUG-NOTES.md`](V0.3-LEAF-SPLIT-DEBUG-NOTES.md) for the full investigation log. The remaining limit (the case where `$INDEX_ROOT` itself needs to split into a multi-level B-tree) is a separate, smaller item — when reached, insert now throws `unsupportedFeature` cleanly with no data loss.
 
 ### FSKit System Extension (`Extensions/NTFSFileSystem`)
 
@@ -159,6 +160,7 @@ Code is complete. Builds clean. **Has not been run with the extension actually l
 | **Real Windows-formatted drive** | NTFSCore parses a real 4 TB Western Digital My Passport drive | ✅ via manual `ntfsctl verify` |
 | **Byte-exact vs Apple's driver** | SHA-256 of our read matches Apple's mount-path read of same file | ✅ proven on real Windows .exe |
 | **`ntfsctl` write → Apple's driver read on real hardware** | Apple's NTFS driver reads our writes byte-exact on re-mount of the user's 4 TB WD My Passport | ✅ proven 2026-05-18 against v0.2.0 candidate `bac8d31` (see §4 below) |
+| **v0.3 leaf-split clean-abort on real hardware** | 22,419-file phone-backup `cp -r` against same WD drive; expected to hit parent-record overflow ~file 63 (same trigger as v0.2 silent-orphan bug). Pass condition: clean `unsupportedFeature` abort + `verify` shows 0 orphans. | ✅ proven 2026-05-19 against v0.3.0 candidate — 0 orphans after partial cp (was 11 silent orphans pre-v0.3) |
 | **`xcodebuild` of FSKit ext + app** | All three Xcode schemes build clean | ✅ in CI |
 | **FSKit extension mount in Finder** | Drive actually mounts via our extension | ❌ requires SIP-off / entitlement |
 | **Windows `chkdsk /f`** | Microsoft's own fsck accepts our writes | ❌ requires Windows machine |
@@ -264,14 +266,16 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 ### High-impact
 
 1. ~~**Path-based subcommand resolution.**~~ ✅ Done.
-2. ~~**LARGE_INDEX leaf split.**~~ ✅ Done (T1.2). Directories grow past the single-leaf cap; tested to 40+ inserts. The actual remaining cap is `$MFT.$DATA` growth.
+2. ~~**LARGE_INDEX leaf split.**~~ ✅ Done (T1.2 in v0.2; silent-orphan bug fixed in v0.3 — `splitLeafAndPromote` now computes parent-record overflow check before any leaf disk write). Directories grow past the single-leaf cap; tested to 75+ inserts. Validated on real 4 TB WD My Passport drive (22,419-file phone-backup cp -r → fails at file 63 with clean `unsupportedFeature` abort, **0 orphans**, was 11 silent orphans pre-v0.3). The actual remaining cap is `$INDEX_ROOT` itself needing to split (multi-level interior tree) — see follow-up #11 below.
 3. ~~**Partial mid-file overwrites.**~~ ✅ Done.
 4. ~~**Streaming `cat` for large files.**~~ ✅ Done.
 5. ~~**Stale `$FILE_NAME` size hints.**~~ ✅ Done for both resident and LARGE_INDEX parents (T1.3).
 6. ~~**`mtime` updates on write.**~~ ✅ Done (T1.4). `atime` deferred — most NTFS-on-Windows volumes have atime updates disabled by default (perf), no value-add for this CLI.
 7. ~~**`$MFT.$DATA` growth.**~~ **Partial.** `growMFTDataByClusters()` + `growMFTBitmapToCoverBytes()` + runlist-aware MFT reads are implemented and tested in isolation (75-insert small-dir round-trip clean). NOT auto-invoked from `allocateMFTRecord` in v0.2 — the interaction with a second LARGE_INDEX leaf split corrupts state in a way I haven't been able to track down. Real Windows-formatted drives reserve ~12.5% of the volume for $MFT growth, so on a 4 TB drive `allocatedSize` covers hundreds of millions of records — plenty for phone-backup workloads without auto-grow. The framework is there; flip the retry loop in `allocateMFTRecord` back on once the second-split bug is found.
 8. **`cp --resume`.** Skip files already present at destination (by name + size match, or optional SHA-256). Important for multi-GB copies over flaky USB. ~1 day.
-9. **Streaming bitmap reader.** `$Bitmap` is loaded whole into RAM (~250 MB for 8 TB volumes). Chunk on demand. ~1-2 days. Defer to v0.3.
+9. **Streaming bitmap reader.** `$Bitmap` is loaded whole into RAM (~250 MB for 8 TB volumes). Chunk on demand. ~1-2 days. Defer to v0.4.
+10. **`cp -r` bulk-write perf.** Currently ~1-2 files/sec on USB (≈ 30-40 min for the 22 k-file phone-backup workload, vs. Apple's driver's ~5-10 min). Two contributors, both fixable. **(a) `refreshParentI30Size` deferral** — runs after every file write; defer to once-per-cp-r-directory (size hint is cosmetic for Windows Explorer; files are byte-correct either way). ~2 hours, ~2× speedup. **(b) per-directory parent-record coalescing** — when cp -r adds N files to one dir, we currently re-read + re-write the parent MFT record N times; batch to one rewrite at end of dir. ~1 day, ~3-5× speedup on bulk inserts. Combined: ~5-10× speedup. Optional v0.4 follow-up. Optional **(c) async write pipelining** — issue write N+1 while N is in flight. Bigger refactor (~3-5 days); worth doing only after (a)+(b).
+11. **`$INDEX_ROOT` multi-level split.** Lifts the current "~60 files per fresh directory" cap that v0.3 turned from silent corruption into a clean `unsupportedFeature` abort. When `$INDEX_ROOT` cannot fit another interior entry, currently we throw; the proper fix is to convert `$INDEX_ROOT` itself into an interior B-tree node and split it. Requires extending `splitLeafAndPromote`'s pattern up one level. ~3-5 days. Until this lands, the workaround is per-directory chunking (cp -r treats each ≤50 files as its own subdir). v0.4 target.
 
 ### Medium-impact
 

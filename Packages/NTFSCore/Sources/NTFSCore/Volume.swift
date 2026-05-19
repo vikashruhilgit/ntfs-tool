@@ -737,7 +737,7 @@ public actor Volume {
             )
         } catch {
             // Roll back the orphan record so the volume stays consistent.
-            try? await deleteOrphan(at: recordNumber)
+            try? await reclaimOrphanedMFTRecord(at: recordNumber)
             throw error
         }
 
@@ -1126,7 +1126,36 @@ public actor Volume {
             }
         }
 
-        // 3. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
+        // 3. Pre-flight: compute the new parent MFT record bytes IN MEMORY
+        //    before mutating any disk state. This is where the v0.3
+        //    silent-orphan bug used to live — `rewriteIndexRootForSplit`
+        //    threw "would overflow parent record" AFTER the LEFT/RIGHT leaf
+        //    writes had already mutated disk, leaving the original leaf
+        //    half-rewritten and the new cluster unreachable. By moving the
+        //    in-memory build (and its overflow check) ahead of the leaf
+        //    writes, an overflow now aborts cleanly: only the freshly
+        //    allocated cluster has been touched, and we free it below.
+        let newParentRecordBytes: Data
+        do {
+            newParentRecordBytes = try await computeParentRecordBytesForSplit(
+                parentRecordNumber: parentRecordNumber,
+                indexRoot: indexRoot,
+                rootBytes: rootBytes,
+                splitLeafVCN: leafVCN,
+                newLeafVCN: newVCN,
+                medianEntry: median,
+                allocationExtents: allocationExtents,
+                newExtent: newExtent
+            )
+        } catch {
+            // Compute step failed (typically parent-record overflow).
+            // Release the cluster we provisionally allocated so it doesn't
+            // leak — disk is otherwise pristine, no orphans.
+            try? await freeClusters(newExtent)
+            throw error
+        }
+
+        // 4. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
         let blockSize = Int(indexRecordSizeBytes)
         let sectorSize = Int(boot.bytesPerSector)
         let originalLeafRaw = try await device.read(offset: leafByteOffset, length: blockSize)
@@ -1149,7 +1178,7 @@ public actor Volume {
         )
         try await device.write(offset: leafByteOffset, bytes: leftOnDisk)
 
-        // 4. Build the RIGHT leaf at the new VCN — fresh block with rightEntries.
+        // 5. Build the RIGHT leaf at the new VCN — fresh block with rightEntries.
         let rightBlock = try buildEmptyIndxBlock(
             blockSize: blockSize,
             sectorSize: sectorSize,
@@ -1164,22 +1193,15 @@ public actor Volume {
         )
         try await device.write(offset: newLCN * clusterBytes, bytes: rightOnDisk)
 
-        // 5. Rebuild $INDEX_ROOT with the median promoted as an interior entry.
-        //    Existing $INDEX_ROOT interior entries are preserved; we insert
-        //    a new interior entry for `median` pointing at the LEFT leaf (the
-        //    original leaf, which now holds the smaller half), and the LAST
-        //    sentinel either retains its existing target or gets retargeted
-        //    to the RIGHT leaf depending on which leaf was just split.
-        try await rewriteIndexRootForSplit(
-            parentRecordNumber: parentRecordNumber,
-            indexRoot: indexRoot,
-            rootBytes: rootBytes,
-            splitLeafVCN: leafVCN,
-            newLeafVCN: newVCN,
-            medianEntry: median,
-            allocationExtents: allocationExtents,
-            newExtent: newExtent
-        )
+        // 6. Commit the precomputed parent MFT record (overflow already
+        //    ruled out in step 3). This finalizes the split atomically
+        //    from the tree-shape perspective.
+        let mft = self.mft()
+        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParentRecordBytes)
+        // Self-check: re-read + re-parse + walk attributes. Any malformation
+        // surfaces here with a precise location rather than as a later
+        // mysterious USA-fixup mismatch in the next descent.
+        try await verifyParentRecord(parentRecordNumber, context: "after split of leaf VCN \(leafVCN)")
 
         // T1.2 deep verification: walk the tree post-split and compare to
         // the pre-split snapshot. After exactly one split that promoted
@@ -1199,9 +1221,17 @@ public actor Volume {
         }
     }
 
-    /// Update the parent's $INDEX_ROOT after a leaf split, AND its
-    /// $INDEX_ALLOCATION runlist + $BITMAP to cover the new leaf block.
-    private func rewriteIndexRootForSplit(
+    /// Build the new MFT record bytes that would result from updating the
+    /// parent's $INDEX_ROOT after a leaf split, AND its $INDEX_ALLOCATION
+    /// runlist + $BITMAP to cover the new leaf block.
+    ///
+    /// **Pure compute — never mutates disk.** Throws if the new $INDEX_ROOT
+    /// body would overflow the parent MFT record (the v0.3 silent-orphan
+    /// trigger: previously this check fired AFTER the leaf disk writes,
+    /// leaving the new right-leaf cluster unreachable and the original leaf
+    /// rewritten to its left half). `splitLeafAndPromote` calls this BEFORE
+    /// any disk mutation so overflow aborts cleanly with no data loss.
+    private func computeParentRecordBytesForSplit(
         parentRecordNumber: UInt64,
         indexRoot: IndexRoot,
         rootBytes: Data,
@@ -1210,7 +1240,7 @@ public actor Volume {
         medianEntry: (fileRef: UInt64, body: Data, sortKey: String),
         allocationExtents: [Extent],
         newExtent: Extent
-    ) async throws {
+    ) async throws -> Data {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
         let attrs = try parent.attributes()
@@ -1348,17 +1378,17 @@ public actor Volume {
         )
 
         // 5e) Rebuild the parent MFT record with all three updates.
+        //     This throws "would overflow parent record" if the new
+        //     $INDEX_ROOT body (with the promoted median interior entry)
+        //     no longer fits. Critical to do this BEFORE leaf disk writes
+        //     so the failure mode is a clean abort, not silent orphaning.
         let newRecordBytes = try rewriteParentForLeafSplit(
             parent: parent,
             newRootBody: newRootBody,
             newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
             newBitmapAttrBytes: updatedBitmapAttrBytes
         )
-        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newRecordBytes)
-        // Self-check: re-read + re-parse + walk attributes. Any malformation
-        // surfaces here with a precise location rather than as a later
-        // mysterious USA-fixup mismatch in the next descent.
-        try await verifyParentRecord(parentRecordNumber, context: "after split of leaf VCN \(splitLeafVCN)")
+        return newRecordBytes
     }
 
     /// Walk the entire LARGE_INDEX tree of `parentRecordNumber` and return
@@ -3283,12 +3313,18 @@ public actor Volume {
         return out
     }
 
-    /// Roll back an MFT record allocation by flipping IN_USE off — used by
-    /// createFile's error handler when the $I30 insert fails. Doesn't try to
-    /// free clusters (the new record is empty resident $DATA only) and
-    /// doesn't update the parent (this is the rollback path called after
-    /// the parent update itself failed).
-    private func deleteOrphan(at recordNumber: UInt64) async throws {
+    /// Roll back an MFT record allocation by flipping IN_USE off. Used both
+    /// internally (createFile's error handler when $I30 insert fails) and
+    /// externally (the `ntfsctl reclaim-orphans` subcommand which sweeps
+    /// pre-existing orphans left behind by older buggy builds).
+    ///
+    /// Doesn't free non-resident clusters — for a fresh createFile orphan
+    /// the record is empty resident $DATA only. For reclaim-orphans use, the
+    /// caller should already have decided this slot is safe to reclaim (no
+    /// reachable $I30 entry pointing at it, no non-resident data the user
+    /// wants to keep). Use `deleteFile` instead if the file IS reachable
+    /// and you want full cluster + $I30 cleanup.
+    public func reclaimOrphanedMFTRecord(at recordNumber: UInt64) async throws {
         let mft = self.mft()
         let record = try await mft.record(at: recordNumber)
         guard record.isInUse else { return }

@@ -177,6 +177,7 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `truncate` | `<device> <recnum> <newSize>` | Resize file to any byte-precise size (shrink only; growing requires `write`). |
 | `delete` | `<device> <recnum>` | Single-record delete by recnum. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15. (Prefer `rm` for path-based use.) |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
+| `reclaim-orphans` | `<device>` | Sweep MFT for orphaned records (IN_USE=1 but unreachable from root) and clear them. Dry-run by default — pass `--confirm` to actually clean. `-v` for per-orphan name/parent details. Native equivalent of `ntfsfix` / `chkdsk /f` for orphan recovery. |
 
 ## Common task recipes
 
@@ -257,6 +258,37 @@ docker run --rm -v /tmp:/io --privileged debian:bookworm-slim bash -c '
   ntfsfix --no-action /io/volume-snapshot.img
 '
 ```
+
+### Reclaim orphaned MFT records left by older buggy builds
+
+If `verify` reports orphans (records in the MFT with IN_USE=1 but not reachable from any directory), you can clean them in-place without booting Windows or Linux. Common scenario: a previous failed `cp -r` against a pre-v0.3 build that hit the leaf-split silent-orphan bug.
+
+```bash
+diskutil unmount /dev/disk10s1
+# 1. See what would be reclaimed (read-only dry-run — totally safe).
+sudo ntfsctl reclaim-orphans -v /dev/disk10s1
+#    Prints orphan recnums + their $FILE_NAME if present, e.g.:
+#    orphan recnum 72  name='IMG_2031.HEIC' parent_ref=44
+#    Inspect the names — if these are files you actually want to keep,
+#    DO NOT continue. They'd be reachable only through their parent's
+#    $I30, which is corrupted; reclaim drops them.
+
+# 2. Clean. Wraps in a dirty-bit transaction with fsync.
+sudo ntfsctl reclaim-orphans --confirm /dev/disk10s1
+
+# 3. Confirm
+sudo ntfsctl verify /dev/disk10s1
+#    Orphans should now be 0.
+diskutil mount /dev/disk10s1
+```
+
+This is the native equivalent of `ntfsfix --clear-bad-sectors` / `chkdsk /f`'s orphan reclamation — same on-disk effect (clear IN_USE flag + free the bit in `$MFT.$BITMAP`), but doesn't require a Windows machine or a Linux Docker container. Use when:
+
+- An older build of `ntfsctl` (pre-v0.3) left orphans on the drive.
+- Another tool crashed mid-write and orphaned a record.
+- You manually `setdirty 0`'d a volume after a partial operation.
+
+The current build's `createFile` correctly rolls back its own orphans on failure, so a fresh `cp -r` against a clean drive should never need this. It's purely a recovery tool for inherited corruption.
 
 ### Verify our writes match Apple's reads (bit-exact)
 
@@ -347,6 +379,8 @@ Your parent dir has too many entries. Use a smaller subdirectory. See [Constrain
 ### `verify` reports errors
 
 Paste the error output. Specific failure modes:
+- **"Orphans (in MFT, not in tree): N"** → records allocated but unreachable. Run `ntfsctl reclaim-orphans -v <device>` to inspect them, then `--confirm` to clear. See the [reclaim recipe](#reclaim-orphaned-mft-records-left-by-older-buggy-builds).
+- **"Dangling ($I30 entry but MFT slot free): N"** → directory entries pointing at freed MFT slots. Requires `chkdsk /f` / `ntfsfix` — the corresponding tool isn't built into ntfsctl yet.
 - **"MFT record magic is 'BAAD'"** → that record was previously marked corrupt by Windows. Not necessarily a problem for the volume overall.
 - **"USA sentinel mismatch"** → hardware fault or interrupted write. Run Windows `chkdsk /f` to recover.
 - **"attribute … extends past record's used region"** → likely a bug in our parser. Open an issue with the full output and the device's `info` output.

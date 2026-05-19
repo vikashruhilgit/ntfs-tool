@@ -2,7 +2,22 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — v0.2.0 candidate
+## [Unreleased] — v0.3.0 candidate
+
+### Fixed
+
+- **LARGE_INDEX leaf-split silent-orphan bug.** Previously, after ~4 leaf splits in the same directory, the next insert that would overflow `$INDEX_ROOT`'s interior-entry budget partially mutated disk (rewriting the original leaf to its left half, writing right-half data to a new cluster that was never linked into `$INDEX_ALLOCATION`) before throwing — silently orphaning 10-15 previously-inserted entries. **Fix:** reordered `Volume.splitLeafAndPromote` so the parent MFT record is built in memory first; if it would overflow, the throw fires BEFORE any leaf disk write, the freshly-allocated cluster is released, and disk state is identical to before the split attempt. Repro test (`testLeafSplitOrphansBugUnderCpRWorkload`) now passes: 75/75 inserts visible on reopen, 0 missing, 0 orphans. See [`docs/V0.3-LEAF-SPLIT-DEBUG-NOTES.md`](docs/V0.3-LEAF-SPLIT-DEBUG-NOTES.md). The remaining limit (`$INDEX_ROOT` itself needs to split into a multi-level tree) now produces a clean `unsupportedFeature` abort with no data loss.
+
+### Added
+
+- **`ntfsctl reclaim-orphans`** — sweep MFT for IN_USE-but-unreachable records and clear them (clear IN_USE flag + free `$MFT.$BITMAP` bit). Dry-run by default; `--confirm` to actually clean; `-v` for per-orphan name/parent. Native equivalent of `ntfsfix` / `chkdsk /f` for the orphan-reclaim case — no Linux/Windows required. Recovery tool for volumes inherited from pre-v0.3 buggy builds. See the [recipe in CLI.md](docs/CLI.md#reclaim-orphaned-mft-records-left-by-older-buggy-builds).
+- **Nested-cp orphan regression test** (`testCpRecursiveNestedDirsOrphanFreeUnderPressure`) — creates `gallery/backup/` two-deep, fills the leaf until overflow, walks reachability vs IN_USE the same way `ntfsctl verify` does. 0 orphans across 107 inserts.
+
+### Changed
+
+- `Volume.deleteOrphan` (private) renamed to `Volume.reclaimOrphanedMFTRecord` (public). Same operation — flip IN_USE off + free the `$MFT.$BITMAP` bit. Used by createFile's rollback AND by the new `reclaim-orphans` subcommand.
+
+## v0.2.0 — 2026-05-18
 
 This release closes every FATAL + CRITICAL item from the [red-team audit](AUDIT-REPORT.md) and most of the WARNINGs. The CLI is ready for general use on real pre-existing Windows-formatted drives (was: failed immediately on any drive with > 2032 existing files).
 
