@@ -966,7 +966,18 @@ public actor Volume {
             var updatedBytes = newParentBytes
             MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
             try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: updatedBytes)
-        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+        } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
+            // v0.5 Fix B Step 3: predicate widened to catch both
+            // `rewriteResidentAttribute` ($INDEX_ROOT) and
+            // `rewriteEntireAttribute` ($INDEX_ALLOCATION / $BITMAP)
+            // overflow throws — though only the small→LARGE_INDEX
+            // promotion below makes sense here, because at this
+            // point the directory is still resident-only and has no
+            // $INDEX_ALLOCATION attribute to migrate. The migration
+            // helper is wired into the LARGE_INDEX leaf-split catch
+            // sites in `computeParentRecordBytesForSplit` and
+            // `promoteThroughInteriorChain`.
+            //
             // Promote to LARGE_INDEX and retry. The promotion moves the existing
             // entries (without the new one — we'll re-insert through the
             // LARGE_INDEX path) into a fresh $INDEX_ALLOCATION leaf and shrinks
@@ -1531,7 +1542,43 @@ public actor Volume {
                 intermediates: [],
                 extraClustersAllocated: []
             )
-        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+        } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
+            // v0.5 Fix B Step 3: if the non-resident $INDEX_ALLOCATION
+            // attribute overflowed the base record's slack — the runlist
+            // grew past the cap at the ~350-file `cp -r` boundary —
+            // migrate $INDEX_ALLOCATION:$I30 into a fresh extension
+            // record (with a resident $ATTRIBUTE_LIST on the base) and
+            // retry `rewriteParentForLeafSplit` against a freshly-read
+            // parent. The migrated base now has slack for the larger
+            // non-resident attribute.
+            //
+            // For $INDEX_ROOT (Step A) and $BITMAP (Step C) overflow,
+            // fall through to the v0.4 height-grow path; $BITMAP-only
+            // migration is deferred (see follow-up #11).
+            let overflowType = overflowingAttributeType(from: desc)
+            if overflowType == AttributeType.indexAllocation.rawValue {
+                try await migrateIndexAllocationOnOverflow(
+                    baseRecordNumber: parentRecordNumber,
+                    overflowDescription: desc
+                )
+                // Re-read parent post-migration: the on-disk record now
+                // has $ATTRIBUTE_LIST in place of $INDEX_ALLOCATION, so
+                // the stale `parent` value would re-introduce the
+                // migrant and undo the migration.
+                let refreshedParent = try await mft.record(at: parentRecordNumber)
+                let newRecordBytes = try rewriteParentForLeafSplit(
+                    parent: refreshedParent,
+                    newRootBody: newRootBody,
+                    newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                    newBitmapAttrBytes: updatedBitmapAttrBytes
+                )
+                return ComputedSplit(
+                    parentRecordBytes: newRecordBytes,
+                    intermediates: [],
+                    extraClustersAllocated: []
+                )
+            }
+
             // v0.4 Phase 3(A): height-grow $INDEX_ROOT.
             //
             // Bisect newInterior into two halves around a new median; move
@@ -2148,7 +2195,36 @@ public actor Volume {
                 intermediates: intermediateWrites,
                 extraClustersAllocated: extraExtents
             )
-        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+        } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
+            // v0.5 Fix B Step 3: if the non-resident
+            // $INDEX_ALLOCATION is what overflowed the base record
+            // (not $INDEX_ROOT, not $BITMAP), migrate the
+            // $INDEX_ALLOCATION:$I30 attribute into an extension
+            // record + resident $ATTRIBUTE_LIST and retry against a
+            // freshly-read parent. The migrated base now has slack to
+            // accept the grown non-resident attribute. $BITMAP-only
+            // migration is deferred — fall through to v0.4 height-grow.
+            let overflowType = overflowingAttributeType(from: desc)
+            if overflowType == AttributeType.indexAllocation.rawValue {
+                let baseRN = UInt64(parent.mftRecordNumber)
+                try await migrateIndexAllocationOnOverflow(
+                    baseRecordNumber: baseRN,
+                    overflowDescription: desc
+                )
+                let refreshedParent = try await self.mft().record(at: baseRN)
+                let newRecordBytes = try rewriteParentForLeafSplit(
+                    parent: refreshedParent,
+                    newRootBody: newRootBody,
+                    newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                    newBitmapAttrBytes: updatedBitmapAttrBytes
+                )
+                return ComputedSplit(
+                    parentRecordBytes: newRecordBytes,
+                    intermediates: intermediateWrites,
+                    extraClustersAllocated: extraExtents
+                )
+            }
+
             // v0.4 Phase 3(D): cascade reached $INDEX_ROOT AND root would
             // also overflow with the cascade's bubbled-up median. Apply
             // height-grow ON TOP of the cascade's accumulated state.
@@ -2157,7 +2233,6 @@ public actor Volume {
             // $INDEX_ROOT with a tiny new root. All cascade extents and
             // bitmap VCNs are passed through so the merged runlist +
             // bitmap reflect the full picture.
-            _ = desc
             let grown = try await heightGrowIndexRoot(
                 parent: parent,
                 attrs: attrs,
@@ -3013,7 +3088,7 @@ public actor Volume {
         let newUsedSize = usedSize + delta
         guard newUsedSize + 4 <= recordSize else {
             throw NTFSError.unsupportedFeature(
-                description: "rewriteResidentAttribute: new attribute (\(newAttrLength) bytes) would overflow parent record (used \(usedSize), record \(recordSize))"
+                description: "rewriteResidentAttribute: new attribute (\(newAttrLength) bytes) would overflow parent record (used \(usedSize), record \(recordSize), type 0x\(String(replacingType, radix: 16, uppercase: true)))"
             )
         }
 
@@ -4335,7 +4410,7 @@ public actor Volume {
         let newUsedSize = usedSize + delta
         guard newUsedSize + 4 <= recordSize else {
             throw NTFSError.unsupportedFeature(
-                description: "rewriteEntireAttribute: new attribute (\(replacementBytes.count) bytes) would overflow record (used \(usedSize), record \(recordSize))"
+                description: "rewriteEntireAttribute: new attribute (\(replacementBytes.count) bytes) would overflow record (used \(usedSize), record \(recordSize), type 0x\(String(replacingType, radix: 16, uppercase: true)))"
             )
         }
 
@@ -4354,6 +4429,137 @@ public actor Volume {
             out[out.startIndex + newTailStart + i] = originalBytes[originalBytes.startIndex + tailStart + i]
         }
         return out
+    }
+
+    /// v0.5 Fix B Step 3: matches BOTH overflow throw substrings used by
+    /// `rewriteResidentAttribute` (Step A, $INDEX_ROOT) and
+    /// `rewriteEntireAttribute` (Steps B/C, $INDEX_ALLOCATION / $BITMAP).
+    /// The two helpers throw slightly different wording — we need to
+    /// recognise either when wiring the $ATTRIBUTE_LIST migration into
+    /// the leaf-split overflow catch sites.
+    @inline(__always)
+    fileprivate func isOverflowDescription(_ description: String) -> Bool {
+        description.contains("would overflow parent record")
+            || description.contains("would overflow record")
+    }
+
+    /// v0.5 Fix B Step 3: parse the `, type 0xHEX` suffix the two
+    /// overflow throw messages now carry. Returns nil if the suffix is
+    /// missing (older message format or a different throw site).
+    fileprivate func overflowingAttributeType(from description: String) -> UInt32? {
+        guard let range = description.range(of: ", type 0x") else { return nil }
+        let after = description[range.upperBound...]
+        // Hex digits run until the first non-hex char (typically ')' or end).
+        var hex = ""
+        for ch in after {
+            if ch.isHexDigit { hex.append(ch) } else { break }
+        }
+        return UInt32(hex, radix: 16)
+    }
+
+    /// v0.5 Fix B Step 3: migrate the file's `$INDEX_ALLOCATION:$I30`
+    /// attribute out of the base MFT record into a freshly-allocated
+    /// extension record and add a resident `$ATTRIBUTE_LIST` to the
+    /// base. This unblocks the v0.4 ~350-file directory cap by giving
+    /// `rewriteParentForLeafSplit` slack to grow the `$INDEX_ALLOCATION`
+    /// runlist (and the `$BITMAP:$I30` body) in place.
+    ///
+    /// Compute-first transactional: build BOTH the new base and new
+    /// extension bytes via `AttributeMigration.buildIndexAllocationMigration`
+    /// BEFORE the first `writeRawRecord`. The extension record is committed
+    /// FIRST so a crash leaves an orphan slot rather than a dangling
+    /// `$ATTRIBUTE_LIST` pointer; on any throw between `allocateMFTRecord`
+    /// and the final base commit, the extension slot is freed via
+    /// `reclaimOrphanedMFTRecord` and the error rethrown.
+    ///
+    /// `overflowDescription` is the error text that triggered the
+    /// migration; we parse its `, type 0xHEX` suffix to discriminate
+    /// which attribute overflowed. Only `$INDEX_ALLOCATION` (0xA0) is
+    /// supported in v0.5; other types throw `unsupportedFeature` so the
+    /// v0.4 cap holds for those.
+    internal func migrateIndexAllocationOnOverflow(
+        baseRecordNumber: UInt64,
+        overflowDescription: String
+    ) async throws {
+        let mft = self.mft()
+
+        // 1. Read the current base record so we can scan its attributes
+        //    and feed the migration builder. `record(at:)` returns the
+        //    post-fix-up bytes the builder expects.
+        let baseRecord = try await mft.record(at: baseRecordNumber)
+        let baseRecordBytes = baseRecord.bytes
+        let baseSeq = baseRecord.sequenceNumber
+
+        // 2. Discriminate which attribute overflowed.
+        //    Prefer the `, type 0xHEX` suffix the throw messages now
+        //    carry; fall back to assuming $INDEX_ALLOCATION since Step B
+        //    is the user-reported `cp -r` cap trigger.
+        let overflowingType: UInt32 = overflowingAttributeType(from: overflowDescription)
+            ?? AttributeType.indexAllocation.rawValue
+        guard overflowingType == AttributeType.indexAllocation.rawValue else {
+            throw NTFSError.unsupportedFeature(
+                description: "Fix B Step 3 migrate-X not yet implemented; attribute type 0x\(String(overflowingType, radix: 16, uppercase: true))"
+            )
+        }
+
+        // 3. Allocate a fresh extension MFT record. From here until the
+        //    final base commit, any throw must free this slot.
+        let extRN = try await allocateMFTRecord()
+
+        // The extension's sequence number follows the same recycling
+        // discipline as `createFile`: bump the existing slot's sequence,
+        // never zero.
+        var extSeq: UInt16 = 1
+        if let existing = try? await mft.record(at: extRN) {
+            extSeq = existing.sequenceNumber &+ 1
+            if extSeq == 0 { extSeq = 1 }
+        }
+
+        // 4. Pure compute step. If this throws (e.g. $ATTRIBUTE_LIST
+        //    won't fit resident in the base record's slack — the v0.5+
+        //    non-resident-$ATTRIBUTE_LIST cap), the extension slot must
+        //    be released.
+        let result: AttributeMigration.Result
+        do {
+            result = try AttributeMigration.buildIndexAllocationMigration(
+                baseRecordBytes: baseRecordBytes,
+                baseRN: baseRecordNumber,
+                baseSeq: baseSeq,
+                extRN: extRN,
+                extSeq: extSeq,
+                recordSize: Int(mftRecordSizeBytes),
+                sectorSize: Int(boot.bytesPerSector)
+            )
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: extRN)
+            throw error
+        }
+
+        // 5. Commit the extension record FIRST. A crash between this
+        //    and the base commit leaves an orphan extension slot — the
+        //    base record's existing $INDEX_ALLOCATION still points at
+        //    the original (untouched) clusters, so on next mount the
+        //    file is intact and `reclaim-orphans` can sweep the slot.
+        do {
+            try await mft.writeRawRecord(at: extRN, postFixupBytes: result.newExtBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: extRN)
+            throw error
+        }
+
+        // 6. Commit the new base record. If THIS fails after the
+        //    extension is on disk, free the extension slot — the base
+        //    still describes the original layout, so the extension is a
+        //    leak we can safely reclaim.
+        do {
+            try await mft.writeRawRecord(at: baseRecordNumber, postFixupBytes: result.newBaseBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: extRN)
+            throw error
+        }
+
+        // Drop any cached parses of the migrated base so callers re-read.
+        invalidateMFTCaches()
     }
 
     /// Roll back an MFT record allocation by flipping IN_USE off. Used both

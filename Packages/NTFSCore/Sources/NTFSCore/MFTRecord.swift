@@ -170,6 +170,93 @@ public struct MFTRecord: Equatable, Sendable {
         )
     }
 
+    /// Build a fresh post-fix-up extension MFT record holding only the
+    /// attribute(s) the caller is migrating out of a base record. The
+    /// caller is responsible for `UpdateSequenceArray.reverseFixup` (e.g.
+    /// via `MFT.writeRawRecord`) before this hits disk.
+    ///
+    /// `baseFileReference` is the packed `(baseSeq << 48) | (baseRN & 0x0000_FFFF_FFFF_FFFF)`
+    /// — see `AttributeMigration.packMFTReference`.
+    ///
+    /// `nextAttributeID` must be set high enough that any future attribute
+    /// added to this extension won't collide with the migrated attribute's
+    /// existing ID; passing `migrated.attributeID &+ 1` is the typical
+    /// choice.
+    public static func buildExtensionRecord(
+        recordNumber: UInt64,
+        sequenceNumber: UInt16,
+        baseFileReference: UInt64,
+        attributesBytes: Data,
+        nextAttributeID: UInt16,
+        recordSize: Int,
+        sectorSize: Int
+    ) throws -> Data {
+        guard recordSize >= 256, sectorSize > 2, recordSize % sectorSize == 0 else {
+            throw NTFSError.corruptOnDisk(
+                description: "buildExtensionRecord: invalid recordSize \(recordSize) / sectorSize \(sectorSize)"
+            )
+        }
+        guard baseFileReference != 0 else {
+            throw NTFSError.corruptOnDisk(
+                description: "buildExtensionRecord: baseFileReference must be non-zero for an extension record"
+            )
+        }
+
+        var data = Data(count: recordSize)
+
+        // USA at offset 48: 1 sentinel + N fix-ups (N = recordSize/sectorSize).
+        let usaOffset: UInt16 = 48
+        let fixupCount = recordSize / sectorSize
+        let usaCount = UInt16(1 + fixupCount)
+        // First attribute starts at the next 8-byte boundary after the USA.
+        let firstAttrOffset = UInt16(((Int(usaOffset) + Int(usaCount) * 2 + 7) / 8) * 8)
+
+        // Bounds: attributes + end marker must fit.
+        guard Int(firstAttrOffset) + attributesBytes.count + 4 <= recordSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "buildExtensionRecord: migrated attribute (\(attributesBytes.count) bytes) does not fit in extension record (\(recordSize))"
+            )
+        }
+
+        // Header.
+        Self.writeU32LE(into: &data, at: 0,  value: Self.magicFILE)
+        Self.writeU16LE(into: &data, at: 4,  value: usaOffset)
+        Self.writeU16LE(into: &data, at: 6,  value: usaCount)
+        Self.writeU64LE(into: &data, at: 8,  value: 0)                          // LSN
+        Self.writeU16LE(into: &data, at: 16, value: sequenceNumber)
+        Self.writeU16LE(into: &data, at: 18, value: 0)                          // hardLinkCount — extension records carry 0
+        Self.writeU16LE(into: &data, at: 20, value: firstAttrOffset)
+        // IN_USE only — NEVER set DIRECTORY on an extension record even if
+        // the base is a directory; directory-ness is a property of the base.
+        Self.writeU16LE(into: &data, at: 22, value: 0x0001)
+        // 24: usedSize — filled in after we know how much we consumed.
+        Self.writeU32LE(into: &data, at: 28, value: UInt32(recordSize))         // allocatedSize
+        Self.writeU64LE(into: &data, at: 32, value: baseFileReference)
+        Self.writeU16LE(into: &data, at: 40, value: nextAttributeID)
+        // 42: 2 bytes padding stay zero.
+        // 44: mftRecordNumber (NTFS 3.1+). Low 32 bits of the record number.
+        Self.writeU32LE(into: &data, at: 44, value: UInt32(recordNumber & 0xFFFF_FFFF))
+
+        // USA[0] sentinel = 1. reverseFixup will bump to 2 on first write;
+        // USA[1..N] are 0 here and will be populated from the (zero) block
+        // tails when reverseFixup runs.
+        Self.writeU16LE(into: &data, at: Int(usaOffset), value: 1)
+
+        // Splice the migrated attribute(s) into place.
+        for (i, byte) in attributesBytes.enumerated() {
+            data[data.startIndex + Int(firstAttrOffset) + i] = byte
+        }
+
+        // End marker.
+        let endMarkerPos = Int(firstAttrOffset) + attributesBytes.count
+        Self.writeU32LE(into: &data, at: endMarkerPos, value: 0xFFFF_FFFF)
+
+        // usedSize = bytes through and including the end marker.
+        Self.writeU32LE(into: &data, at: 24, value: UInt32(endMarkerPos + 4))
+
+        return data
+    }
+
     // MARK: — Little-endian writers (mirror of Endian.swift's readers)
 
     static func writeU16LE(into data: inout Data, at offset: Int, value: UInt16) {
