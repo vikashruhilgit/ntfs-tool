@@ -833,7 +833,7 @@ public actor Volume {
     ) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
 
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
@@ -988,7 +988,7 @@ public actor Volume {
     private func promoteDirectoryToLargeIndex(parentRecordNumber: UInt64) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
         }) else {
@@ -1353,7 +1353,7 @@ public actor Volume {
     ) async throws -> ComputedSplit {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
 
         // 5a) Build the new $INDEX_ROOT body.
         //
@@ -2847,7 +2847,7 @@ public actor Volume {
     ) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
 
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
@@ -3537,7 +3537,7 @@ public actor Volume {
             return
         }
         let parent = try await mft.record(at: parentRN)
-        let parentAttrs = try parent.attributes()
+        let parentAttrs = try await allAttributesOf(recordNumber: parentRN)
         guard let irAttr = parentAttrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
               case let .resident(rootBytes, _) = irAttr.value else {
             return
@@ -4708,7 +4708,7 @@ public actor Volume {
             )
         }
 
-        let attrs = try dirRecord.attributes()
+        let attrs = try await allAttributesOf(recordNumber: recordNumber)
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
         }) else {
