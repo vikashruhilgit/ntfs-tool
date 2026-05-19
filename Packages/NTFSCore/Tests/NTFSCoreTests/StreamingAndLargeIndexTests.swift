@@ -177,13 +177,6 @@ final class StreamingAndLargeIndexTests: XCTestCase {
     /// corruption.
     func testLeafSplitOrphansBugUnderCpRWorkload() async throws {
         guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
-        // Skipped pending v0.3 fix. This test reproduces the known leaf-
-        // split silent-orphan bug — entries created after the 4th split
-        // vanish on disk re-read. Remove the skip + run the test once
-        // the fix lands; it serves as the regression target. The split-
-        // time verifier in splitLeafAndPromote stays active for any
-        // accidental future regression to surface loudly.
-        throw XCTSkip("Known v0.2 leaf-split silent-orphan bug; tracked for v0.3. Remove skip + re-run when fix lands.")
         let path = try MutableFixture.scopedCopy("small.img", testCase: self)
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
@@ -197,6 +190,7 @@ final class StreamingAndLargeIndexTests: XCTestCase {
 
         var inserted: [(name: String, rn: UInt64)] = []
         let payload = Data("test content for split-orphan repro\n".utf8)
+        var firstLoss: (iter: Int, lostNames: [String])?
         for i in 0..<200 {
             let name = String(format: "cp-repro-%04d.txt", i)
             do {
@@ -206,7 +200,55 @@ final class StreamingAndLargeIndexTests: XCTestCase {
             } catch NTFSError.unsupportedFeature {
                 break
             }
+            // After EVERY iter: reopen fresh from disk + check every
+            // previously-inserted name. Capture the iter where loss
+            // first occurs, but keep going so we know the total damage.
+            // Per-iter LIVE check via active volume (no fd switching).
+            if firstLoss == nil {
+                let liveNamesNow = Set(try await volume.enumerate(directory: 5).map { $0.name })
+                let lost = inserted.map(\.name).filter { !liveNamesNow.contains($0) }
+                if !lost.isEmpty {
+                    firstLoss = (iter: i, lostNames: lost)
+                    FileHandle.standardError.write(Data(
+                        "[FIRST LOSS] iter=\(i) just-inserted=\(name) total-inserted=\(inserted.count) lost-count=\(lost.count) lost=\(lost.sorted())\n".utf8
+                    ))
+                }
+            }
         }
+        // First check via the SAME (still-open) volume — should see all.
+        let liveNames = Set(try await volume.enumerate(directory: 5).map { $0.name })
+        let liveMissing = inserted.map(\.name).filter { !liveNames.contains($0) }
+        FileHandle.standardError.write(Data("[end-of-loop] inserted=\(inserted.count) live_visible=\(liveNames.filter { $0.hasPrefix("cp-repro") }.count) live_missing=\(liveMissing.count)\n".utf8))
+
+        // Dump $INDEX_ALLOCATION state: how many leaves, what each contains.
+        let mft = await volume.mft()
+        let parent = try await mft.record(at: 5)
+        let parentAttrs = try parent.attributes()
+        if let allocAttr = parentAttrs.first(where: { $0.type == .indexAllocation && $0.nameOrEmpty == "$I30" }),
+           case let .nonResident(_, _, _, _, _, _, _, extents) = allocAttr.value {
+            FileHandle.standardError.write(Data("[$INDEX_ALLOCATION] extents=\(extents.map { "(LCN=\($0.startLCN ?? 0), clusters=\($0.clusterCount))" })\n".utf8))
+            // Walk each LEAF independently and report its first/last names.
+            let clusterBytes = UInt64(volume.bytesPerCluster)
+            let blockSize = Int(volume.indexRecordSizeBytes)
+            let sectorSize = Int(volume.boot.bytesPerSector)
+            var vcnCursor: UInt64 = 0
+            for extent in extents {
+                guard let startLCN = extent.startLCN else { continue }
+                for c in 0..<extent.clusterCount {
+                    let vcn = vcnCursor + c
+                    let lcn = startLCN + c
+                    let raw = try await volume.device.read(offset: lcn * clusterBytes, length: blockSize)
+                    if let block = try? IndexAllocationBlock.parse(raw, sectorSize: sectorSize) {
+                        let names = block.entries.compactMap { $0.fileName?.name }.filter { $0.hasPrefix("cp-repro") }.sorted()
+                        FileHandle.standardError.write(Data("[leaf VCN=\(vcn) LCN=\(lcn)] entries=\(block.entries.count) cp-repro-count=\(names.count) first=\(names.first ?? "-") last=\(names.last ?? "-")\n".utf8))
+                    } else {
+                        FileHandle.standardError.write(Data("[leaf VCN=\(vcn) LCN=\(lcn)] PARSE FAILED\n".utf8))
+                    }
+                }
+                vcnCursor += extent.clusterCount
+            }
+        }
+
         // Final reopen check: reopen the fixture from disk and verify
         // every inserted name is visible. The split-time verifier guards
         // each split's atomicity; this guards the END state.
@@ -214,6 +256,7 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         let finalReopen = try await Volume(device: finalReader)
         let finalNames = Set(try await finalReopen.enumerate(directory: 5).map { $0.name })
         let stillMissing = inserted.map(\.name).filter { !finalNames.contains($0) }
+        FileHandle.standardError.write(Data("[final-reopen] inserted=\(inserted.count) reopen_visible=\(finalNames.filter { $0.hasPrefix("cp-repro") }.count) reopen_missing=\(stillMissing.count)\n".utf8))
         // Known v0.2 bug: after the 4th leaf split (around insert 75),
         // entries from the 4th leaf's range silently vanish on disk.
         // Tracked in STATUS.md as v0.3 work; this test serves as the
@@ -221,6 +264,331 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         XCTAssertTrue(
             stillMissing.isEmpty,
             "Known v0.2 leaf-split silent-orphan bug: \(stillMissing.count) entries missing on disk after \(inserted.count) cp-style inserts. Missing: \(stillMissing.prefix(5).joined(separator: ", "))\(stillMissing.count > 5 ? "..." : "")"
+        )
+
+        // v0.3 orphan-detection assertion: mirror `ntfsctl verify`'s full
+        // reachability walk from root. Any user MFT record with IN_USE=1
+        // that isn't reachable from root → orphan → createFile failed to
+        // clean up after a downstream throw.
+        let finalMFT = await finalReopen.mft()
+        var inUseUserRecords: Set<UInt64> = []
+        let maxRecNum: UInt64 = 256
+        for rn in 0..<maxRecNum {
+            guard let rec = try? await finalMFT.record(at: rn) else { continue }
+            guard rec.isInUse else { continue }
+            if rn >= 16 { inUseUserRecords.insert(rn) }
+        }
+        var reachable: Set<UInt64> = [5]
+        var queue: [UInt64] = [5]
+        while let dirRN = queue.popLast() {
+            guard let entries = try? await finalReopen.enumerate(directory: dirRN) else { continue }
+            for e in entries where e.fileName.namespace != .dos {
+                if !reachable.contains(e.recordNumber) {
+                    reachable.insert(e.recordNumber)
+                    if e.isDirectory {
+                        queue.append(e.recordNumber)
+                    }
+                }
+            }
+        }
+        let reachableUser = reachable.filter { $0 >= 16 }
+        let orphans = inUseUserRecords.subtracting(reachableUser)
+        FileHandle.standardError.write(Data(
+            "[orphan-check] in_use_user=\(inUseUserRecords.count) reachable_user=\(reachableUser.count) inserted=\(inserted.count) orphans=\(orphans.count) orphan_recnums=\(orphans.sorted().prefix(20))\n".utf8
+        ))
+        XCTAssertTrue(
+            orphans.isEmpty,
+            "createFile orphan-rollback bug: \(orphans.count) MFT slots IN_USE=1 but unreachable. Recnums: \(orphans.sorted().prefix(10))"
+        )
+    }
+
+    /// v0.4 Phase 1: bulk-insert mode skips per-file refreshParentI30Size.
+    /// Wrap a batch of file inserts in beginBulkInsert / endBulkInsert and
+    /// confirm every write that would have triggered a size-hint refresh
+    /// is counted as skipped. This is the perf foundation for cp -r: the
+    /// 22k-file phone-backup workload was paying one INDX-block rewrite per
+    /// file write just to update Windows Explorer's "Size" column.
+    func testBulkInsertSkipsSizeHintRefresh() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(8)
+
+        // Before bulk insert: skip-count starts at zero.
+        let initialSkipped = await volume.bulkInsertSkippedRefreshCount()
+        XCTAssertEqual(initialSkipped, 0)
+
+        // Open bulk-insert window targeting root (recnum 5). The same parent
+        // recnum cp -r uses when copying into the root of a fresh dir.
+        try await volume.beginBulkInsert(into: 5)
+
+        // Insert + write 25 files. Each write would normally trigger one
+        // refreshParentI30Size; with bulk insert active each becomes a
+        // no-op + counter bump.
+        let payload = Data("phase1 bulk insert\n".utf8)
+        for i in 0..<25 {
+            let name = String(format: "bulk-%04d.txt", i)
+            let rn = try await volume.createFile(named: name, inDirectory: 5)
+            try await volume.write(at: rn, offset: 0, bytes: payload)
+        }
+
+        let skipped = try await volume.endBulkInsert()
+        XCTAssertEqual(
+            skipped, 25,
+            "Expected 25 skipped size-hint refreshes during bulk insert (one per write); got \(skipped)"
+        )
+
+        // After endBulkInsert, the counter resets and subsequent writes
+        // resume their normal (refreshing) behavior.
+        let postSkipped = await volume.bulkInsertSkippedRefreshCount()
+        XCTAssertEqual(postSkipped, 0)
+        let rn = try await volume.createFile(named: "post-bulk.txt", inDirectory: 5)
+        try await volume.write(at: rn, offset: 0, bytes: payload)
+        let postSkipped2 = await volume.bulkInsertSkippedRefreshCount()
+        XCTAssertEqual(
+            postSkipped2, 0,
+            "After endBulkInsert, subsequent writes should NOT increment the skip counter"
+        )
+
+        // Sanity: nested bulk insert is rejected.
+        try await volume.beginBulkInsert(into: 5)
+        do {
+            try await volume.beginBulkInsert(into: 5)
+            XCTFail("Expected nested beginBulkInsert to throw")
+        } catch NTFSError.unsupportedFeature {
+            // expected
+        }
+        _ = try await volume.endBulkInsert()
+
+        // All 25 inserted files must still be reachable + readable — the
+        // optimization is purely about deferring cosmetic size hints, not
+        // skipping any actual content writes.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let names = Set(try await reopen.enumerate(directory: 5).map { $0.name })
+        for i in 0..<25 {
+            let n = String(format: "bulk-%04d.txt", i)
+            XCTAssertTrue(names.contains(n), "bulk-inserted file \(n) missing from reopen")
+        }
+    }
+
+    /// v0.4 Phase 3(A)+(B)+(C): tree-growth lifts the ~60-file/dir cap.
+    /// Asserts inserts continue successfully past every cap level: 60
+    /// (v0.3 root-overflow), ~120 (Phase 3(A) height-grow), ~3000-5000
+    /// (Phase 3(B)+(C) intermediate-fits + interior-block split).
+    func testHeightGrowIndexRootLiftsLeafSplitCap() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        // Grow MFT $DATA aggressively so the test exercises the index
+        // algorithm's cap, not the MFT-slot cap. The small fixture is
+        // 4 MiB total — we can't grow much more than this without
+        // running out of free clusters.
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+
+        // Insert as many files as the index algorithm allows before
+        // hitting Phase 3(D) (root-overflow on cascaded depth-N tree)
+        // — which we don't expect to fire on this fixture.
+        var inserted = 0
+        var lastError: String?
+        for i in 0..<3000 {
+            let name = String(format: "heightgrow-%04d.txt", i)
+            do {
+                _ = try await volume.createFile(named: name, inDirectory: 5)
+                inserted += 1
+            } catch NTFSError.unsupportedFeature(let desc) {
+                lastError = "unsupportedFeature: \(desc)"
+                break
+            } catch NTFSError.outOfSpace {
+                lastError = "outOfSpace"
+                break
+            } catch {
+                lastError = "\(error)"
+                break
+            }
+        }
+
+        FileHandle.standardError.write(Data("[heightgrow] inserted=\(inserted) lastError=\(lastError ?? "nil")\n".utf8))
+        XCTAssertGreaterThan(
+            inserted, 75,
+            "v0.4 tree-growth should lift the leaf-split cap past v0.3's ~75 ceiling. Got \(inserted)."
+        )
+
+        // Correctness backstop: every inserted name must be reachable +
+        // no orphans after reopen.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let names = Set(try await reopen.enumerate(directory: 5).map { $0.name })
+        for i in 0..<inserted {
+            let n = String(format: "heightgrow-%04d.txt", i)
+            XCTAssertTrue(names.contains(n), "lost entry '\(n)' after height-grow + reopen")
+        }
+
+        // Walk reachability vs IN_USE: zero orphans even with the deeper tree.
+        let mft = await reopen.mft()
+        var inUseUser: Set<UInt64> = []
+        for rn: UInt64 in 0..<256 {
+            guard let rec = try? await mft.record(at: rn) else { continue }
+            if rec.isInUse, rn >= 16 { inUseUser.insert(rn) }
+        }
+        var reachable: Set<UInt64> = [5]
+        var queue: [UInt64] = [5]
+        while let dir = queue.popLast() {
+            guard let entries = try? await reopen.enumerate(directory: dir) else { continue }
+            for e in entries where e.fileName.namespace != .dos {
+                if !reachable.contains(e.recordNumber) {
+                    reachable.insert(e.recordNumber)
+                    if e.isDirectory { queue.append(e.recordNumber) }
+                }
+            }
+        }
+        let orphans = inUseUser.subtracting(reachable.filter { $0 >= 16 })
+        XCTAssertTrue(
+            orphans.isEmpty,
+            "Phase 3(A) orphan check: \(orphans.count) MFT slots IN_USE=1 but unreachable. Recnums: \(orphans.sorted().prefix(10))"
+        )
+    }
+
+    /// v0.4 Phase 2: INDX-leaf coalescing during bulk insert. When N
+    /// consecutive inserts land in the same LARGE_INDEX leaf, the per-file
+    /// 4 KiB INDX-block rewrite should collapse into one final flush at
+    /// endBulkInsert. Asserts via cache-hit counter + dirty-leaves-flushed
+    /// counter that the cache actually did work — not just shipped no-ops.
+    func testBulkInsertCoalescesLeafWrites() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(8)
+
+        // Prime root to LARGE_INDEX shape: insert just enough files (outside
+        // bulk mode) to force SMALL→LARGE promotion + populate the first
+        // leaf. After this the dir is LARGE_INDEX with one leaf and plenty
+        // of slack, so the subsequent bulk-insert burst exercises the cache
+        // path cleanly without tripping into a leaf-split.
+        for i in 0..<8 {
+            let n = String(format: "prime-%04d.txt", i)
+            _ = try await volume.createFile(named: n, inDirectory: 5)
+        }
+
+        // Open a bulk-insert window. Pick a count low enough that no split
+        // fires (~15 entries comfortably fit in one fresh-promoted leaf
+        // alongside the 8 prime entries + baseline fixture entries).
+        try await volume.beginBulkInsert(into: 5)
+        let nInserts = 15
+        let payload = Data("phase2 coalescing\n".utf8)
+        for i in 0..<nInserts {
+            let n = String(format: "coalesce-%04d.txt", i)
+            let rn = try await volume.createFile(named: n, inDirectory: 5)
+            try await volume.write(at: rn, offset: 0, bytes: payload)
+        }
+        _ = try await volume.endBulkInsert()
+        let hits = await volume.bulkInsertLeafCacheHits()
+        let dirtyFlushed = await volume.bulkInsertDirtyLeavesFlushed()
+
+        FileHandle.standardError.write(Data(
+            "[phase2] inserts=\(nInserts) cache_hits=\(hits) dirty_leaves_flushed=\(dirtyFlushed)\n".utf8
+        ))
+
+        // Expected: nInserts inserts. First lookup is a cache MISS (seeds
+        // the cache). Subsequent inserts are cache HITS. So hits should be
+        // at least (nInserts - 1). If a split fires unexpectedly each
+        // split costs one extra miss; tolerate up to 2 splits worth of
+        // extra misses for fixture variance.
+        XCTAssertGreaterThanOrEqual(
+            hits, nInserts - 3,
+            "Expected ≥\(nInserts - 3) cache hits across \(nInserts) same-leaf inserts; got \(hits). Cache is not being consulted on subsequent inserts."
+        )
+        // One dirty leaf must flush at endBulkInsert (assuming no split,
+        // which would flush mid-stream and reset). Tolerate up to 3 for
+        // variance with splits.
+        XCTAssertGreaterThanOrEqual(
+            dirtyFlushed, 1,
+            "Expected ≥1 dirty leaf flushed at endBulkInsert; got \(dirtyFlushed). Cache may not be marking writes dirty."
+        )
+
+        // Correctness backstop: every inserted entry must be reachable
+        // after a fresh reopen — no orphans, no stale on-disk state.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let names = Set(try await reopen.enumerate(directory: 5).map { $0.name })
+        for i in 0..<nInserts {
+            let n = String(format: "coalesce-%04d.txt", i)
+            XCTAssertTrue(
+                names.contains(n),
+                "Phase 2 coalesced insert lost entry '\(n)' — cache didn't flush correctly"
+            )
+        }
+    }
+
+    /// v0.3 hardware-shape repro: mimic `cp -r` of a deeply-nested source
+    /// tree (a parent dir + many child files all under it, plus a sibling
+    /// dir + a deeper subdir). The user's 22,419-file phone backup workload
+    /// failed with 11 orphans on real hardware; this test exercises the same
+    /// shape — directory creates interleaved with file inserts that span
+    /// multiple leaf splits — and asserts the orphan rollback holds.
+    func testCpRecursiveNestedDirsOrphanFreeUnderPressure() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(8)
+        try await volume.growMFTDataByClusters(8)
+
+        // Step 1: create a destination "gallery" dir at root.
+        let galleryRN = try await volume.createFile(named: "gallery", inDirectory: 5, isDirectory: true)
+        // Step 2: under gallery, create a subdir "backup" that we will then
+        //         fill with many files (mirrors cp -r's "fill one dir until
+        //         it splits" pattern).
+        let backupRN = try await volume.createFile(named: "backup", inDirectory: galleryRN, isDirectory: true)
+
+        // Step 3: pour files into backup/ until something fails.
+        var insertedFiles: [String] = []
+        let payload = Data("hi\n".utf8)
+        for i in 0..<300 {
+            let name = String(format: "file-%04d.dat", i)
+            do {
+                let rn = try await volume.createFile(named: name, inDirectory: backupRN)
+                try await volume.write(at: rn, offset: 0, bytes: payload)
+                insertedFiles.append(name)
+            } catch NTFSError.unsupportedFeature {
+                break
+            }
+        }
+
+        // Step 4: reopen + walk reachability vs IN_USE, exactly like
+        //         `ntfsctl verify` does.
+        let reader = try FileHandleBlockDevice(openingFileAt: path)
+        let reopen = try await Volume(device: reader)
+        let mft = await reopen.mft()
+
+        var inUseUser: Set<UInt64> = []
+        for rn: UInt64 in 0..<256 {
+            guard let rec = try? await mft.record(at: rn) else { continue }
+            if rec.isInUse, rn >= 16 { inUseUser.insert(rn) }
+        }
+
+        var reachable: Set<UInt64> = [5]
+        var queue: [UInt64] = [5]
+        while let dir = queue.popLast() {
+            guard let entries = try? await reopen.enumerate(directory: dir) else { continue }
+            for e in entries where e.fileName.namespace != .dos {
+                if !reachable.contains(e.recordNumber) {
+                    reachable.insert(e.recordNumber)
+                    if e.isDirectory { queue.append(e.recordNumber) }
+                }
+            }
+        }
+        let reachableUser = reachable.filter { $0 >= 16 }
+        let orphans = inUseUser.subtracting(reachableUser)
+        FileHandle.standardError.write(Data(
+            "[nested-cp] inserted_files=\(insertedFiles.count) in_use_user=\(inUseUser.count) reachable_user=\(reachableUser.count) orphans=\(orphans.count) orphan_recnums=\(orphans.sorted().prefix(20))\n".utf8
+        ))
+        XCTAssertTrue(
+            orphans.isEmpty,
+            "Nested cp -r orphan-rollback: \(orphans.count) orphans after \(insertedFiles.count) successful file inserts into a 2-deep subdir. Recnums: \(orphans.sorted().prefix(10))"
         )
     }
 

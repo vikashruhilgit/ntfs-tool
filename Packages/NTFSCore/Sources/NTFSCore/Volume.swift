@@ -17,6 +17,27 @@ public actor Volume {
 
     private var _mft: MFT?
 
+    // v0.4 Phase 1: bulk-insert mode. When set, refreshParentI30Size becomes
+    // a no-op for files whose parent matches `_bulkInsertParentRN`. cp -r
+    // wraps each destination dir's batch of file inserts in beginBulkInsert
+    // / endBulkInsert so the per-file size-hint refresh (which re-reads +
+    // recomputes + rewrites the parent's $I30 entry, a ~4 KiB INDX-block
+    // write each time on LARGE_INDEX dirs) is skipped. Size hints in $I30
+    // are cosmetic (Windows Explorer file-size column); files are byte-
+    // correct without them. Run `ntfsctl refresh-sizes` later if you care.
+    private var _bulkInsertParentRN: UInt64?
+    private var _bulkInsertSkippedRefreshCount: Int = 0
+    // v0.4 Phase 2: INDX-leaf coalescing. While in bulk-insert mode, leaf
+    // modifications are held in memory and flushed to disk in a single
+    // pass at `endBulkInsert`. For cp -r, where 50+ consecutive files
+    // land in the same leaf, this collapses 50 leaf-rewrites (~4 KiB
+    // each) into one final write.
+    private var _bulkInsertLeafCache: BulkLeafCache?
+    // Counters snapshotted into the actor at `endBulkInsert` so tests
+    // can read them after the cache reference has been cleared.
+    private var _bulkInsertLastCacheHits: Int = 0
+    private var _bulkInsertLastDirtyLeavesFlushed: Int = 0
+
     public init(device: any BlockDevice) async throws {
         self.device = device
 
@@ -53,6 +74,70 @@ public actor Volume {
         let mft = MFT(volume: self)
         _mft = mft
         return mft
+    }
+
+    // v0.5 Fix B Step 2(A): $ATTRIBUTE_LIST-aware attribute lookup. When a
+    // base MFT record's attributes overflow into extension records, the base
+    // carries a $ATTRIBUTE_LIST (0x20) pointing at the extension recnums.
+    // resolveAttribute / allAttributesOf walk that list and concatenate the
+    // base + extension attributes so callers can find
+    // $INDEX_ROOT / $INDEX_ALLOCATION / $BITMAP:$I30 even when they've
+    // migrated out of the base. When $ATTRIBUTE_LIST is absent these
+    // helpers behave identically to `record.attributes()` — read paths
+    // that worked pre-Fix-B keep working.
+
+    public func allAttributesOf(recordNumber: UInt64) async throws -> [Attribute] {
+        let mft = self.mft()
+        let base = try await mft.record(at: recordNumber)
+        let baseAttrs = try base.attributes()
+        guard let attrListAttr = baseAttrs.first(where: { $0.rawType == AttributeType.attributeList.rawValue }) else {
+            return baseAttrs
+        }
+        let body: Data
+        switch attrListAttr.value {
+        case let .resident(b, _):
+            body = b
+        case let .nonResident(_, _, _, _, _, realSize, _, extents):
+            body = try await readNonResidentData(
+                extents: extents,
+                realSize: realSize,
+                lastVCN: 0
+            )
+        }
+        let entries = try AttributeListEntry.parseAll(in: body)
+        var seenExt: Set<UInt64> = []
+        var extAttrs: [Attribute] = []
+        for e in entries {
+            let rn = e.recordNumber
+            if rn == recordNumber { continue }
+            if seenExt.contains(rn) { continue }
+            seenExt.insert(rn)
+            let extRec = try await mft.record(at: rn)
+            // Defence in depth: an $ATTRIBUTE_LIST entry whose sequenceNumber
+            // doesn't match the resolved extension record's sequenceNumber
+            // means we're following a stale pointer at a recycled MFT slot.
+            // Better to fail loud than silently read the wrong file's data.
+            guard extRec.sequenceNumber == e.sequenceNumber else {
+                throw NTFSError.corruptOnDisk(
+                    description: "ATTR_LIST entry recnum \(rn) seq \(e.sequenceNumber) != record seq \(extRec.sequenceNumber) (base recnum \(recordNumber))"
+                )
+            }
+            extAttrs.append(contentsOf: try extRec.attributes())
+        }
+        return baseAttrs + extAttrs
+    }
+
+    public func resolveAttribute(
+        recordNumber: UInt64,
+        type: AttributeType,
+        name: String?
+    ) async throws -> Attribute? {
+        let all = try await allAttributesOf(recordNumber: recordNumber)
+        return all.first { a in
+            guard a.rawType == type.rawValue else { return false }
+            if let n = name { return a.nameOrEmpty == n }
+            return true
+        }
     }
 
     /// MFT record number of the $Bitmap system file. Always 6 on every NTFS
@@ -737,7 +822,7 @@ public actor Volume {
             )
         } catch {
             // Roll back the orphan record so the volume stays consistent.
-            try? await deleteOrphan(at: recordNumber)
+            try? await reclaimOrphanedMFTRecord(at: recordNumber)
             throw error
         }
 
@@ -758,7 +843,7 @@ public actor Volume {
     ) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
 
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
@@ -802,7 +887,8 @@ public actor Volume {
                 device: device,
                 newSortKey: childFileName,
                 newEntryFileRef: childRef,
-                newEntryBody: childBody
+                newEntryBody: childBody,
+                leafCache: _bulkInsertLeafCache
             )
             switch outcome {
             case .inserted:
@@ -912,7 +998,7 @@ public actor Volume {
     private func promoteDirectoryToLargeIndex(parentRecordNumber: UInt64) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
         }) else {
@@ -1126,7 +1212,39 @@ public actor Volume {
             }
         }
 
-        // 3. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
+        // 3. Pre-flight: compute the new parent MFT record bytes IN MEMORY
+        //    before mutating any disk state. This is where the v0.3
+        //    silent-orphan bug used to live — `rewriteIndexRootForSplit`
+        //    threw "would overflow parent record" AFTER the LEFT/RIGHT leaf
+        //    writes had already mutated disk, leaving the original leaf
+        //    half-rewritten and the new cluster unreachable. By moving the
+        //    in-memory build (and its overflow check) ahead of the leaf
+        //    writes, an overflow now aborts cleanly: only the freshly
+        //    allocated cluster has been touched, and we free it below.
+        let computed: ComputedSplit
+        do {
+            computed = try await computeParentRecordBytesForSplit(
+                parentRecordNumber: parentRecordNumber,
+                indexRoot: indexRoot,
+                rootBytes: rootBytes,
+                splitLeafVCN: leafVCN,
+                newLeafVCN: newVCN,
+                medianEntry: median,
+                allocationExtents: allocationExtents,
+                newExtent: newExtent
+            )
+        } catch {
+            // Compute step failed (out-of-space allocating intermediates,
+            // or some other unrecoverable error). Release the leaf cluster
+            // we provisionally allocated — disk is otherwise pristine.
+            // height-grow path's intermediate allocations are freed inside
+            // computeParentRecordBytesForSplit on its own throw.
+            try? await freeClusters(newExtent)
+            throw error
+        }
+        let newParentRecordBytes = computed.parentRecordBytes
+
+        // 4. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
         let blockSize = Int(indexRecordSizeBytes)
         let sectorSize = Int(boot.bytesPerSector)
         let originalLeafRaw = try await device.read(offset: leafByteOffset, length: blockSize)
@@ -1149,7 +1267,7 @@ public actor Volume {
         )
         try await device.write(offset: leafByteOffset, bytes: leftOnDisk)
 
-        // 4. Build the RIGHT leaf at the new VCN — fresh block with rightEntries.
+        // 5. Build the RIGHT leaf at the new VCN — fresh block with rightEntries.
         let rightBlock = try buildEmptyIndxBlock(
             blockSize: blockSize,
             sectorSize: sectorSize,
@@ -1164,22 +1282,28 @@ public actor Volume {
         )
         try await device.write(offset: newLCN * clusterBytes, bytes: rightOnDisk)
 
-        // 5. Rebuild $INDEX_ROOT with the median promoted as an interior entry.
-        //    Existing $INDEX_ROOT interior entries are preserved; we insert
-        //    a new interior entry for `median` pointing at the LEFT leaf (the
-        //    original leaf, which now holds the smaller half), and the LAST
-        //    sentinel either retains its existing target or gets retargeted
-        //    to the RIGHT leaf depending on which leaf was just split.
-        try await rewriteIndexRootForSplit(
-            parentRecordNumber: parentRecordNumber,
-            indexRoot: indexRoot,
-            rootBytes: rootBytes,
-            splitLeafVCN: leafVCN,
-            newLeafVCN: newVCN,
-            medianEntry: median,
-            allocationExtents: allocationExtents,
-            newExtent: newExtent
-        )
+        // 6. (v0.4 Phase 3(A)) If height-grow fired, write the new
+        //    intermediate INDX blocks BEFORE committing the parent record.
+        //    Order matters: the parent record's new $INDEX_ROOT will point
+        //    at these intermediates, so they must exist on disk first or a
+        //    crash between writes would orphan dependent references.
+        for intermediate in computed.intermediates {
+            try await device.write(
+                offset: intermediate.byteOffset,
+                bytes: intermediate.postFixupBytes
+            )
+        }
+
+        // 7. Commit the precomputed parent MFT record (overflow already
+        //    ruled out in step 3, possibly after a height-grow). This
+        //    finalizes the split atomically from the tree-shape
+        //    perspective.
+        let mft = self.mft()
+        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParentRecordBytes)
+        // Self-check: re-read + re-parse + walk attributes. Any malformation
+        // surfaces here with a precise location rather than as a later
+        // mysterious USA-fixup mismatch in the next descent.
+        try await verifyParentRecord(parentRecordNumber, context: "after split of leaf VCN \(leafVCN)")
 
         // T1.2 deep verification: walk the tree post-split and compare to
         // the pre-split snapshot. After exactly one split that promoted
@@ -1199,9 +1323,35 @@ public actor Volume {
         }
     }
 
-    /// Update the parent's $INDEX_ROOT after a leaf split, AND its
-    /// $INDEX_ALLOCATION runlist + $BITMAP to cover the new leaf block.
-    private func rewriteIndexRootForSplit(
+    /// v0.4 Phase 3(A): result of `computeParentRecordBytesForSplit`. The
+    /// common case has `intermediates` empty + `extraClustersAllocated`
+    /// empty. The height-grow case has 2 intermediate INDX blocks the
+    /// caller must write to disk BEFORE the parent record write, plus
+    /// the 2 extra cluster extents (caller frees these on failure).
+    private struct ComputedSplit {
+        let parentRecordBytes: Data
+        /// Each entry: (byteOffset on disk, post-USA-fixup bytes to write).
+        /// Empty when no height-grow occurred.
+        let intermediates: [(byteOffset: UInt64, postFixupBytes: Data)]
+        /// Extra cluster extents allocated DURING this compute (beyond the
+        /// caller's primary leaf cluster). Caller must free on any
+        /// failure between compute and parent-record commit.
+        let extraClustersAllocated: [Extent]
+    }
+
+    /// Build the new MFT record bytes that would result from updating the
+    /// parent's $INDEX_ROOT after a leaf split, AND its $INDEX_ALLOCATION
+    /// runlist + $BITMAP to cover the new leaf block.
+    ///
+    /// **Pure compute — never mutates disk EXCEPT for allocating clusters
+    /// (which mutate the volume `$Bitmap`). Allocations are returned in
+    /// `extraClustersAllocated` so callers can roll them back on failure.**
+    ///
+    /// Throws only on unrecoverable error (corrupted on-disk shape, out of
+    /// space). The v0.3 silent-orphan trigger ($INDEX_ROOT overflow on
+    /// median promotion) is handled internally by height-growing the tree
+    /// into 2 intermediate INDX blocks — caller doesn't see the throw.
+    private func computeParentRecordBytesForSplit(
         parentRecordNumber: UInt64,
         indexRoot: IndexRoot,
         rootBytes: Data,
@@ -1210,10 +1360,10 @@ public actor Volume {
         medianEntry: (fileRef: UInt64, body: Data, sortKey: String),
         allocationExtents: [Extent],
         newExtent: Extent
-    ) async throws {
+    ) async throws -> ComputedSplit {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
 
         // 5a) Build the new $INDEX_ROOT body.
         //
@@ -1298,9 +1448,25 @@ public actor Volume {
                 spliced = true
             }
         }
-        guard spliced else {
-            throw NTFSError.corruptOnDisk(
-                description: "splitLeaf: split leaf VCN \(splitLeafVCN) not found among parent's subnode pointers"
+        if !spliced {
+            // v0.4 Phase 3(B): splitLeafVCN isn't a direct child of
+            // $INDEX_ROOT — the tree is depth ≥ 3 after a prior height-
+            // grow. Find the leaf's direct parent (an intermediate INDX
+            // block) and promote the new (median, newLeafVCN) into THAT
+            // block. If the intermediate fits, we just rewrite it; if
+            // overflowing, the intermediate must split too (cascade up).
+            return try await promoteThroughInteriorChain(
+                parent: parent,
+                attrs: attrs,
+                indexRoot: indexRoot,
+                rootInterior: interior,
+                rootLastSubnodeVCN: lastSubnodeVCN,
+                rootBytes: rootBytes,
+                allocationExtents: allocationExtents,
+                primaryNewExtent: newExtent,
+                splitLeafVCN: splitLeafVCN,
+                newLeafVCN: newLeafVCN,
+                medianEntry: medianEntry
             )
         }
 
@@ -1348,26 +1514,751 @@ public actor Volume {
         )
 
         // 5e) Rebuild the parent MFT record with all three updates.
-        let newRecordBytes = try rewriteParentForLeafSplit(
-            parent: parent,
-            newRootBody: newRootBody,
-            newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
-            newBitmapAttrBytes: updatedBitmapAttrBytes
+        //     If the new $INDEX_ROOT body (with the just-promoted median
+        //     interior entry) no longer fits in the parent record's slack,
+        //     `rewriteParentForLeafSplit` throws "would overflow parent
+        //     record". In v0.3 this aborted the operation cleanly; in
+        //     v0.4 Phase 3(A) we recover via $INDEX_ROOT height-grow.
+        do {
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newRootBody,
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: [],
+                extraClustersAllocated: []
+            )
+        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+            // v0.4 Phase 3(A): height-grow $INDEX_ROOT.
+            //
+            // Bisect newInterior into two halves around a new median; move
+            // each half into a fresh interior INDX block; replace $INDEX_ROOT
+            // with a tiny new root containing just (newMedian → leftInter)
+            // + LAST → rightInter. New cap: ~3-6k files/dir, up from ~60.
+            return try await heightGrowIndexRoot(
+                parent: parent,
+                attrs: attrs,
+                indexRoot: indexRoot,
+                newInterior: newInterior,
+                newLastVCN: newLastVCN,
+                allocationExtents: allocationExtents,
+                primaryNewExtent: newExtent,
+                newLeafVCN: newLeafVCN
+            )
+        }
+    }
+
+    /// v0.4 Phase 3(A): height-grow $INDEX_ROOT into a 2-level interior tree.
+    ///
+    /// Allocates 2 new clusters for left/right intermediate interior INDX
+    /// blocks, bisects `newInterior` around its midpoint, and replaces the
+    /// parent's $INDEX_ROOT with a tiny new root: 1 interior entry pointing
+    /// at the left intermediate + LAST sentinel pointing at the right.
+    ///
+    /// Returns a `ComputedSplit` carrying:
+    /// - new parent record bytes (much smaller $INDEX_ROOT now fits cleanly)
+    /// - the 2 intermediate blocks (caller writes BEFORE the parent record)
+    /// - the 2 extra cluster extents (caller frees on commit failure)
+    ///
+    /// Cluster allocations happen here; on any thrown error the caller's
+    /// outer rollback frees them along with the primary leaf extent.
+    private func heightGrowIndexRoot(
+        parent: MFTRecord,
+        attrs: [Attribute],
+        indexRoot: IndexRoot,
+        newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        newLastVCN: UInt64,
+        allocationExtents: [Extent],
+        primaryNewExtent: Extent,
+        newLeafVCN: UInt64,
+        // v0.4 Phase 3(D): additional context for cascade-driven height-grow.
+        // These represent state ALREADY accumulated by an in-flight cascade
+        // (interior splits up the chain that ran before reaching root). The
+        // simple direct-from-leaf height-grow path leaves them empty.
+        cascadeAccumulatedExtents: [Extent] = [],
+        cascadeBitmapVCNs: [UInt64] = []
+    ) async throws -> ComputedSplit {
+        guard newInterior.count >= 2 else {
+            // Height-grow can't help — $INDEX_ROOT has only 0 or 1 interior
+            // entries. The overflow must be a different cause (e.g., other
+            // attributes consuming the record). Re-throw the original error.
+            throw NTFSError.unsupportedFeature(
+                description: "heightGrowIndexRoot: too few interior entries (\(newInterior.count)) to bisect — parent record overflow is not caused by $INDEX_ROOT growth"
+            )
+        }
+
+        let medianIdx = newInterior.count / 2
+        let medianEntry = newInterior[medianIdx]
+        let leftEntries = Array(newInterior[0..<medianIdx])
+        let rightEntries = Array(newInterior[(medianIdx + 1)..<newInterior.count])
+        // The left intermediate's LAST sentinel points at where the median's
+        // subnode used to live (subtree to the LEFT of the median key).
+        let leftIntermediateLastVCN = medianEntry.subnodeVCN
+        // The right intermediate's LAST sentinel inherits the original
+        // $INDEX_ROOT's LAST → newLastVCN target.
+        let rightIntermediateLastVCN = newLastVCN
+
+        // Allocate 2 new clusters. The primary leaf extent is independent;
+        // it's already in `primaryNewExtent`. Track our extra allocations
+        // so the caller can free them on commit failure.
+        let leftInterExtent = try await allocateClusters(1)
+        let rightInterExtent: Extent
+        do {
+            rightInterExtent = try await allocateClusters(1)
+        } catch {
+            try? await freeClusters(leftInterExtent)
+            throw error
+        }
+        var extraClusters = [leftInterExtent, rightInterExtent]
+
+        guard let leftInterLCN = leftInterExtent.startLCN,
+              let rightInterLCN = rightInterExtent.startLCN else {
+            for ext in extraClusters { try? await freeClusters(ext) }
+            throw NTFSError.corruptOnDisk(description: "heightGrowIndexRoot: allocator returned sparse extent")
+        }
+
+        let clusterBytes = UInt64(bytesPerCluster)
+        // The new VCNs for the intermediates: they extend the existing
+        // $INDEX_ALLOCATION runlist. Account for the primary leaf extent
+        // AND any cascade-accumulated extents that already extended the
+        // runlist (Phase 3(D) re-entry).
+        let existingVCNCount = allocationExtents.reduce(0) { $0 + $1.clusterCount }
+        let primaryClusters = primaryNewExtent.clusterCount
+        let cascadeClusters = cascadeAccumulatedExtents.reduce(0) { $0 + $1.clusterCount }
+        let leftInterVCN = existingVCNCount + primaryClusters + cascadeClusters
+        let rightInterVCN = leftInterVCN + 1
+
+        // Build the two intermediate interior INDX blocks (in memory).
+        let blockSize = Int(indexRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        do {
+            let leftBlock = try buildInteriorIndxBlock(
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                vcn: leftInterVCN,
+                interior: leftEntries,
+                lastSubnodeVCN: leftIntermediateLastVCN
+            )
+            let leftOnDisk = try UpdateSequenceArray.reverseFixup(
+                recordBytes: leftBlock,
+                usaOffset: Int(try leftBlock.readU16LE(at: 4)),
+                usaCount: Int(try leftBlock.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+            let rightBlock = try buildInteriorIndxBlock(
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                vcn: rightInterVCN,
+                interior: rightEntries,
+                lastSubnodeVCN: rightIntermediateLastVCN
+            )
+            let rightOnDisk = try UpdateSequenceArray.reverseFixup(
+                recordBytes: rightBlock,
+                usaOffset: Int(try rightBlock.readU16LE(at: 4)),
+                usaCount: Int(try rightBlock.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+
+            // Build the NEW tiny $INDEX_ROOT body: 1 interior entry +
+            // LAST sentinel.
+            let newRootInterior = [(
+                key: medianEntry.key,
+                body: medianEntry.body,
+                fileRef: medianEntry.fileRef,
+                subnodeVCN: leftInterVCN
+            )]
+            let newTinyRootBody = serializeLargeIndexRoot(
+                indexAllocationBlockSize: indexRoot.indexAllocationBlockSize,
+                clustersPerIndexBlock: indexRoot.clustersPerIndexBlock,
+                interior: newRootInterior,
+                lastSubnodeVCN: rightInterVCN
+            )
+
+            // Updated $INDEX_ALLOCATION runlist: existing + primary leaf
+            // extent + cascade-accumulated extents + left/right new
+            // intermediate extents (in that VCN order).
+            var allExtentsForRunlist: [Extent] = allocationExtents
+            allExtentsForRunlist.append(primaryNewExtent)
+            allExtentsForRunlist.append(contentsOf: cascadeAccumulatedExtents)
+            allExtentsForRunlist.append(leftInterExtent)
+            allExtentsForRunlist.append(rightInterExtent)
+            let updatedExtents = mergeAdjacentExtents(allExtentsForRunlist)
+            let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
+            let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
+                attrID: try findIndexAllocationAttributeID(attrs: attrs),
+                extents: updatedExtents,
+                totalBytes: totalIndexAllocClusters * clusterBytes
+            )
+
+            // Updated $BITMAP: cascade's already-set bits + the 2 new
+            // intermediates. (newLeafVCN may already be in cascadeBitmapVCNs;
+            // updateBitmapAttribute is idempotent on duplicates.)
+            var allBitmapVCNs: [UInt64] = []
+            if cascadeBitmapVCNs.isEmpty {
+                allBitmapVCNs = [newLeafVCN]
+            } else {
+                allBitmapVCNs = cascadeBitmapVCNs
+            }
+            allBitmapVCNs.append(leftInterVCN)
+            allBitmapVCNs.append(rightInterVCN)
+            let updatedBitmapAttrBytes = try updateBitmapAttribute(
+                attrs: attrs,
+                blockIndices: allBitmapVCNs
+            )
+
+            // Build the parent record bytes — should now fit (tiny root).
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newTinyRootBody,
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: [
+                    (byteOffset: leftInterLCN * clusterBytes, postFixupBytes: leftOnDisk),
+                    (byteOffset: rightInterLCN * clusterBytes, postFixupBytes: rightOnDisk)
+                ],
+                extraClustersAllocated: extraClusters
+            )
+        } catch {
+            // Any build/serialize failure → free both intermediates + rethrow.
+            for ext in extraClusters { try? await freeClusters(ext) }
+            extraClusters.removeAll()
+            throw error
+        }
+    }
+
+    /// v0.4 Phase 3(B): in-memory snapshot of an intermediate (non-root)
+    /// interior INDX block. Built by `findInteriorParentChainForLeaf`.
+    private struct InteriorBlockInfo {
+        let blockVCN: UInt64
+        let byteOffset: UInt64
+        /// USA-applied source bytes — caller needs the headers when
+        /// rebuilding the block.
+        let blockBytesFixedUp: Data
+        let blockSize: Int
+        let sectorSize: Int
+        let entriesOffsetWithinHeader: Int
+        let allocatedSizeWithinHeader: Int
+        /// Non-LAST interior entries in this block.
+        let interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)]
+        /// LAST sentinel's subnode VCN.
+        let lastSubnodeVCN: UInt64
+    }
+
+    /// v0.4 Phase 3(B): walk the tree from $INDEX_ROOT's pointers down to
+    /// find the chain of interior INDX blocks leading to the leaf at
+    /// `leafVCN`. Returns the chain root-first (chain[0] is the first
+    /// intermediate visited from $INDEX_ROOT; chain[last] is the leaf's
+    /// direct parent).
+    ///
+    /// Uses key-based descent (same selector as `IndexAllocationWriter.
+    /// pickSubnode`). `searchKey` is any key that resides in the leaf —
+    /// in practice we pass the first entry of the merged sorted list.
+    /// Reaching the target leaf at the end of descent confirms we found
+    /// the right path; mismatch means the tree state diverged from
+    /// expectations and we abort with a clear error.
+    private func findInteriorParentChainForLeaf(
+        rootInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        rootLastSubnodeVCN: UInt64,
+        allocationExtents: [Extent],
+        searchKey: String,
+        leafVCN: UInt64
+    ) async throws -> [InteriorBlockInfo] {
+        let blockSize = Int(indexRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        let clusterBytes = UInt64(bytesPerCluster)
+
+        // Step 1: pick the $INDEX_ROOT subnode to descend into.
+        var currentVCN: UInt64 = rootLastSubnodeVCN
+        for entry in rootInterior {
+            if !IndexBuilder.collationFilenameSortsBefore(entry.key, searchKey) {
+                currentVCN = entry.subnodeVCN
+                break
+            }
+        }
+
+        var chain: [InteriorBlockInfo] = []
+        var visited: Set<UInt64> = []
+
+        while true {
+            if visited.contains(currentVCN) {
+                throw NTFSError.corruptOnDisk(
+                    description: "findInteriorParentChainForLeaf: cycle detected at VCN \(currentVCN)"
+                )
+            }
+            visited.insert(currentVCN)
+
+            let byteOffset = try vcnToByteOffsetInAllocation(
+                vcn: currentVCN,
+                extents: allocationExtents,
+                clusterBytes: clusterBytes
+            )
+            let raw = try await device.read(offset: byteOffset, length: blockSize)
+            let usaOffset = Int(try raw.readU16LE(at: 4))
+            let usaCount = Int(try raw.readU16LE(at: 6))
+            let fixed = try UpdateSequenceArray.applyFixup(
+                recordBytes: raw,
+                usaOffset: usaOffset,
+                usaCount: usaCount,
+                blockSize: sectorSize
+            )
+
+            // INDEX_HEADER at offset 24 in the block.
+            let entriesOffsetWithinHeader = Int(try fixed.readU32LE(at: 24))
+            let usedSizeWithinHeader = Int(try fixed.readU32LE(at: 28))
+            let allocatedSizeWithinHeader = Int(try fixed.readU32LE(at: 32))
+
+            let entriesStart = 24 + entriesOffsetWithinHeader
+            let entriesEnd = 24 + usedSizeWithinHeader
+            let parsed = try parseRootInteriorEntries(in: fixed, start: entriesStart, limit: entriesEnd)
+
+            // Decompose entries into [(non-LAST)] + LAST.subnodeVCN.
+            var interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)] = []
+            var lastSub: UInt64 = 0
+            for e in parsed {
+                if e.isLast {
+                    lastSub = e.subnodeVCN ?? 0
+                } else if let key = e.keyName, e.hasSubnode {
+                    interior.append((key: key, body: e.keyBytes, fileRef: e.fileReference, subnodeVCN: e.subnodeVCN ?? 0))
+                }
+            }
+
+            // Is this an INTERIOR block (has subnodes) or a LEAF (no subnodes)?
+            // Interior iff at least one entry — including LAST — has a subnode.
+            let hasAnySubnode = !interior.isEmpty || parsed.contains(where: { $0.isLast && $0.hasSubnode })
+
+            // Check whether THIS block's pointer set contains leafVCN.
+            // If so, this block IS the leaf's direct parent — append to
+            // chain and return.
+            let pointsAtLeaf = interior.contains(where: { $0.subnodeVCN == leafVCN }) || lastSub == leafVCN
+            if pointsAtLeaf {
+                chain.append(InteriorBlockInfo(
+                    blockVCN: currentVCN,
+                    byteOffset: byteOffset,
+                    blockBytesFixedUp: fixed,
+                    blockSize: blockSize,
+                    sectorSize: sectorSize,
+                    entriesOffsetWithinHeader: entriesOffsetWithinHeader,
+                    allocatedSizeWithinHeader: allocatedSizeWithinHeader,
+                    interior: interior,
+                    lastSubnodeVCN: lastSub
+                ))
+                return chain
+            }
+
+            // Not the direct parent — must be an interior block whose
+            // subnodes are themselves interior. Record + descend.
+            guard hasAnySubnode else {
+                // This is a leaf (no subnodes) but it's not leafVCN — the
+                // descent didn't reach the target. Tree state diverged.
+                throw NTFSError.corruptOnDisk(
+                    description: "findInteriorParentChainForLeaf: descent landed at leaf VCN \(currentVCN), not target \(leafVCN)"
+                )
+            }
+
+            chain.append(InteriorBlockInfo(
+                blockVCN: currentVCN,
+                byteOffset: byteOffset,
+                blockBytesFixedUp: fixed,
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                entriesOffsetWithinHeader: entriesOffsetWithinHeader,
+                allocatedSizeWithinHeader: allocatedSizeWithinHeader,
+                interior: interior,
+                lastSubnodeVCN: lastSub
+            ))
+
+            // Pick next subnode using key-based descent.
+            var nextVCN: UInt64 = lastSub
+            for entry in interior {
+                if !IndexBuilder.collationFilenameSortsBefore(entry.key, searchKey) {
+                    nextVCN = entry.subnodeVCN
+                    break
+                }
+            }
+            currentVCN = nextVCN
+        }
+    }
+
+    /// VCN→byte offset using the directory's $INDEX_ALLOCATION runlist.
+    private func vcnToByteOffsetInAllocation(vcn: UInt64, extents: [Extent], clusterBytes: UInt64) throws -> UInt64 {
+        var cumulative: UInt64 = 0
+        for extent in extents {
+            if vcn < cumulative + extent.clusterCount {
+                let clusterInExtent = vcn - cumulative
+                guard let startLCN = extent.startLCN else {
+                    throw NTFSError.corruptOnDisk(description: "vcnToByteOffsetInAllocation: sparse extent at VCN \(vcn)")
+                }
+                return (startLCN + clusterInExtent) * clusterBytes
+            }
+            cumulative += extent.clusterCount
+        }
+        throw NTFSError.corruptOnDisk(description: "vcnToByteOffsetInAllocation: VCN \(vcn) beyond runlist (total \(cumulative))")
+    }
+
+    /// v0.4 Phase 3(B) + 3(C): promote (newKey, newRightSubnodeVCN) through
+    /// the chain of intermediate INDX blocks from leaf's direct parent up
+    /// toward `$INDEX_ROOT`, splitting any intermediate that overflows and
+    /// cascading the new median up to the next level. If the cascade
+    /// reaches `$INDEX_ROOT`, the existing root-update path takes over
+    /// (with Phase 3(A) height-grow as the final fallback).
+    ///
+    /// Algorithm (iterative, leaf-side-first):
+    /// 1. At each level (chain[i], from leaf up to root):
+    ///    a. Splice the pending (key, rightVCN) into the level's interior
+    ///       entries after the existing leftSubnode pointer.
+    ///    b. Try to build the new interior block. Fits → rewrite this
+    ///       intermediate in place; cascade stops here.
+    ///    c. Overflow → bisect the spliced entries, allocate 1 new
+    ///       cluster for the right half. Write left half (overwriting
+    ///       this intermediate's original location) + right half (new
+    ///       cluster). Promote the bisection median up to the next level.
+    /// 2. If the loop exhausts the chain, the bisection median needs to
+    ///    go into `$INDEX_ROOT`. We invoke the existing root-update path
+    ///    via `computeRootUpdateAfterCascade`, which itself can
+    ///    height-grow if `$INDEX_ROOT` is full.
+    ///
+    /// Tracks all allocated extents in `extraClustersAllocated` so the
+    /// caller's outer rollback frees them on any failure between compute
+    /// and parent-record commit.
+    private func promoteThroughInteriorChain(
+        parent: MFTRecord,
+        attrs: [Attribute],
+        indexRoot: IndexRoot,
+        rootInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        rootLastSubnodeVCN: UInt64,
+        rootBytes: Data,
+        allocationExtents: [Extent],
+        primaryNewExtent: Extent,
+        splitLeafVCN: UInt64,
+        newLeafVCN: UInt64,
+        medianEntry: (fileRef: UInt64, body: Data, sortKey: String)
+    ) async throws -> ComputedSplit {
+        // Walk tree to find leaf's direct parent + its ancestor intermediates.
+        let chain = try await findInteriorParentChainForLeaf(
+            rootInterior: rootInterior,
+            rootLastSubnodeVCN: rootLastSubnodeVCN,
+            allocationExtents: allocationExtents,
+            searchKey: medianEntry.sortKey,
+            leafVCN: splitLeafVCN
         )
-        try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newRecordBytes)
-        // Self-check: re-read + re-parse + walk attributes. Any malformation
-        // surfaces here with a precise location rather than as a later
-        // mysterious USA-fixup mismatch in the next descent.
-        try await verifyParentRecord(parentRecordNumber, context: "after split of leaf VCN \(splitLeafVCN)")
+        guard !chain.isEmpty else {
+            throw NTFSError.corruptOnDisk(
+                description: "promoteThroughInteriorChain: empty chain for leafVCN \(splitLeafVCN)"
+            )
+        }
+
+        let clusterBytes = UInt64(bytesPerCluster)
+        // Existing $INDEX_ALLOCATION total VCNs, BEFORE primaryNewExtent.
+        // Each new cluster we allocate during cascade gets the next VCN.
+        let existingVCNCount = allocationExtents.reduce(0) { $0 + $1.clusterCount }
+        var nextNewVCN = existingVCNCount + primaryNewExtent.clusterCount  // VCN of next new cluster
+
+        var pendingKey = medianEntry.sortKey
+        var pendingBody = medianEntry.body
+        var pendingFileRef = medianEntry.fileRef
+        var pendingRightVCN = newLeafVCN
+        var existingLeftSubnodeVCN = splitLeafVCN
+
+        var intermediateWrites: [(byteOffset: UInt64, postFixupBytes: Data)] = []
+        var extraExtents: [Extent] = []
+        var newVCNsForBitmap: [UInt64] = [newLeafVCN]
+
+        var cascadeExhaustedChain = false
+
+        // Walk chain from leaf-side (chain.last) up to root-side (chain.first).
+        for level in chain.reversed() {
+            let splice = try spliceInteriorEntries(
+                interior: level.interior,
+                lastSubnodeVCN: level.lastSubnodeVCN,
+                afterSubnode: existingLeftSubnodeVCN,
+                newKey: pendingKey,
+                newKeyBody: pendingBody,
+                newKeyFileRef: pendingFileRef,
+                newRightSubnode: pendingRightVCN
+            )
+
+            // Attempt fits-in-place build.
+            do {
+                let newBlock = try buildInteriorIndxBlock(
+                    blockSize: level.blockSize,
+                    sectorSize: level.sectorSize,
+                    vcn: level.blockVCN,
+                    interior: splice.newInterior,
+                    lastSubnodeVCN: splice.newLastVCN
+                )
+                let onDisk = try UpdateSequenceArray.reverseFixup(
+                    recordBytes: newBlock,
+                    usaOffset: Int(try newBlock.readU16LE(at: 4)),
+                    usaCount: Int(try newBlock.readU16LE(at: 6)),
+                    blockSize: level.sectorSize
+                )
+                intermediateWrites.append((byteOffset: level.byteOffset, postFixupBytes: onDisk))
+                // Cascade stops here.
+                cascadeExhaustedChain = false
+                break
+            } catch NTFSError.unsupportedFeature(let desc) where desc.contains("overflow block") {
+                // This intermediate is full. Split it: bisect spliced
+                // entries around midpoint, allocate cluster for right
+                // half.
+                let mid = splice.newInterior.count / 2
+                guard splice.newInterior.count >= 2 else {
+                    // Single-entry intermediate that can't even fit one
+                    // more — pathological tree shape. Roll back all
+                    // pending allocations and surface.
+                    for ext in extraExtents { try? await freeClusters(ext) }
+                    throw NTFSError.corruptOnDisk(
+                        description: "promoteThroughInteriorChain: intermediate at VCN \(level.blockVCN) reports overflow with only \(splice.newInterior.count) entries — \(desc)"
+                    )
+                }
+                let medianInter = splice.newInterior[mid]
+                let leftHalf = Array(splice.newInterior[0..<mid])
+                let rightHalf = Array(splice.newInterior[(mid + 1)..<splice.newInterior.count])
+
+                // Allocate cluster for right half.
+                let rightExtent: Extent
+                do {
+                    rightExtent = try await allocateClusters(1)
+                } catch {
+                    for ext in extraExtents { try? await freeClusters(ext) }
+                    throw error
+                }
+                guard let rightLCN = rightExtent.startLCN else {
+                    for ext in extraExtents { try? await freeClusters(ext) }
+                    try? await freeClusters(rightExtent)
+                    throw NTFSError.corruptOnDisk(description: "promoteThroughInteriorChain: allocator returned sparse extent")
+                }
+                extraExtents.append(rightExtent)
+                let rightVCN = nextNewVCN
+                nextNewVCN += 1
+                newVCNsForBitmap.append(rightVCN)
+
+                // Build LEFT half (overwrites the original block at level.blockVCN).
+                let leftBlock = try buildInteriorIndxBlock(
+                    blockSize: level.blockSize,
+                    sectorSize: level.sectorSize,
+                    vcn: level.blockVCN,
+                    interior: leftHalf,
+                    lastSubnodeVCN: medianInter.subnodeVCN
+                )
+                let leftOnDisk = try UpdateSequenceArray.reverseFixup(
+                    recordBytes: leftBlock,
+                    usaOffset: Int(try leftBlock.readU16LE(at: 4)),
+                    usaCount: Int(try leftBlock.readU16LE(at: 6)),
+                    blockSize: level.sectorSize
+                )
+                intermediateWrites.append((byteOffset: level.byteOffset, postFixupBytes: leftOnDisk))
+
+                // Build RIGHT half (new cluster).
+                let rightBlock = try buildInteriorIndxBlock(
+                    blockSize: level.blockSize,
+                    sectorSize: level.sectorSize,
+                    vcn: rightVCN,
+                    interior: rightHalf,
+                    lastSubnodeVCN: splice.newLastVCN
+                )
+                let rightOnDisk = try UpdateSequenceArray.reverseFixup(
+                    recordBytes: rightBlock,
+                    usaOffset: Int(try rightBlock.readU16LE(at: 4)),
+                    usaCount: Int(try rightBlock.readU16LE(at: 6)),
+                    blockSize: level.sectorSize
+                )
+                intermediateWrites.append((byteOffset: rightLCN * clusterBytes, postFixupBytes: rightOnDisk))
+
+                // Setup for next iteration: the bisection median must be
+                // promoted to the LEVEL ABOVE this one. The "existing
+                // left subnode" up there is this level's blockVCN
+                // (which now points at the LEFT half) — Phase 3(B)'s
+                // spliceInteriorEntries(afterSubnode: ...) will find it
+                // and splice in (newKey, rightVCN) right after.
+                pendingKey = medianInter.key
+                pendingBody = medianInter.body
+                pendingFileRef = medianInter.fileRef
+                pendingRightVCN = rightVCN
+                existingLeftSubnodeVCN = level.blockVCN
+                cascadeExhaustedChain = true  // continues unless next iter breaks
+            }
+        }
+
+        // Build updated $INDEX_ALLOCATION runlist (existing + primary leaf +
+        // any new cluster extents from interior splits).
+        let updatedExtents = mergeAdjacentExtents(allocationExtents + [primaryNewExtent] + extraExtents)
+        let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
+        let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
+            attrID: try findIndexAllocationAttributeID(attrs: attrs),
+            extents: updatedExtents,
+            totalBytes: totalIndexAllocClusters * clusterBytes
+        )
+        let updatedBitmapAttrBytes = try updateBitmapAttribute(
+            attrs: attrs,
+            blockIndices: newVCNsForBitmap
+        )
+
+        if !cascadeExhaustedChain {
+            // Cascade stopped at some intermediate level. $INDEX_ROOT body
+            // is UNCHANGED. Just rewrite parent record with updated
+            // runlist + bitmap.
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: rootBytes,  // unchanged
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: intermediateWrites,
+                extraClustersAllocated: extraExtents
+            )
+        }
+
+        // Phase 3(C) cascade exhausted the chain. The pending median needs
+        // to land in $INDEX_ROOT. Splice into the root's interior + LAST
+        // sentinel; if root overflows, height-grow.
+        let rootSplice = try spliceInteriorEntries(
+            interior: rootInterior,
+            lastSubnodeVCN: rootLastSubnodeVCN,
+            afterSubnode: existingLeftSubnodeVCN,
+            newKey: pendingKey,
+            newKeyBody: pendingBody,
+            newKeyFileRef: pendingFileRef,
+            newRightSubnode: pendingRightVCN
+        )
+        let newRootBody = serializeLargeIndexRoot(
+            indexAllocationBlockSize: indexRoot.indexAllocationBlockSize,
+            clustersPerIndexBlock: indexRoot.clustersPerIndexBlock,
+            interior: rootSplice.newInterior,
+            lastSubnodeVCN: rootSplice.newLastVCN
+        )
+
+        do {
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newRootBody,
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: intermediateWrites,
+                extraClustersAllocated: extraExtents
+            )
+        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+            // v0.4 Phase 3(D): cascade reached $INDEX_ROOT AND root would
+            // also overflow with the cascade's bubbled-up median. Apply
+            // height-grow ON TOP of the cascade's accumulated state.
+            // heightGrowIndexRoot allocates 2 more clusters, splits the
+            // post-splice root entries into intermediates, and replaces
+            // $INDEX_ROOT with a tiny new root. All cascade extents and
+            // bitmap VCNs are passed through so the merged runlist +
+            // bitmap reflect the full picture.
+            _ = desc
+            let grown = try await heightGrowIndexRoot(
+                parent: parent,
+                attrs: attrs,
+                indexRoot: indexRoot,
+                newInterior: rootSplice.newInterior,
+                newLastVCN: rootSplice.newLastVCN,
+                allocationExtents: allocationExtents,
+                primaryNewExtent: primaryNewExtent,
+                newLeafVCN: newLeafVCN,
+                cascadeAccumulatedExtents: extraExtents,
+                cascadeBitmapVCNs: newVCNsForBitmap
+            )
+            // Merge cascade intermediates + height-grow intermediates.
+            // Order matters for write sequencing — both arrays are
+            // already in "write these in order before parent" form.
+            var combined = intermediateWrites
+            combined.append(contentsOf: grown.intermediates)
+            return ComputedSplit(
+                parentRecordBytes: grown.parentRecordBytes,
+                intermediates: combined,
+                extraClustersAllocated: extraExtents + grown.extraClustersAllocated
+            )
+        }
+    }
+
+    /// v0.4 Phase 3(B): splice (newKey, newRightSubnodeVCN) into an
+    /// interior-entry list just AFTER the pointer at `existingChildVCN`.
+    /// Returns the new entry list + new LAST subnode VCN. Used by both
+    /// the $INDEX_ROOT update path AND the intermediate-INDX-block
+    /// rewrite path.
+    private struct InteriorEntriesSplice {
+        let newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)]
+        let newLastVCN: UInt64
+    }
+
+    private func spliceInteriorEntries(
+        interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        lastSubnodeVCN: UInt64,
+        afterSubnode existingChildVCN: UInt64,
+        newKey: String,
+        newKeyBody: Data,
+        newKeyFileRef: UInt64,
+        newRightSubnode: UInt64
+    ) throws -> InteriorEntriesSplice {
+        // Model as token list: [V_0, K_1, V_1, K_2, V_2, ..., K_n, V_n].
+        var tokens: [(kind: String, key: String?, body: Data?, fileRef: UInt64?, vcn: UInt64?)] = []
+        if interior.isEmpty {
+            tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: lastSubnodeVCN))
+        } else {
+            tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: interior[0].subnodeVCN))
+            for i in 0..<interior.count {
+                tokens.append((kind: "key", key: interior[i].key, body: interior[i].body, fileRef: interior[i].fileRef, vcn: nil))
+                if i + 1 < interior.count {
+                    tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: interior[i + 1].subnodeVCN))
+                } else {
+                    tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: lastSubnodeVCN))
+                }
+            }
+        }
+
+        // Splice in (newKey, newRightSubnode) AFTER the VCN token matching existingChildVCN.
+        var spliced = false
+        var newTokens: [(kind: String, key: String?, body: Data?, fileRef: UInt64?, vcn: UInt64?)] = []
+        for t in tokens {
+            newTokens.append(t)
+            if !spliced, t.kind == "vcn", t.vcn == existingChildVCN {
+                newTokens.append((kind: "key", key: newKey, body: newKeyBody, fileRef: newKeyFileRef, vcn: nil))
+                newTokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: newRightSubnode))
+                spliced = true
+            }
+        }
+        guard spliced else {
+            throw NTFSError.corruptOnDisk(
+                description: "spliceInteriorEntries: existingChildVCN \(existingChildVCN) not found among interior pointers"
+            )
+        }
+
+        // Re-collapse tokens into interior entries + LAST.
+        var newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)] = []
+        var idx = 0
+        while idx + 2 < newTokens.count {
+            let leftVCN = newTokens[idx].vcn ?? 0
+            let key = newTokens[idx + 1]
+            newInterior.append((
+                key: key.key ?? "",
+                body: key.body ?? Data(),
+                fileRef: key.fileRef ?? 0,
+                subnodeVCN: leftVCN
+            ))
+            idx += 2
+        }
+        let newLastVCN = newTokens.last?.vcn ?? 0
+
+        return InteriorEntriesSplice(newInterior: newInterior, newLastVCN: newLastVCN)
     }
 
     /// Walk the entire LARGE_INDEX tree of `parentRecordNumber` and return
     /// the set of distinct fileReferences visible. Used as a post-split
     /// self-check.
     private func collectAllFileRefsInLargeIndex(parentRecordNumber: UInt64) async throws -> Set<UInt64> {
-        let mft = self.mft()
-        let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
         guard let irAttr = attrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
               case let .resident(rootBytes, _) = irAttr.value else {
             return []
@@ -1423,7 +2314,12 @@ public actor Volume {
         }
         let attrs: [Attribute]
         do {
-            attrs = try rec.attributes()
+            // $ATTRIBUTE_LIST-aware: once Fix B Step 3 migrates $INDEX_ALLOCATION
+            // into an extension record, the verifier must follow the same path
+            // every reader does. The base-only `rec.attributes()` would miss
+            // the migrated attribute and the LARGE_INDEX assertion below
+            // would false-positive on a well-formed migrated record.
+            attrs = try await allAttributesOf(recordNumber: recordNumber)
         } catch {
             throw NTFSError.corruptOnDisk(
                 description: "verifyParentRecord(\(recordNumber), \(context)): attribute iteration failed: \(error)"
@@ -1628,6 +2524,13 @@ public actor Volume {
     /// Update the $BITMAP:$I30 attribute by setting the bit at `blockIndex`.
     /// Returns the serialized replacement attribute bytes.
     private func updateBitmapAttribute(attrs: [Attribute], blockIndex: UInt64) throws -> Data {
+        try updateBitmapAttribute(attrs: attrs, blockIndices: [blockIndex])
+    }
+
+    /// v0.4 Phase 3(A): set multiple bits in $BITMAP:$I30 in one rebuild.
+    /// Used by `heightGrowIndexRoot` where 3 new blocks (the primary new
+    /// leaf + 2 intermediates) need their bits set together.
+    private func updateBitmapAttribute(attrs: [Attribute], blockIndices: [UInt64]) throws -> Data {
         guard let attr = attrs.first(where: {
             $0.rawType == 0xB0 && $0.nameOrEmpty == "$I30"
         }) else {
@@ -1637,14 +2540,16 @@ public actor Volume {
             throw NTFSError.unsupportedFeature(description: "updateBitmap: $BITMAP:$I30 must be resident (non-resident bitmaps not yet supported)")
         }
         var updated = bytes
-        let byteIdx = Int(blockIndex / 8)
-        let bitIdx = Int(blockIndex % 8)
-        guard byteIdx < updated.count else {
-            throw NTFSError.unsupportedFeature(
-                description: "updateBitmap: block index \(blockIndex) exceeds bitmap capacity \(updated.count * 8); growing $BITMAP not yet supported"
-            )
+        for blockIndex in blockIndices {
+            let byteIdx = Int(blockIndex / 8)
+            let bitIdx = Int(blockIndex % 8)
+            guard byteIdx < updated.count else {
+                throw NTFSError.unsupportedFeature(
+                    description: "updateBitmap: block index \(blockIndex) exceeds bitmap capacity \(updated.count * 8); growing $BITMAP not yet supported"
+                )
+            }
+            updated[updated.startIndex + byteIdx] |= (UInt8(1) << bitIdx)
         }
-        updated[updated.startIndex + byteIdx] |= (UInt8(1) << bitIdx)
         return buildNamedResidentAttribute(
             type: 0xB0,
             attrID: attr.header.attributeID,
@@ -1735,6 +2640,83 @@ public actor Volume {
         MFTRecord.writeU16LE(into: &body, at: 46, value: 0)              // reserved
         MFTRecord.writeU64LE(into: &body, at: 48, value: firstSubnodeVCN)
         return body
+    }
+
+    /// v0.4 Phase 3(A): Build an INTERIOR INDX block (pre-USA) with the
+    /// given (key + subnode VCN) entries + LAST sentinel pointing at
+    /// `lastSubnodeVCN`. Used by the $INDEX_ROOT height-grow path when
+    /// the parent MFT record can't fit another interior entry — we move
+    /// existing interior entries from $INDEX_ROOT into intermediate INDX
+    /// blocks (one per half of the bisection), allocated in
+    /// $INDEX_ALLOCATION.
+    ///
+    /// Interior entry layout: header(16) + keyBytes + 8-byte alignment +
+    /// 8-byte subnode VCN. The HAS_SUBNODE flag (0x01) is set on every
+    /// non-LAST entry; the LAST sentinel has flags = LAST|HAS_SUBNODE
+    /// (0x03) with no key + 8-byte subnode VCN.
+    private func buildInteriorIndxBlock(
+        blockSize: Int,
+        sectorSize: Int,
+        vcn: UInt64,
+        interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        lastSubnodeVCN: UInt64
+    ) throws -> Data {
+        var block = Data(count: blockSize)
+        let fixupCount = blockSize / sectorSize
+        let usaCount = UInt16(1 + fixupCount)
+        let usaOffset: UInt16 = 40
+        MFTRecord.writeU32LE(into: &block, at: 0,  value: IndexAllocationBlock.magicINDX)
+        MFTRecord.writeU16LE(into: &block, at: 4,  value: usaOffset)
+        MFTRecord.writeU16LE(into: &block, at: 6,  value: usaCount)
+        MFTRecord.writeU64LE(into: &block, at: 8,  value: 0)              // LSN
+        MFTRecord.writeU64LE(into: &block, at: 16, value: vcn)
+        MFTRecord.writeU16LE(into: &block, at: Int(usaOffset), value: 1)
+
+        let usaBytes = Int(usaCount) * 2
+        let entriesStart = ((40 + usaBytes + 7) / 8) * 8
+        let entriesOffsetWithinHeader = entriesStart - 24
+
+        // Serialize interior entries + LAST sentinel (each with HAS_SUBNODE).
+        var entryBytes = Data()
+        for e in interior {
+            let rawLen = 16 + e.body.count
+            let aligned = ((rawLen + 7) / 8) * 8
+            let totalLen = aligned + 8  // 8-byte subnode VCN at end
+            var entry = Data(count: totalLen)
+            MFTRecord.writeU64LE(into: &entry, at: 0, value: e.fileRef)
+            MFTRecord.writeU16LE(into: &entry, at: 8, value: UInt16(totalLen))
+            MFTRecord.writeU16LE(into: &entry, at: 10, value: UInt16(e.body.count))
+            MFTRecord.writeU16LE(into: &entry, at: 12, value: 0x01)  // HAS_SUBNODE
+            MFTRecord.writeU16LE(into: &entry, at: 14, value: 0)
+            for (i, byte) in e.body.enumerated() {
+                entry[entry.startIndex + 16 + i] = byte
+            }
+            MFTRecord.writeU64LE(into: &entry, at: totalLen - 8, value: e.subnodeVCN)
+            entryBytes.append(entry)
+        }
+        // LAST sentinel with HAS_SUBNODE.
+        var lastSentinel = Data(count: 24)
+        MFTRecord.writeU64LE(into: &lastSentinel, at: 0, value: 0)
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 8, value: 24)
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 10, value: 0)
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 12, value: 0x03)  // LAST | HAS_SUBNODE
+        MFTRecord.writeU16LE(into: &lastSentinel, at: 14, value: 0)
+        MFTRecord.writeU64LE(into: &lastSentinel, at: 16, value: lastSubnodeVCN)
+        entryBytes.append(lastSentinel)
+
+        guard entriesStart + entryBytes.count <= blockSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "buildInteriorIndxBlock: \(interior.count) interior entries (\(entryBytes.count) bytes) overflow block (start \(entriesStart), block \(blockSize)) — interior INDX block can hold ~40-60 entries depending on key length"
+            )
+        }
+        for (i, byte) in entryBytes.enumerated() {
+            block[block.startIndex + entriesStart + i] = byte
+        }
+        MFTRecord.writeU32LE(into: &block, at: 24, value: UInt32(entriesOffsetWithinHeader))
+        MFTRecord.writeU32LE(into: &block, at: 28, value: UInt32(entriesOffsetWithinHeader + entryBytes.count))
+        MFTRecord.writeU32LE(into: &block, at: 32, value: UInt32(blockSize - 24))
+        block[block.startIndex + 36] = 0x01  // flags: LARGE_INDEX (this is an interior block)
+        return block
     }
 
     /// Build an INDX block (pre-USA, ready for reverseFixup) with `entries`
@@ -1878,7 +2860,7 @@ public actor Volume {
     ) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
 
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
@@ -2201,6 +3183,88 @@ public actor Volume {
         try await device.synchronize()
     }
 
+    /// v0.4 Phase 1: enter bulk-insert mode for one destination directory.
+    ///
+    /// While this mode is active, `refreshParentI30Size` (called from every
+    /// `Volume.write` / `Volume.writeFile` to keep $I30's size hints in
+    /// sync with the file's actual size) is skipped for files whose parent
+    /// recnum matches `parentRN`. On a 22 k-file `cp -r`, this is the
+    /// difference between 22 k INDX-block rewrites and zero.
+    ///
+    /// `endBulkInsert` MUST be called to leave bulk-insert mode. Use
+    /// `Swift`'s `defer { try? await volume.endBulkInsert() }` pattern.
+    ///
+    /// Nesting / re-entry is **not** supported. Calling `beginBulkInsert`
+    /// while already in bulk-insert mode throws — the consumer (typically
+    /// `cp -r`) finishes one destination dir before starting the next.
+    ///
+    /// Size hints in $I30 are cosmetic — they drive the Windows Explorer
+    /// "Size" column and similar UI surfaces. Files copied during bulk
+    /// insert are **byte-correct on disk** but will show 0 / stale sizes
+    /// in some UIs until a subsequent write or an explicit hint-refresh
+    /// pass updates them.
+    public func beginBulkInsert(into parentRN: UInt64) async throws {
+        if _bulkInsertParentRN != nil {
+            throw NTFSError.unsupportedFeature(
+                description: "beginBulkInsert: already in bulk-insert mode for parent \(_bulkInsertParentRN!); nested bulk insert is not supported"
+            )
+        }
+        _bulkInsertParentRN = parentRN
+        _bulkInsertSkippedRefreshCount = 0
+        _bulkInsertLeafCache = BulkLeafCache()
+        _bulkInsertLastCacheHits = 0
+        _bulkInsertLastDirtyLeavesFlushed = 0
+    }
+
+    /// v0.4 Phase 1+2: leave bulk-insert mode. Flushes any cached leaf
+    /// writes to disk, returns the number of size-hint refreshes that
+    /// were skipped during the session (for diagnostics + tests).
+    /// Idempotent — calling outside bulk-insert mode is a no-op returning 0.
+    @discardableResult
+    public func endBulkInsert() async throws -> Int {
+        let n = _bulkInsertSkippedRefreshCount
+        if let cache = _bulkInsertLeafCache {
+            _ = try await cache.flushAll(device: device)
+            // Snapshot counters before dropping the cache reference so
+            // post-end introspection hooks have something to read.
+            _bulkInsertLastCacheHits = cache.cacheHits
+            _bulkInsertLastDirtyLeavesFlushed = cache.totalDirtyLeavesFlushed
+        }
+        _bulkInsertLeafCache = nil
+        _bulkInsertParentRN = nil
+        _bulkInsertSkippedRefreshCount = 0
+        return n
+    }
+
+    /// v0.4 Phase 1: introspection hook for tests. Returns the count of
+    /// `refreshParentI30Size` calls skipped so far in the current bulk-
+    /// insert session, or 0 if not in one.
+    public func bulkInsertSkippedRefreshCount() async -> Int {
+        _bulkInsertSkippedRefreshCount
+    }
+
+    /// v0.4 Phase 2: introspection hook for tests. Returns the count of
+    /// leaf-cache hits during the most recent bulk-insert session.
+    /// Reads from a snapshot captured at `endBulkInsert`, so it's valid
+    /// AFTER the session ends.
+    public func bulkInsertLeafCacheHits() async -> Int {
+        if let cache = _bulkInsertLeafCache {
+            return cache.cacheHits
+        }
+        return _bulkInsertLastCacheHits
+    }
+
+    /// v0.4 Phase 2: introspection hook for tests. Returns the number of
+    /// dirty leaves flushed during the most recent bulk-insert session
+    /// (cumulative across both flushOne calls and the final flushAll).
+    /// Reads from a snapshot captured at `endBulkInsert`.
+    public func bulkInsertDirtyLeavesFlushed() async -> Int {
+        if let cache = _bulkInsertLeafCache {
+            return cache.totalDirtyLeavesFlushed
+        }
+        return _bulkInsertLastDirtyLeavesFlushed
+    }
+
     /// Set or clear the $VOLUME_INFORMATION dirty bit. After every batch of
     /// writes is complete, callers should `setDirty(false)` so that chkdsk /
     /// ntfsfix treat the volume as cleanly-unmounted.
@@ -2477,8 +3541,16 @@ public actor Volume {
             return
         }
         let parentRN = fn.parentRecordNumber
+        // v0.4 Phase 1: skip during bulk insert into this parent. Size
+        // hints in $I30 are cosmetic; the file's actual content is
+        // already on disk and reachable through $I30 (just with stale /
+        // zero size in the Windows Explorer column).
+        if _bulkInsertParentRN == parentRN {
+            _bulkInsertSkippedRefreshCount += 1
+            return
+        }
         let parent = try await mft.record(at: parentRN)
-        let parentAttrs = try parent.attributes()
+        let parentAttrs = try await allAttributesOf(recordNumber: parentRN)
         guard let irAttr = parentAttrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
               case let .resident(rootBytes, _) = irAttr.value else {
             return
@@ -2784,6 +3856,7 @@ public actor Volume {
             remaining -= taken
         }
         try await persistBitmap(bm)
+        bm.clearDirty()
         _bitmap = bm
         return extents
     }
@@ -3283,12 +4356,18 @@ public actor Volume {
         return out
     }
 
-    /// Roll back an MFT record allocation by flipping IN_USE off — used by
-    /// createFile's error handler when the $I30 insert fails. Doesn't try to
-    /// free clusters (the new record is empty resident $DATA only) and
-    /// doesn't update the parent (this is the rollback path called after
-    /// the parent update itself failed).
-    private func deleteOrphan(at recordNumber: UInt64) async throws {
+    /// Roll back an MFT record allocation by flipping IN_USE off. Used both
+    /// internally (createFile's error handler when $I30 insert fails) and
+    /// externally (the `ntfsctl reclaim-orphans` subcommand which sweeps
+    /// pre-existing orphans left behind by older buggy builds).
+    ///
+    /// Doesn't free non-resident clusters — for a fresh createFile orphan
+    /// the record is empty resident $DATA only. For reclaim-orphans use, the
+    /// caller should already have decided this slot is safe to reclaim (no
+    /// reachable $I30 entry pointing at it, no non-resident data the user
+    /// wants to keep). Use `deleteFile` instead if the file IS reachable
+    /// and you want full cluster + $I30 cleanup.
+    public func reclaimOrphanedMFTRecord(at recordNumber: UInt64) async throws {
         let mft = self.mft()
         let record = try await mft.record(at: recordNumber)
         guard record.isInUse else { return }
@@ -3405,6 +4484,7 @@ public actor Volume {
         var bm = try await bitmap()
         let extent = try bm.allocate(count)
         try await persistBitmap(bm)
+        bm.clearDirty()
         _bitmap = bm
         return extent
     }
@@ -3414,6 +4494,7 @@ public actor Volume {
         var bm = try await bitmap()
         try bm.free(extent)
         try await persistBitmap(bm)
+        bm.clearDirty()
         _bitmap = bm
     }
 
@@ -3424,6 +4505,17 @@ public actor Volume {
     /// non-resident), we'd need to rewrite the MFT record — out of scope
     /// for stage 2.
     private func persistBitmap(_ bm: Bitmap) async throws {
+        // v0.4 perf: only write the dirty byte range. On a 4 TB drive
+        // bm.bytes is ~128 MB; rewriting all of it per allocate/free was
+        // the dominant cost in cp -r (~5 sec per file on USB). With
+        // dirty-range tracking from Bitmap, a single contiguous allocate
+        // typically dirties just a few bytes, so we write under a sector
+        // per call. Sector-align the write range so we don't issue
+        // sub-sector writes (some block devices reject them).
+        guard let dirtyRange = bm.dirtyByteRange else {
+            return  // nothing dirty, nothing to write
+        }
+
         let mft = self.mft()
         let bitmapRecord = try await mft.record(at: Self.bitmapRecordNumber)
         let attrs = try bitmapRecord.attributes()
@@ -3439,16 +4531,39 @@ public actor Volume {
         }
 
         let clusterBytes = UInt64(bytesPerCluster)
-        var bytesRemaining = bm.bytes
-        for extent in extents where !bytesRemaining.isEmpty {
+        let sectorBytes = UInt64(boot.bytesPerSector)
+        // Round the dirty range down to a sector boundary at the start
+        // and up to a sector boundary at the end — block writes must be
+        // sector-aligned on raw devices.
+        let alignedStart = Int((UInt64(dirtyRange.lowerBound) / sectorBytes) * sectorBytes)
+        let endByte = UInt64(dirtyRange.upperBound)
+        let alignedEndU64 = ((endByte + sectorBytes - 1) / sectorBytes) * sectorBytes
+        let alignedEnd = Int(min(alignedEndU64, UInt64(bm.bytes.count)))
+        let alignedRange = alignedStart..<alignedEnd
+        guard !alignedRange.isEmpty else { return }
+
+        // Walk the $Bitmap's $DATA extents until we hit the byte range we
+        // need to write, then write the dirty bytes (potentially spanning
+        // multiple extents on a fragmented volume).
+        var byteCursor = 0
+        for extent in extents {
             guard let startLCN = extent.startLCN else { continue }  // sparse
-            let extentBytes = Int(min(extent.clusterCount * clusterBytes, UInt64(bytesRemaining.count)))
-            let chunk = bytesRemaining.prefix(extentBytes)
-            try await device.write(
-                offset: startLCN * clusterBytes,
-                bytes: Data(chunk)
-            )
-            bytesRemaining = bytesRemaining.dropFirst(extentBytes)
+            let extentByteLen = Int(min(extent.clusterCount * clusterBytes, UInt64(bm.bytes.count - byteCursor)))
+            let extentByteEnd = byteCursor + extentByteLen
+            // Compute the intersection of this extent's byte range with
+            // the aligned dirty range.
+            let overlapStart = max(byteCursor, alignedRange.lowerBound)
+            let overlapEnd = min(extentByteEnd, alignedRange.upperBound)
+            if overlapStart < overlapEnd {
+                let inExtentOffset = UInt64(overlapStart - byteCursor)
+                let writeBytes = bm.bytes.subdata(in: bm.bytes.startIndex.advanced(by: overlapStart)..<bm.bytes.startIndex.advanced(by: overlapEnd))
+                try await device.write(
+                    offset: startLCN * clusterBytes + inExtentOffset,
+                    bytes: writeBytes
+                )
+            }
+            byteCursor = extentByteEnd
+            if byteCursor >= alignedRange.upperBound { break }
         }
     }
 
@@ -3606,7 +4721,7 @@ public actor Volume {
             )
         }
 
-        let attrs = try dirRecord.attributes()
+        let attrs = try await allAttributesOf(recordNumber: recordNumber)
         guard let indexRootAttr = attrs.first(where: {
             $0.type == .indexRoot && $0.nameOrEmpty == "$I30"
         }) else {

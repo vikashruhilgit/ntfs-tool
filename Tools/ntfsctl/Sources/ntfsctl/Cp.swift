@@ -148,6 +148,11 @@ struct Cp: AsyncParsableCommand {
         // Execute the copy.
         var copiedFiles = 0
         var copiedBytes: UInt64 = 0
+        // v0.4 perf measurement: capture start time so each progress line +
+        // the final summary can report elapsed and throughput. Without this
+        // it's impossible to tell whether Phase 1 / Phase 2 perf work
+        // actually moved the needle.
+        let cpStart = Date()
         if srcIsDir.boolValue {
             let dirRN = try await ensureDirectory(volume: volume, parent: destParent, name: destName)
             try await copyDirectoryRecursive(
@@ -157,7 +162,8 @@ struct Cp: AsyncParsableCommand {
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
                 totalFiles: totalFiles,
-                totalBytes: totalBytes
+                totalBytes: totalBytes,
+                startTime: cpStart
             )
         } else {
             try await copyOneFile(
@@ -168,13 +174,19 @@ struct Cp: AsyncParsableCommand {
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
                 totalFiles: totalFiles,
-                totalBytes: totalBytes
+                totalBytes: totalBytes,
+                startTime: cpStart
             )
         }
         try await volume.endWriteSession()
 
         if progress || verbose {
-            FileHandle.standardError.write(Data("done: \(copiedFiles)/\(totalFiles) files, \(humanBytes(copiedBytes))/\(humanBytes(totalBytes))\n".utf8))
+            let elapsed = Date().timeIntervalSince(cpStart)
+            let fileRate = elapsed > 0 ? Double(copiedFiles) / elapsed : 0
+            let mibRate = elapsed > 0 ? (Double(copiedBytes) / 1_048_576.0) / elapsed : 0
+            FileHandle.standardError.write(Data(
+                "done: \(copiedFiles)/\(totalFiles) files, \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)), elapsed=\(String(format: "%.1f", elapsed))s, rate=\(String(format: "%.2f", fileRate)) files/s, \(String(format: "%.2f", mibRate)) MiB/s\n".utf8
+            ))
         }
     }
 
@@ -269,7 +281,8 @@ struct Cp: AsyncParsableCommand {
         copiedFiles: inout Int,
         copiedBytes: inout UInt64,
         totalFiles: Int,
-        totalBytes: UInt64
+        totalBytes: UInt64,
+        startTime: Date
     ) async throws {
         let url = URL(fileURLWithPath: hostFile)
         let attrs = try FileManager.default.attributesOfItem(atPath: hostFile)
@@ -296,7 +309,11 @@ struct Cp: AsyncParsableCommand {
         }
         if progress {
             let pct = totalBytes == 0 ? 100.0 : Double(copiedBytes) / Double(totalBytes) * 100
-            FileHandle.standardError.write(Data("[\(copiedFiles)/\(totalFiles)] \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)) (\(String(format: "%.1f", pct))%) - \(name)\n".utf8))
+            let elapsed = Date().timeIntervalSince(startTime)
+            let fileRate = elapsed > 0 ? Double(copiedFiles) / elapsed : 0
+            FileHandle.standardError.write(Data(
+                "[\(copiedFiles)/\(totalFiles)] \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)) (\(String(format: "%.1f", pct))%) elapsed=\(String(format: "%.1f", elapsed))s rate=\(String(format: "%.1f", fileRate))/s - \(name)\n".utf8
+            ))
         }
     }
 
@@ -307,26 +324,57 @@ struct Cp: AsyncParsableCommand {
         copiedFiles: inout Int,
         copiedBytes: inout UInt64,
         totalFiles: Int,
-        totalBytes: UInt64
+        totalBytes: UInt64,
+        startTime: Date
     ) async throws {
         let fm = FileManager.default
         let entries = (try? fm.contentsOfDirectory(atPath: hostDir)) ?? []
+
+        // v0.4 Phase 1: separate subdirs from files so we can recurse first
+        // and then process this level's file batch under one beginBulkInsert
+        // / endBulkInsert window. Nesting begin/end isn't supported (Volume
+        // throws), so we MUST finish recursion (each of which enters its
+        // own begin/end at the child level) BEFORE opening this level's
+        // bulk-insert window.
+        var subdirs: [(name: String, fullPath: String)] = []
+        var files: [(name: String, fullPath: String)] = []
         for name in entries.sorted() {
             let fullPath = (hostDir as NSString).appendingPathComponent(name)
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else { continue }
             if isDir.boolValue {
-                let childRN = try await ensureDirectory(volume: volume, parent: ntfsParent, name: name)
-                try await copyDirectoryRecursive(
-                    volume: volume,
-                    hostDir: fullPath,
-                    ntfsParent: childRN,
-                    copiedFiles: &copiedFiles,
-                    copiedBytes: &copiedBytes,
-                    totalFiles: totalFiles,
-                    totalBytes: totalBytes
-                )
+                subdirs.append((name, fullPath))
             } else {
+                files.append((name, fullPath))
+            }
+        }
+
+        // 1) Recurse into subdirs first. Each recursion may open its own
+        //    bulk-insert window at the child level — that's fine because
+        //    THIS level's window is still closed.
+        for (name, fullPath) in subdirs {
+            let childRN = try await ensureDirectory(volume: volume, parent: ntfsParent, name: name)
+            try await copyDirectoryRecursive(
+                volume: volume,
+                hostDir: fullPath,
+                ntfsParent: childRN,
+                copiedFiles: &copiedFiles,
+                copiedBytes: &copiedBytes,
+                totalFiles: totalFiles,
+                totalBytes: totalBytes,
+                startTime: startTime
+            )
+        }
+
+        // 2) Now copy this level's files inside one bulk-insert window.
+        //    Per-file refreshParentI30Size calls become no-ops; size hints
+        //    will show as 0 in Windows Explorer until a subsequent write
+        //    or explicit hint-refresh updates them. File contents are
+        //    byte-correct on disk.
+        guard !files.isEmpty else { return }
+        try await volume.beginBulkInsert(into: ntfsParent)
+        do {
+            for (name, fullPath) in files {
                 try await copyOneFile(
                     volume: volume,
                     hostFile: fullPath,
@@ -335,9 +383,14 @@ struct Cp: AsyncParsableCommand {
                     copiedFiles: &copiedFiles,
                     copiedBytes: &copiedBytes,
                     totalFiles: totalFiles,
-                    totalBytes: totalBytes
+                    totalBytes: totalBytes,
+                    startTime: startTime
                 )
             }
+            _ = try await volume.endBulkInsert()
+        } catch {
+            _ = try? await volume.endBulkInsert()
+            throw error
         }
     }
 
@@ -405,6 +458,7 @@ struct Cp: AsyncParsableCommand {
 
         var copiedFiles = 0
         var copiedBytes: UInt64 = 0
+        let cpStart = Date()
         if srcIsDir {
             try fm.createDirectory(atPath: finalHostPath, withIntermediateDirectories: true)
             try await pullDirRecursive(
@@ -414,7 +468,8 @@ struct Cp: AsyncParsableCommand {
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
                 totalFiles: totalFiles,
-                totalBytes: totalBytes
+                totalBytes: totalBytes,
+                startTime: cpStart
             )
         } else {
             try await pullOneFile(
@@ -425,12 +480,18 @@ struct Cp: AsyncParsableCommand {
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
                 totalFiles: totalFiles,
-                totalBytes: totalBytes
+                totalBytes: totalBytes,
+                startTime: cpStart
             )
         }
 
         if progress || verbose {
-            FileHandle.standardError.write(Data("done: \(copiedFiles)/\(totalFiles) files, \(humanBytes(copiedBytes))/\(humanBytes(totalBytes))\n".utf8))
+            let elapsed = Date().timeIntervalSince(cpStart)
+            let fileRate = elapsed > 0 ? Double(copiedFiles) / elapsed : 0
+            let mibRate = elapsed > 0 ? (Double(copiedBytes) / 1_048_576.0) / elapsed : 0
+            FileHandle.standardError.write(Data(
+                "done: \(copiedFiles)/\(totalFiles) files, \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)), elapsed=\(String(format: "%.1f", elapsed))s, rate=\(String(format: "%.2f", fileRate)) files/s, \(String(format: "%.2f", mibRate)) MiB/s\n".utf8
+            ))
         }
     }
 
@@ -457,7 +518,8 @@ struct Cp: AsyncParsableCommand {
         copiedFiles: inout Int,
         copiedBytes: inout UInt64,
         totalFiles: Int,
-        totalBytes: UInt64
+        totalBytes: UInt64,
+        startTime: Date
     ) async throws {
         let fm = FileManager.default
         if noClobber && fm.fileExists(atPath: hostPath) {
@@ -488,7 +550,11 @@ struct Cp: AsyncParsableCommand {
         }
         if progress {
             let pct = totalBytes == 0 ? 100.0 : Double(copiedBytes) / Double(totalBytes) * 100
-            FileHandle.standardError.write(Data("[\(copiedFiles)/\(totalFiles)] \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)) (\(String(format: "%.1f", pct))%) - \(fileName)\n".utf8))
+            let elapsed = Date().timeIntervalSince(startTime)
+            let fileRate = elapsed > 0 ? Double(copiedFiles) / elapsed : 0
+            FileHandle.standardError.write(Data(
+                "[\(copiedFiles)/\(totalFiles)] \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)) (\(String(format: "%.1f", pct))%) elapsed=\(String(format: "%.1f", elapsed))s rate=\(String(format: "%.1f", fileRate))/s - \(fileName)\n".utf8
+            ))
         }
     }
 
@@ -499,7 +565,8 @@ struct Cp: AsyncParsableCommand {
         copiedFiles: inout Int,
         copiedBytes: inout UInt64,
         totalFiles: Int,
-        totalBytes: UInt64
+        totalBytes: UInt64,
+        startTime: Date
     ) async throws {
         let fm = FileManager.default
         let entries = try await volume.enumerate(directory: volumeDirRN)
@@ -514,7 +581,8 @@ struct Cp: AsyncParsableCommand {
                     copiedFiles: &copiedFiles,
                     copiedBytes: &copiedBytes,
                     totalFiles: totalFiles,
-                    totalBytes: totalBytes
+                    totalBytes: totalBytes,
+                    startTime: startTime
                 )
             } else {
                 try await pullOneFile(
@@ -525,7 +593,8 @@ struct Cp: AsyncParsableCommand {
                     copiedFiles: &copiedFiles,
                     copiedBytes: &copiedBytes,
                     totalFiles: totalFiles,
-                    totalBytes: totalBytes
+                    totalBytes: totalBytes,
+                    startTime: startTime
                 )
             }
         }
