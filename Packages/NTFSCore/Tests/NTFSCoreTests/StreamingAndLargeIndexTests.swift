@@ -382,7 +382,9 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
         // Grow MFT $DATA aggressively so the test exercises the index
-        // algorithm's cap, not the MFT-slot cap.
+        // algorithm's cap, not the MFT-slot cap. The small fixture is
+        // 4 MiB total — we can't grow much more than this without
+        // running out of free clusters.
         try await volume.growMFTDataByClusters(64)
         try await volume.growMFTDataByClusters(64)
         try await volume.growMFTDataByClusters(64)
@@ -392,17 +394,25 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         // hitting Phase 3(D) (root-overflow on cascaded depth-N tree)
         // — which we don't expect to fire on this fixture.
         var inserted = 0
+        var lastError: String?
         for i in 0..<3000 {
             let name = String(format: "heightgrow-%04d.txt", i)
             do {
                 _ = try await volume.createFile(named: name, inDirectory: 5)
                 inserted += 1
-            } catch NTFSError.unsupportedFeature {
+            } catch NTFSError.unsupportedFeature(let desc) {
+                lastError = "unsupportedFeature: \(desc)"
+                break
+            } catch NTFSError.outOfSpace {
+                lastError = "outOfSpace"
+                break
+            } catch {
+                lastError = "\(error)"
                 break
             }
         }
 
-        FileHandle.standardError.write(Data("[heightgrow] inserted=\(inserted)\n".utf8))
+        FileHandle.standardError.write(Data("[heightgrow] inserted=\(inserted) lastError=\(lastError ?? "nil")\n".utf8))
         XCTAssertGreaterThan(
             inserted, 75,
             "v0.4 tree-growth should lift the leaf-split cap past v0.3's ~75 ceiling. Got \(inserted)."

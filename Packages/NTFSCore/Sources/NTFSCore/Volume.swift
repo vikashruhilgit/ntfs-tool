@@ -1509,7 +1509,13 @@ public actor Volume {
         newLastVCN: UInt64,
         allocationExtents: [Extent],
         primaryNewExtent: Extent,
-        newLeafVCN: UInt64
+        newLeafVCN: UInt64,
+        // v0.4 Phase 3(D): additional context for cascade-driven height-grow.
+        // These represent state ALREADY accumulated by an in-flight cascade
+        // (interior splits up the chain that ran before reaching root). The
+        // simple direct-from-leaf height-grow path leaves them empty.
+        cascadeAccumulatedExtents: [Extent] = [],
+        cascadeBitmapVCNs: [UInt64] = []
     ) async throws -> ComputedSplit {
         guard newInterior.count >= 2 else {
             // Height-grow can't help — $INDEX_ROOT has only 0 or 1 interior
@@ -1552,10 +1558,13 @@ public actor Volume {
 
         let clusterBytes = UInt64(bytesPerCluster)
         // The new VCNs for the intermediates: they extend the existing
-        // $INDEX_ALLOCATION runlist. The primary leaf already took the
-        // first new VCN; the intermediates take the next two.
+        // $INDEX_ALLOCATION runlist. Account for the primary leaf extent
+        // AND any cascade-accumulated extents that already extended the
+        // runlist (Phase 3(D) re-entry).
         let existingVCNCount = allocationExtents.reduce(0) { $0 + $1.clusterCount }
-        let leftInterVCN = existingVCNCount + primaryNewExtent.clusterCount
+        let primaryClusters = primaryNewExtent.clusterCount
+        let cascadeClusters = cascadeAccumulatedExtents.reduce(0) { $0 + $1.clusterCount }
+        let leftInterVCN = existingVCNCount + primaryClusters + cascadeClusters
         let rightInterVCN = leftInterVCN + 1
 
         // Build the two intermediate interior INDX blocks (in memory).
@@ -1605,10 +1614,14 @@ public actor Volume {
             )
 
             // Updated $INDEX_ALLOCATION runlist: existing + primary leaf
-            // extent + left/right intermediate extents.
-            let updatedExtents = mergeAdjacentExtents(
-                allocationExtents + [primaryNewExtent, leftInterExtent, rightInterExtent]
-            )
+            // extent + cascade-accumulated extents + left/right new
+            // intermediate extents (in that VCN order).
+            var allExtentsForRunlist: [Extent] = allocationExtents
+            allExtentsForRunlist.append(primaryNewExtent)
+            allExtentsForRunlist.append(contentsOf: cascadeAccumulatedExtents)
+            allExtentsForRunlist.append(leftInterExtent)
+            allExtentsForRunlist.append(rightInterExtent)
+            let updatedExtents = mergeAdjacentExtents(allExtentsForRunlist)
             let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
             let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
                 attrID: try findIndexAllocationAttributeID(attrs: attrs),
@@ -1616,10 +1629,20 @@ public actor Volume {
                 totalBytes: totalIndexAllocClusters * clusterBytes
             )
 
-            // Updated $BITMAP: set bits for primary leaf, left inter, right inter.
+            // Updated $BITMAP: cascade's already-set bits + the 2 new
+            // intermediates. (newLeafVCN may already be in cascadeBitmapVCNs;
+            // updateBitmapAttribute is idempotent on duplicates.)
+            var allBitmapVCNs: [UInt64] = []
+            if cascadeBitmapVCNs.isEmpty {
+                allBitmapVCNs = [newLeafVCN]
+            } else {
+                allBitmapVCNs = cascadeBitmapVCNs
+            }
+            allBitmapVCNs.append(leftInterVCN)
+            allBitmapVCNs.append(rightInterVCN)
             let updatedBitmapAttrBytes = try updateBitmapAttribute(
                 attrs: attrs,
-                blockIndices: [newLeafVCN, leftInterVCN, rightInterVCN]
+                blockIndices: allBitmapVCNs
             )
 
             // Build the parent record bytes — should now fit (tiny root).
@@ -2062,14 +2085,36 @@ public actor Volume {
                 extraClustersAllocated: extraExtents
             )
         } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
-            // Phase 3(D) — cascade reached $INDEX_ROOT AND root needs to
-            // height-grow on top of an already-cascaded depth-N tree.
-            // This is a real-but-rare case (typically several thousand
-            // files per dir in a depth-4+ tree). Not implemented in this
-            // commit — clean abort. Free everything we allocated.
-            for ext in extraExtents { try? await freeClusters(ext) }
-            throw NTFSError.unsupportedFeature(
-                description: "splitLeaf: cascade reached $INDEX_ROOT and root needs height-grow on a depth-N tree (Phase 3(D), not yet implemented). Trigger: \(desc)"
+            // v0.4 Phase 3(D): cascade reached $INDEX_ROOT AND root would
+            // also overflow with the cascade's bubbled-up median. Apply
+            // height-grow ON TOP of the cascade's accumulated state.
+            // heightGrowIndexRoot allocates 2 more clusters, splits the
+            // post-splice root entries into intermediates, and replaces
+            // $INDEX_ROOT with a tiny new root. All cascade extents and
+            // bitmap VCNs are passed through so the merged runlist +
+            // bitmap reflect the full picture.
+            _ = desc
+            let grown = try await heightGrowIndexRoot(
+                parent: parent,
+                attrs: attrs,
+                indexRoot: indexRoot,
+                newInterior: rootSplice.newInterior,
+                newLastVCN: rootSplice.newLastVCN,
+                allocationExtents: allocationExtents,
+                primaryNewExtent: primaryNewExtent,
+                newLeafVCN: newLeafVCN,
+                cascadeAccumulatedExtents: extraExtents,
+                cascadeBitmapVCNs: newVCNsForBitmap
+            )
+            // Merge cascade intermediates + height-grow intermediates.
+            // Order matters for write sequencing — both arrays are
+            // already in "write these in order before parent" form.
+            var combined = intermediateWrites
+            combined.append(contentsOf: grown.intermediates)
+            return ComputedSplit(
+                parentRecordBytes: grown.parentRecordBytes,
+                intermediates: combined,
+                extraClustersAllocated: extraExtents + grown.extraClustersAllocated
             )
         }
     }
