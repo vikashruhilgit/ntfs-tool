@@ -1384,19 +1384,25 @@ public actor Volume {
                 spliced = true
             }
         }
-        guard spliced else {
-            // v0.4 Phase 3(A) limit: splitLeafVCN is not a direct child of
-            // $INDEX_ROOT — it lives under an intermediate INDX block (the
-            // tree has more than 2 levels after a prior height-grow). The
-            // split should promote its median into the LEAF'S DIRECT
-            // PARENT (an intermediate), not into $INDEX_ROOT. That's the
-            // recursive split-promote path (Phase 3(B)) which isn't
-            // implemented yet. Clean abort — no data loss; the rollback
-            // chain (splitLeafAndPromote → insertIntoParentI30 →
-            // createFile catch → reclaimOrphanedMFTRecord) keeps the
-            // disk consistent.
-            throw NTFSError.unsupportedFeature(
-                description: "splitLeaf: split leaf VCN \(splitLeafVCN) lives under an intermediate INDX block (deeper than 2-level tree); recursive interior-block split not yet implemented (v0.4 Phase 3(B))"
+        if !spliced {
+            // v0.4 Phase 3(B): splitLeafVCN isn't a direct child of
+            // $INDEX_ROOT — the tree is depth ≥ 3 after a prior height-
+            // grow. Find the leaf's direct parent (an intermediate INDX
+            // block) and promote the new (median, newLeafVCN) into THAT
+            // block. If the intermediate fits, we just rewrite it; if
+            // overflowing, the intermediate must split too (cascade up).
+            return try await promoteThroughInteriorChain(
+                parent: parent,
+                attrs: attrs,
+                indexRoot: indexRoot,
+                rootInterior: interior,
+                rootLastSubnodeVCN: lastSubnodeVCN,
+                rootBytes: rootBytes,
+                allocationExtents: allocationExtents,
+                primaryNewExtent: newExtent,
+                splitLeafVCN: splitLeafVCN,
+                newLeafVCN: newLeafVCN,
+                medianEntry: medianEntry
             )
         }
 
@@ -1638,6 +1644,363 @@ public actor Volume {
             extraClusters.removeAll()
             throw error
         }
+    }
+
+    /// v0.4 Phase 3(B): in-memory snapshot of an intermediate (non-root)
+    /// interior INDX block. Built by `findInteriorParentChainForLeaf`.
+    private struct InteriorBlockInfo {
+        let blockVCN: UInt64
+        let byteOffset: UInt64
+        /// USA-applied source bytes — caller needs the headers when
+        /// rebuilding the block.
+        let blockBytesFixedUp: Data
+        let blockSize: Int
+        let sectorSize: Int
+        let entriesOffsetWithinHeader: Int
+        let allocatedSizeWithinHeader: Int
+        /// Non-LAST interior entries in this block.
+        let interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)]
+        /// LAST sentinel's subnode VCN.
+        let lastSubnodeVCN: UInt64
+    }
+
+    /// v0.4 Phase 3(B): walk the tree from $INDEX_ROOT's pointers down to
+    /// find the chain of interior INDX blocks leading to the leaf at
+    /// `leafVCN`. Returns the chain root-first (chain[0] is the first
+    /// intermediate visited from $INDEX_ROOT; chain[last] is the leaf's
+    /// direct parent).
+    ///
+    /// Uses key-based descent (same selector as `IndexAllocationWriter.
+    /// pickSubnode`). `searchKey` is any key that resides in the leaf —
+    /// in practice we pass the first entry of the merged sorted list.
+    /// Reaching the target leaf at the end of descent confirms we found
+    /// the right path; mismatch means the tree state diverged from
+    /// expectations and we abort with a clear error.
+    private func findInteriorParentChainForLeaf(
+        rootInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        rootLastSubnodeVCN: UInt64,
+        allocationExtents: [Extent],
+        searchKey: String,
+        leafVCN: UInt64
+    ) async throws -> [InteriorBlockInfo] {
+        let blockSize = Int(indexRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        let clusterBytes = UInt64(bytesPerCluster)
+
+        // Step 1: pick the $INDEX_ROOT subnode to descend into.
+        var currentVCN: UInt64 = rootLastSubnodeVCN
+        for entry in rootInterior {
+            if !IndexBuilder.collationFilenameSortsBefore(entry.key, searchKey) {
+                currentVCN = entry.subnodeVCN
+                break
+            }
+        }
+
+        var chain: [InteriorBlockInfo] = []
+        var visited: Set<UInt64> = []
+
+        while true {
+            if visited.contains(currentVCN) {
+                throw NTFSError.corruptOnDisk(
+                    description: "findInteriorParentChainForLeaf: cycle detected at VCN \(currentVCN)"
+                )
+            }
+            visited.insert(currentVCN)
+
+            let byteOffset = try vcnToByteOffsetInAllocation(
+                vcn: currentVCN,
+                extents: allocationExtents,
+                clusterBytes: clusterBytes
+            )
+            let raw = try await device.read(offset: byteOffset, length: blockSize)
+            let usaOffset = Int(try raw.readU16LE(at: 4))
+            let usaCount = Int(try raw.readU16LE(at: 6))
+            let fixed = try UpdateSequenceArray.applyFixup(
+                recordBytes: raw,
+                usaOffset: usaOffset,
+                usaCount: usaCount,
+                blockSize: sectorSize
+            )
+
+            // INDEX_HEADER at offset 24 in the block.
+            let entriesOffsetWithinHeader = Int(try fixed.readU32LE(at: 24))
+            let usedSizeWithinHeader = Int(try fixed.readU32LE(at: 28))
+            let allocatedSizeWithinHeader = Int(try fixed.readU32LE(at: 32))
+
+            let entriesStart = 24 + entriesOffsetWithinHeader
+            let entriesEnd = 24 + usedSizeWithinHeader
+            let parsed = try parseRootInteriorEntries(in: fixed, start: entriesStart, limit: entriesEnd)
+
+            // Decompose entries into [(non-LAST)] + LAST.subnodeVCN.
+            var interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)] = []
+            var lastSub: UInt64 = 0
+            for e in parsed {
+                if e.isLast {
+                    lastSub = e.subnodeVCN ?? 0
+                } else if let key = e.keyName, e.hasSubnode {
+                    interior.append((key: key, body: e.keyBytes, fileRef: e.fileReference, subnodeVCN: e.subnodeVCN ?? 0))
+                }
+            }
+
+            // Is this an INTERIOR block (has subnodes) or a LEAF (no subnodes)?
+            // Interior iff at least one entry — including LAST — has a subnode.
+            let hasAnySubnode = !interior.isEmpty || parsed.contains(where: { $0.isLast && $0.hasSubnode })
+
+            // Check whether THIS block's pointer set contains leafVCN.
+            // If so, this block IS the leaf's direct parent — append to
+            // chain and return.
+            let pointsAtLeaf = interior.contains(where: { $0.subnodeVCN == leafVCN }) || lastSub == leafVCN
+            if pointsAtLeaf {
+                chain.append(InteriorBlockInfo(
+                    blockVCN: currentVCN,
+                    byteOffset: byteOffset,
+                    blockBytesFixedUp: fixed,
+                    blockSize: blockSize,
+                    sectorSize: sectorSize,
+                    entriesOffsetWithinHeader: entriesOffsetWithinHeader,
+                    allocatedSizeWithinHeader: allocatedSizeWithinHeader,
+                    interior: interior,
+                    lastSubnodeVCN: lastSub
+                ))
+                return chain
+            }
+
+            // Not the direct parent — must be an interior block whose
+            // subnodes are themselves interior. Record + descend.
+            guard hasAnySubnode else {
+                // This is a leaf (no subnodes) but it's not leafVCN — the
+                // descent didn't reach the target. Tree state diverged.
+                throw NTFSError.corruptOnDisk(
+                    description: "findInteriorParentChainForLeaf: descent landed at leaf VCN \(currentVCN), not target \(leafVCN)"
+                )
+            }
+
+            chain.append(InteriorBlockInfo(
+                blockVCN: currentVCN,
+                byteOffset: byteOffset,
+                blockBytesFixedUp: fixed,
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                entriesOffsetWithinHeader: entriesOffsetWithinHeader,
+                allocatedSizeWithinHeader: allocatedSizeWithinHeader,
+                interior: interior,
+                lastSubnodeVCN: lastSub
+            ))
+
+            // Pick next subnode using key-based descent.
+            var nextVCN: UInt64 = lastSub
+            for entry in interior {
+                if !IndexBuilder.collationFilenameSortsBefore(entry.key, searchKey) {
+                    nextVCN = entry.subnodeVCN
+                    break
+                }
+            }
+            currentVCN = nextVCN
+        }
+    }
+
+    /// VCN→byte offset using the directory's $INDEX_ALLOCATION runlist.
+    private func vcnToByteOffsetInAllocation(vcn: UInt64, extents: [Extent], clusterBytes: UInt64) throws -> UInt64 {
+        var cumulative: UInt64 = 0
+        for extent in extents {
+            if vcn < cumulative + extent.clusterCount {
+                let clusterInExtent = vcn - cumulative
+                guard let startLCN = extent.startLCN else {
+                    throw NTFSError.corruptOnDisk(description: "vcnToByteOffsetInAllocation: sparse extent at VCN \(vcn)")
+                }
+                return (startLCN + clusterInExtent) * clusterBytes
+            }
+            cumulative += extent.clusterCount
+        }
+        throw NTFSError.corruptOnDisk(description: "vcnToByteOffsetInAllocation: VCN \(vcn) beyond runlist (total \(cumulative))")
+    }
+
+    /// v0.4 Phase 3(B): promote a (newKey, newRightSubnodeVCN) through an
+    /// intermediate-rooted chain. The leaf's direct parent is `chain.last`.
+    /// `splitLeafVCN` is the left child (existing pointer in that parent).
+    ///
+    /// Algorithm:
+    /// 1. Splice (newKey, newRightSubnodeVCN) into chain.last just AFTER
+    ///    the pointer at `splitLeafVCN`.
+    /// 2. If the resulting block fits its on-disk allocated size: rewrite
+    ///    the intermediate in place; no further promotion needed. Build
+    ///    the parent record bytes (only $INDEX_ALLOCATION runlist + $BITMAP
+    ///    change; $INDEX_ROOT body unchanged).
+    /// 3. If it overflows: NOT IMPLEMENTED IN THIS COMMIT — throw clean
+    ///    unsupportedFeature. (Would require splitting the intermediate
+    ///    and recursing the promotion up the chain.)
+    private func promoteThroughInteriorChain(
+        parent: MFTRecord,
+        attrs: [Attribute],
+        indexRoot: IndexRoot,
+        rootInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        rootLastSubnodeVCN: UInt64,
+        rootBytes: Data,
+        allocationExtents: [Extent],
+        primaryNewExtent: Extent,
+        splitLeafVCN: UInt64,
+        newLeafVCN: UInt64,
+        medianEntry: (fileRef: UInt64, body: Data, sortKey: String)
+    ) async throws -> ComputedSplit {
+        // Step 1: walk the tree to find the leaf's direct parent.
+        let chain = try await findInteriorParentChainForLeaf(
+            rootInterior: rootInterior,
+            rootLastSubnodeVCN: rootLastSubnodeVCN,
+            allocationExtents: allocationExtents,
+            searchKey: medianEntry.sortKey,
+            leafVCN: splitLeafVCN
+        )
+        guard let directParent = chain.last else {
+            throw NTFSError.corruptOnDisk(
+                description: "promoteThroughInteriorChain: empty chain for leafVCN \(splitLeafVCN)"
+            )
+        }
+
+        // Step 2: splice (newKey, newLeafVCN) after splitLeafVCN in the
+        // direct parent's pointer set.
+        let splice = try spliceInteriorEntries(
+            interior: directParent.interior,
+            lastSubnodeVCN: directParent.lastSubnodeVCN,
+            afterSubnode: splitLeafVCN,
+            newKey: medianEntry.sortKey,
+            newKeyBody: medianEntry.body,
+            newKeyFileRef: medianEntry.fileRef,
+            newRightSubnode: newLeafVCN
+        )
+
+        // Step 3: compute the new intermediate block's bytes. If it
+        // overflows the on-disk allocated size, this throws — handled below.
+        let newInteriorBlock: Data
+        do {
+            newInteriorBlock = try buildInteriorIndxBlock(
+                blockSize: directParent.blockSize,
+                sectorSize: directParent.sectorSize,
+                vcn: directParent.blockVCN,
+                interior: splice.newInterior,
+                lastSubnodeVCN: splice.newLastVCN
+            )
+        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("overflow block") {
+            // The intermediate INDX block can't fit another interior
+            // entry. We'd need to split it and recurse promotion up the
+            // chain. Not implemented in this commit (Phase 3(B) full
+            // recursive). Clean abort.
+            throw NTFSError.unsupportedFeature(
+                description: "splitLeaf: intermediate INDX block at VCN \(directParent.blockVCN) is full (depth-N tree, would need recursive interior-block split). Not yet implemented in v0.4 Phase 3(B) — \(desc)"
+            )
+        }
+
+        let newInteriorOnDisk = try UpdateSequenceArray.reverseFixup(
+            recordBytes: newInteriorBlock,
+            usaOffset: Int(try newInteriorBlock.readU16LE(at: 4)),
+            usaCount: Int(try newInteriorBlock.readU16LE(at: 6)),
+            blockSize: directParent.sectorSize
+        )
+
+        // Step 4: parent record stays mostly the same — only
+        // $INDEX_ALLOCATION runlist (+ $BITMAP for newLeafVCN) need to
+        // grow. $INDEX_ROOT body is UNCHANGED since we only modified an
+        // intermediate.
+        let clusterBytes = UInt64(bytesPerCluster)
+        let updatedExtents = mergeAdjacentExtents(allocationExtents + [primaryNewExtent])
+        let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
+        let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
+            attrID: try findIndexAllocationAttributeID(attrs: attrs),
+            extents: updatedExtents,
+            totalBytes: totalIndexAllocClusters * clusterBytes
+        )
+        let updatedBitmapAttrBytes = try updateBitmapAttribute(
+            attrs: attrs,
+            blockIndex: newLeafVCN
+        )
+
+        // Build new parent record (uses the EXISTING $INDEX_ROOT body —
+        // unchanged for this promotion since the root's pointer set
+        // doesn't need updating).
+        let newRecordBytes = try rewriteParentForLeafSplit(
+            parent: parent,
+            newRootBody: rootBytes,  // unchanged
+            newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+            newBitmapAttrBytes: updatedBitmapAttrBytes
+        )
+
+        return ComputedSplit(
+            parentRecordBytes: newRecordBytes,
+            intermediates: [
+                (byteOffset: directParent.byteOffset, postFixupBytes: newInteriorOnDisk)
+            ],
+            extraClustersAllocated: []  // no new allocations needed in this path
+        )
+    }
+
+    /// v0.4 Phase 3(B): splice (newKey, newRightSubnodeVCN) into an
+    /// interior-entry list just AFTER the pointer at `existingChildVCN`.
+    /// Returns the new entry list + new LAST subnode VCN. Used by both
+    /// the $INDEX_ROOT update path AND the intermediate-INDX-block
+    /// rewrite path.
+    private struct InteriorEntriesSplice {
+        let newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)]
+        let newLastVCN: UInt64
+    }
+
+    private func spliceInteriorEntries(
+        interior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)],
+        lastSubnodeVCN: UInt64,
+        afterSubnode existingChildVCN: UInt64,
+        newKey: String,
+        newKeyBody: Data,
+        newKeyFileRef: UInt64,
+        newRightSubnode: UInt64
+    ) throws -> InteriorEntriesSplice {
+        // Model as token list: [V_0, K_1, V_1, K_2, V_2, ..., K_n, V_n].
+        var tokens: [(kind: String, key: String?, body: Data?, fileRef: UInt64?, vcn: UInt64?)] = []
+        if interior.isEmpty {
+            tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: lastSubnodeVCN))
+        } else {
+            tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: interior[0].subnodeVCN))
+            for i in 0..<interior.count {
+                tokens.append((kind: "key", key: interior[i].key, body: interior[i].body, fileRef: interior[i].fileRef, vcn: nil))
+                if i + 1 < interior.count {
+                    tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: interior[i + 1].subnodeVCN))
+                } else {
+                    tokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: lastSubnodeVCN))
+                }
+            }
+        }
+
+        // Splice in (newKey, newRightSubnode) AFTER the VCN token matching existingChildVCN.
+        var spliced = false
+        var newTokens: [(kind: String, key: String?, body: Data?, fileRef: UInt64?, vcn: UInt64?)] = []
+        for t in tokens {
+            newTokens.append(t)
+            if !spliced, t.kind == "vcn", t.vcn == existingChildVCN {
+                newTokens.append((kind: "key", key: newKey, body: newKeyBody, fileRef: newKeyFileRef, vcn: nil))
+                newTokens.append((kind: "vcn", key: nil, body: nil, fileRef: nil, vcn: newRightSubnode))
+                spliced = true
+            }
+        }
+        guard spliced else {
+            throw NTFSError.corruptOnDisk(
+                description: "spliceInteriorEntries: existingChildVCN \(existingChildVCN) not found among interior pointers"
+            )
+        }
+
+        // Re-collapse tokens into interior entries + LAST.
+        var newInterior: [(key: String, body: Data, fileRef: UInt64, subnodeVCN: UInt64)] = []
+        var idx = 0
+        while idx + 2 < newTokens.count {
+            let leftVCN = newTokens[idx].vcn ?? 0
+            let key = newTokens[idx + 1]
+            newInterior.append((
+                key: key.key ?? "",
+                body: key.body ?? Data(),
+                fileRef: key.fileRef ?? 0,
+                subnodeVCN: leftVCN
+            ))
+            idx += 2
+        }
+        let newLastVCN = newTokens.last?.vcn ?? 0
+
+        return InteriorEntriesSplice(newInterior: newInterior, newLastVCN: newLastVCN)
     }
 
     /// Walk the entire LARGE_INDEX tree of `parentRecordNumber` and return
