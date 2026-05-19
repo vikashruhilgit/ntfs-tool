@@ -76,6 +76,60 @@ public actor Volume {
         return mft
     }
 
+    // v0.5 Fix B Step 2(A): $ATTRIBUTE_LIST-aware attribute lookup. When a
+    // base MFT record's attributes overflow into extension records, the base
+    // carries a $ATTRIBUTE_LIST (0x20) pointing at the extension recnums.
+    // resolveAttribute / allAttributesOf walk that list and concatenate the
+    // base + extension attributes so callers can find $INDEX_ROOT / $INDEX_
+    // ALLOCATION / $BITMAP:$I30 even when they've migrated out of the base.
+    // When $ATTRIBUTE_LIST is absent these helpers behave identically to
+    // `record.attributes()` — read paths that worked pre-Fix-B keep working.
+
+    public func allAttributesOf(recordNumber: UInt64) async throws -> [Attribute] {
+        let mft = self.mft()
+        let base = try await mft.record(at: recordNumber)
+        let baseAttrs = try base.attributes()
+        guard let attrListAttr = baseAttrs.first(where: { $0.rawType == AttributeType.attributeList.rawValue }) else {
+            return baseAttrs
+        }
+        let body: Data
+        switch attrListAttr.value {
+        case let .resident(b, _):
+            body = b
+        case let .nonResident(_, _, _, _, _, realSize, _, extents):
+            body = try await readNonResidentData(
+                extents: extents,
+                realSize: realSize,
+                lastVCN: 0
+            )
+        }
+        let entries = try AttributeListEntry.parseAll(in: body)
+        var seenExt: Set<UInt64> = []
+        var extAttrs: [Attribute] = []
+        for e in entries {
+            let rn = e.recordNumber
+            if rn == recordNumber { continue }
+            if seenExt.contains(rn) { continue }
+            seenExt.insert(rn)
+            let extRec = try await mft.record(at: rn)
+            extAttrs.append(contentsOf: try extRec.attributes())
+        }
+        return baseAttrs + extAttrs
+    }
+
+    public func resolveAttribute(
+        recordNumber: UInt64,
+        type: AttributeType,
+        name: String?
+    ) async throws -> Attribute? {
+        let all = try await allAttributesOf(recordNumber: recordNumber)
+        return all.first { a in
+            guard a.rawType == type.rawValue else { return false }
+            if let n = name { return a.nameOrEmpty == n }
+            return true
+        }
+    }
+
     /// MFT record number of the $Bitmap system file. Always 6 on every NTFS
     /// volume — this is part of the NTFS spec, not a per-volume value.
     public static let bitmapRecordNumber: UInt64 = 6
