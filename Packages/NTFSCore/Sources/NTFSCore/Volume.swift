@@ -1815,20 +1815,31 @@ public actor Volume {
         throw NTFSError.corruptOnDisk(description: "vcnToByteOffsetInAllocation: VCN \(vcn) beyond runlist (total \(cumulative))")
     }
 
-    /// v0.4 Phase 3(B): promote a (newKey, newRightSubnodeVCN) through an
-    /// intermediate-rooted chain. The leaf's direct parent is `chain.last`.
-    /// `splitLeafVCN` is the left child (existing pointer in that parent).
+    /// v0.4 Phase 3(B) + 3(C): promote (newKey, newRightSubnodeVCN) through
+    /// the chain of intermediate INDX blocks from leaf's direct parent up
+    /// toward `$INDEX_ROOT`, splitting any intermediate that overflows and
+    /// cascading the new median up to the next level. If the cascade
+    /// reaches `$INDEX_ROOT`, the existing root-update path takes over
+    /// (with Phase 3(A) height-grow as the final fallback).
     ///
-    /// Algorithm:
-    /// 1. Splice (newKey, newRightSubnodeVCN) into chain.last just AFTER
-    ///    the pointer at `splitLeafVCN`.
-    /// 2. If the resulting block fits its on-disk allocated size: rewrite
-    ///    the intermediate in place; no further promotion needed. Build
-    ///    the parent record bytes (only $INDEX_ALLOCATION runlist + $BITMAP
-    ///    change; $INDEX_ROOT body unchanged).
-    /// 3. If it overflows: NOT IMPLEMENTED IN THIS COMMIT — throw clean
-    ///    unsupportedFeature. (Would require splitting the intermediate
-    ///    and recursing the promotion up the chain.)
+    /// Algorithm (iterative, leaf-side-first):
+    /// 1. At each level (chain[i], from leaf up to root):
+    ///    a. Splice the pending (key, rightVCN) into the level's interior
+    ///       entries after the existing leftSubnode pointer.
+    ///    b. Try to build the new interior block. Fits → rewrite this
+    ///       intermediate in place; cascade stops here.
+    ///    c. Overflow → bisect the spliced entries, allocate 1 new
+    ///       cluster for the right half. Write left half (overwriting
+    ///       this intermediate's original location) + right half (new
+    ///       cluster). Promote the bisection median up to the next level.
+    /// 2. If the loop exhausts the chain, the bisection median needs to
+    ///    go into `$INDEX_ROOT`. We invoke the existing root-update path
+    ///    via `computeRootUpdateAfterCascade`, which itself can
+    ///    height-grow if `$INDEX_ROOT` is full.
+    ///
+    /// Tracks all allocated extents in `extraClustersAllocated` so the
+    /// caller's outer rollback frees them on any failure between compute
+    /// and parent-record commit.
     private func promoteThroughInteriorChain(
         parent: MFTRecord,
         attrs: [Attribute],
@@ -1842,7 +1853,7 @@ public actor Volume {
         newLeafVCN: UInt64,
         medianEntry: (fileRef: UInt64, body: Data, sortKey: String)
     ) async throws -> ComputedSplit {
-        // Step 1: walk the tree to find the leaf's direct parent.
+        // Walk tree to find leaf's direct parent + its ancestor intermediates.
         let chain = try await findInteriorParentChainForLeaf(
             rootInterior: rootInterior,
             rootLastSubnodeVCN: rootLastSubnodeVCN,
@@ -1850,58 +1861,147 @@ public actor Volume {
             searchKey: medianEntry.sortKey,
             leafVCN: splitLeafVCN
         )
-        guard let directParent = chain.last else {
+        guard !chain.isEmpty else {
             throw NTFSError.corruptOnDisk(
                 description: "promoteThroughInteriorChain: empty chain for leafVCN \(splitLeafVCN)"
             )
         }
 
-        // Step 2: splice (newKey, newLeafVCN) after splitLeafVCN in the
-        // direct parent's pointer set.
-        let splice = try spliceInteriorEntries(
-            interior: directParent.interior,
-            lastSubnodeVCN: directParent.lastSubnodeVCN,
-            afterSubnode: splitLeafVCN,
-            newKey: medianEntry.sortKey,
-            newKeyBody: medianEntry.body,
-            newKeyFileRef: medianEntry.fileRef,
-            newRightSubnode: newLeafVCN
-        )
+        let clusterBytes = UInt64(bytesPerCluster)
+        // Existing $INDEX_ALLOCATION total VCNs, BEFORE primaryNewExtent.
+        // Each new cluster we allocate during cascade gets the next VCN.
+        let existingVCNCount = allocationExtents.reduce(0) { $0 + $1.clusterCount }
+        var nextNewVCN = existingVCNCount + primaryNewExtent.clusterCount  // VCN of next new cluster
 
-        // Step 3: compute the new intermediate block's bytes. If it
-        // overflows the on-disk allocated size, this throws — handled below.
-        let newInteriorBlock: Data
-        do {
-            newInteriorBlock = try buildInteriorIndxBlock(
-                blockSize: directParent.blockSize,
-                sectorSize: directParent.sectorSize,
-                vcn: directParent.blockVCN,
-                interior: splice.newInterior,
-                lastSubnodeVCN: splice.newLastVCN
+        var pendingKey = medianEntry.sortKey
+        var pendingBody = medianEntry.body
+        var pendingFileRef = medianEntry.fileRef
+        var pendingRightVCN = newLeafVCN
+        var existingLeftSubnodeVCN = splitLeafVCN
+
+        var intermediateWrites: [(byteOffset: UInt64, postFixupBytes: Data)] = []
+        var extraExtents: [Extent] = []
+        var newVCNsForBitmap: [UInt64] = [newLeafVCN]
+
+        var cascadeExhaustedChain = false
+
+        // Walk chain from leaf-side (chain.last) up to root-side (chain.first).
+        for level in chain.reversed() {
+            let splice = try spliceInteriorEntries(
+                interior: level.interior,
+                lastSubnodeVCN: level.lastSubnodeVCN,
+                afterSubnode: existingLeftSubnodeVCN,
+                newKey: pendingKey,
+                newKeyBody: pendingBody,
+                newKeyFileRef: pendingFileRef,
+                newRightSubnode: pendingRightVCN
             )
-        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("overflow block") {
-            // The intermediate INDX block can't fit another interior
-            // entry. We'd need to split it and recurse promotion up the
-            // chain. Not implemented in this commit (Phase 3(B) full
-            // recursive). Clean abort.
-            throw NTFSError.unsupportedFeature(
-                description: "splitLeaf: intermediate INDX block at VCN \(directParent.blockVCN) is full (depth-N tree, would need recursive interior-block split). Not yet implemented in v0.4 Phase 3(B) — \(desc)"
-            )
+
+            // Attempt fits-in-place build.
+            do {
+                let newBlock = try buildInteriorIndxBlock(
+                    blockSize: level.blockSize,
+                    sectorSize: level.sectorSize,
+                    vcn: level.blockVCN,
+                    interior: splice.newInterior,
+                    lastSubnodeVCN: splice.newLastVCN
+                )
+                let onDisk = try UpdateSequenceArray.reverseFixup(
+                    recordBytes: newBlock,
+                    usaOffset: Int(try newBlock.readU16LE(at: 4)),
+                    usaCount: Int(try newBlock.readU16LE(at: 6)),
+                    blockSize: level.sectorSize
+                )
+                intermediateWrites.append((byteOffset: level.byteOffset, postFixupBytes: onDisk))
+                // Cascade stops here.
+                cascadeExhaustedChain = false
+                break
+            } catch NTFSError.unsupportedFeature(let desc) where desc.contains("overflow block") {
+                // This intermediate is full. Split it: bisect spliced
+                // entries around midpoint, allocate cluster for right
+                // half.
+                let mid = splice.newInterior.count / 2
+                guard splice.newInterior.count >= 2 else {
+                    // Single-entry intermediate that can't even fit one
+                    // more — pathological tree shape. Roll back all
+                    // pending allocations and surface.
+                    for ext in extraExtents { try? await freeClusters(ext) }
+                    throw NTFSError.corruptOnDisk(
+                        description: "promoteThroughInteriorChain: intermediate at VCN \(level.blockVCN) reports overflow with only \(splice.newInterior.count) entries — \(desc)"
+                    )
+                }
+                let medianInter = splice.newInterior[mid]
+                let leftHalf = Array(splice.newInterior[0..<mid])
+                let rightHalf = Array(splice.newInterior[(mid + 1)..<splice.newInterior.count])
+
+                // Allocate cluster for right half.
+                let rightExtent: Extent
+                do {
+                    rightExtent = try await allocateClusters(1)
+                } catch {
+                    for ext in extraExtents { try? await freeClusters(ext) }
+                    throw error
+                }
+                guard let rightLCN = rightExtent.startLCN else {
+                    for ext in extraExtents { try? await freeClusters(ext) }
+                    try? await freeClusters(rightExtent)
+                    throw NTFSError.corruptOnDisk(description: "promoteThroughInteriorChain: allocator returned sparse extent")
+                }
+                extraExtents.append(rightExtent)
+                let rightVCN = nextNewVCN
+                nextNewVCN += 1
+                newVCNsForBitmap.append(rightVCN)
+
+                // Build LEFT half (overwrites the original block at level.blockVCN).
+                let leftBlock = try buildInteriorIndxBlock(
+                    blockSize: level.blockSize,
+                    sectorSize: level.sectorSize,
+                    vcn: level.blockVCN,
+                    interior: leftHalf,
+                    lastSubnodeVCN: medianInter.subnodeVCN
+                )
+                let leftOnDisk = try UpdateSequenceArray.reverseFixup(
+                    recordBytes: leftBlock,
+                    usaOffset: Int(try leftBlock.readU16LE(at: 4)),
+                    usaCount: Int(try leftBlock.readU16LE(at: 6)),
+                    blockSize: level.sectorSize
+                )
+                intermediateWrites.append((byteOffset: level.byteOffset, postFixupBytes: leftOnDisk))
+
+                // Build RIGHT half (new cluster).
+                let rightBlock = try buildInteriorIndxBlock(
+                    blockSize: level.blockSize,
+                    sectorSize: level.sectorSize,
+                    vcn: rightVCN,
+                    interior: rightHalf,
+                    lastSubnodeVCN: splice.newLastVCN
+                )
+                let rightOnDisk = try UpdateSequenceArray.reverseFixup(
+                    recordBytes: rightBlock,
+                    usaOffset: Int(try rightBlock.readU16LE(at: 4)),
+                    usaCount: Int(try rightBlock.readU16LE(at: 6)),
+                    blockSize: level.sectorSize
+                )
+                intermediateWrites.append((byteOffset: rightLCN * clusterBytes, postFixupBytes: rightOnDisk))
+
+                // Setup for next iteration: the bisection median must be
+                // promoted to the LEVEL ABOVE this one. The "existing
+                // left subnode" up there is this level's blockVCN
+                // (which now points at the LEFT half) — Phase 3(B)'s
+                // spliceInteriorEntries(afterSubnode: ...) will find it
+                // and splice in (newKey, rightVCN) right after.
+                pendingKey = medianInter.key
+                pendingBody = medianInter.body
+                pendingFileRef = medianInter.fileRef
+                pendingRightVCN = rightVCN
+                existingLeftSubnodeVCN = level.blockVCN
+                cascadeExhaustedChain = true  // continues unless next iter breaks
+            }
         }
 
-        let newInteriorOnDisk = try UpdateSequenceArray.reverseFixup(
-            recordBytes: newInteriorBlock,
-            usaOffset: Int(try newInteriorBlock.readU16LE(at: 4)),
-            usaCount: Int(try newInteriorBlock.readU16LE(at: 6)),
-            blockSize: directParent.sectorSize
-        )
-
-        // Step 4: parent record stays mostly the same — only
-        // $INDEX_ALLOCATION runlist (+ $BITMAP for newLeafVCN) need to
-        // grow. $INDEX_ROOT body is UNCHANGED since we only modified an
-        // intermediate.
-        let clusterBytes = UInt64(bytesPerCluster)
-        let updatedExtents = mergeAdjacentExtents(allocationExtents + [primaryNewExtent])
+        // Build updated $INDEX_ALLOCATION runlist (existing + primary leaf +
+        // any new cluster extents from interior splits).
+        let updatedExtents = mergeAdjacentExtents(allocationExtents + [primaryNewExtent] + extraExtents)
         let totalIndexAllocClusters = updatedExtents.reduce(0) { $0 + $1.clusterCount }
         let updatedIndexAllocAttrBytes = serializeIndexAllocationAttribute(
             attrID: try findIndexAllocationAttributeID(attrs: attrs),
@@ -1910,26 +2010,68 @@ public actor Volume {
         )
         let updatedBitmapAttrBytes = try updateBitmapAttribute(
             attrs: attrs,
-            blockIndex: newLeafVCN
+            blockIndices: newVCNsForBitmap
         )
 
-        // Build new parent record (uses the EXISTING $INDEX_ROOT body —
-        // unchanged for this promotion since the root's pointer set
-        // doesn't need updating).
-        let newRecordBytes = try rewriteParentForLeafSplit(
-            parent: parent,
-            newRootBody: rootBytes,  // unchanged
-            newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
-            newBitmapAttrBytes: updatedBitmapAttrBytes
+        if !cascadeExhaustedChain {
+            // Cascade stopped at some intermediate level. $INDEX_ROOT body
+            // is UNCHANGED. Just rewrite parent record with updated
+            // runlist + bitmap.
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: rootBytes,  // unchanged
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: intermediateWrites,
+                extraClustersAllocated: extraExtents
+            )
+        }
+
+        // Phase 3(C) cascade exhausted the chain. The pending median needs
+        // to land in $INDEX_ROOT. Splice into the root's interior + LAST
+        // sentinel; if root overflows, height-grow.
+        let rootSplice = try spliceInteriorEntries(
+            interior: rootInterior,
+            lastSubnodeVCN: rootLastSubnodeVCN,
+            afterSubnode: existingLeftSubnodeVCN,
+            newKey: pendingKey,
+            newKeyBody: pendingBody,
+            newKeyFileRef: pendingFileRef,
+            newRightSubnode: pendingRightVCN
+        )
+        let newRootBody = serializeLargeIndexRoot(
+            indexAllocationBlockSize: indexRoot.indexAllocationBlockSize,
+            clustersPerIndexBlock: indexRoot.clustersPerIndexBlock,
+            interior: rootSplice.newInterior,
+            lastSubnodeVCN: rootSplice.newLastVCN
         )
 
-        return ComputedSplit(
-            parentRecordBytes: newRecordBytes,
-            intermediates: [
-                (byteOffset: directParent.byteOffset, postFixupBytes: newInteriorOnDisk)
-            ],
-            extraClustersAllocated: []  // no new allocations needed in this path
-        )
+        do {
+            let newRecordBytes = try rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newRootBody,
+                newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
+                newBitmapAttrBytes: updatedBitmapAttrBytes
+            )
+            return ComputedSplit(
+                parentRecordBytes: newRecordBytes,
+                intermediates: intermediateWrites,
+                extraClustersAllocated: extraExtents
+            )
+        } catch NTFSError.unsupportedFeature(let desc) where desc.contains("would overflow parent record") {
+            // Phase 3(D) — cascade reached $INDEX_ROOT AND root needs to
+            // height-grow on top of an already-cascaded depth-N tree.
+            // This is a real-but-rare case (typically several thousand
+            // files per dir in a depth-4+ tree). Not implemented in this
+            // commit — clean abort. Free everything we allocated.
+            for ext in extraExtents { try? await freeClusters(ext) }
+            throw NTFSError.unsupportedFeature(
+                description: "splitLeaf: cascade reached $INDEX_ROOT and root needs height-grow on a depth-N tree (Phase 3(D), not yet implemented). Trigger: \(desc)"
+            )
+        }
     }
 
     /// v0.4 Phase 3(B): splice (newKey, newRightSubnodeVCN) into an

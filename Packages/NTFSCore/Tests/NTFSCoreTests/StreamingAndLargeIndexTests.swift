@@ -372,32 +372,32 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         }
     }
 
-    /// v0.4 Phase 3(A): $INDEX_ROOT height-grow lifts the ~60-file/dir cap.
-    /// When the parent record can't fit another interior entry on a leaf
-    /// split's median promotion, `splitLeafAndPromote` allocates 2 new
-    /// intermediate INDX blocks, bisects $INDEX_ROOT's interior entries
-    /// into them, and replaces $INDEX_ROOT with a tiny new root. Asserts
-    /// inserts continue successfully past where v0.3 would have aborted
-    /// (~60 files/dir on this fixture).
+    /// v0.4 Phase 3(A)+(B)+(C): tree-growth lifts the ~60-file/dir cap.
+    /// Asserts inserts continue successfully past every cap level: 60
+    /// (v0.3 root-overflow), ~120 (Phase 3(A) height-grow), ~3000-5000
+    /// (Phase 3(B)+(C) intermediate-fits + interior-block split).
     func testHeightGrowIndexRootLiftsLeafSplitCap() async throws {
         guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
         let path = try MutableFixture.scopedCopy("small.img", testCase: self)
         let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let volume = try await Volume(device: device)
-        try await volume.growMFTDataByClusters(8)
-        try await volume.growMFTDataByClusters(8)
+        // Grow MFT $DATA aggressively so the test exercises the index
+        // algorithm's cap, not the MFT-slot cap.
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
 
-        // Insert until we hit the Phase 3(B) (intermediate-block split)
-        // limit. v0.3 capped at ~60; v0.4 Phase 3(A) should reach >75.
+        // Insert as many files as the index algorithm allows before
+        // hitting Phase 3(D) (root-overflow on cascaded depth-N tree)
+        // — which we don't expect to fire on this fixture.
         var inserted = 0
-        for i in 0..<300 {
+        for i in 0..<3000 {
             let name = String(format: "heightgrow-%04d.txt", i)
             do {
                 _ = try await volume.createFile(named: name, inDirectory: 5)
                 inserted += 1
             } catch NTFSError.unsupportedFeature {
-                // Hit the Phase 3(B) limit (intermediate-block split needed
-                // but not yet implemented). Clean abort.
                 break
             }
         }
@@ -405,7 +405,7 @@ final class StreamingAndLargeIndexTests: XCTestCase {
         FileHandle.standardError.write(Data("[heightgrow] inserted=\(inserted)\n".utf8))
         XCTAssertGreaterThan(
             inserted, 75,
-            "v0.4 Phase 3(A) height-grow should lift the leaf-split cap past v0.3's ~75 ceiling. Got \(inserted)."
+            "v0.4 tree-growth should lift the leaf-split cap past v0.3's ~75 ceiling. Got \(inserted)."
         )
 
         // Correctness backstop: every inserted name must be reachable +
