@@ -2,7 +2,7 @@
 
 This document is the single source of truth for project state. Updated when major work lands.
 
-**Last updated:** 2026-05-19, after v0.3 leaf-split silent-orphan fix validated on real 4 TB WD hardware (22,419-file phone-backup cp -r → clean `unsupportedFeature` abort at file 63, **0 orphans** vs. 11 silent orphans pre-v0.3). Also shipped `ntfsctl reclaim-orphans` subcommand (native equivalent of `ntfsfix --no-action --clear-bad-sectors` for the orphan-reclaim case). Builds on the v0.2 audit-driven push: T0 safety (dirty bit + fsync + flock + rm safety + --recnum + verify cap + MIT LICENSE), T1.1 MFT $BITMAP allocator, T1.2 LARGE_INDEX leaf split, T1.3 LARGE_INDEX size hint refresh, T1.4 mtime updates, T2.1 release CI workflow.
+**Last updated:** 2026-05-19, after v0.5 Fix B Step 3 — `$INDEX_ALLOCATION` migration write path — landed (read path + migration commit; 120/120 NTFSCore tests pass). Builds on Step 1+2's `$ATTRIBUTE_LIST` parse/serialize + `Volume.resolveAttribute` / `allAttributesOf` read-path foundation. Earlier in the cycle: v0.4 `$INDEX_ROOT` multi-level split (Phases 3(A)–(D); per-dir capacity bounded only by free clusters + MFT slots), bitmap dirty-range tracking (~400-500× per-file speedup on USB), and the v0.3 leaf-split silent-orphan fix validated on real 4 TB WD hardware (22,419-file phone-backup cp -r → clean `unsupportedFeature` abort at file 63, **0 orphans** vs. 11 silent orphans pre-v0.3). Hardware validation of Step 3 against the real WD My Passport is still pending — user manual step.
 
 **Audit status:** every FATAL + CRITICAL item from [`AUDIT-REPORT.md`](../AUDIT-REPORT.md) is closed. WARNING #9 (streaming bitmap reader) and #11 (pre-baked test Docker image) deferred to v0.3.
 **Rubric score:** 30/30 baseline from `.supervisor/requirements/auto-2026-05-14-203703-ntfs-multi-phase-rubric.md`, plus three follow-on capabilities (see "What's done — post-v0.1 enhancements").
@@ -154,7 +154,7 @@ Code is complete. Builds clean. **Has not been run with the extension actually l
 
 | Validation tier | What it checks | Status |
 |---|---|---|
-| **Unit tests** (`swift test`) | All NTFSCore parsers + write paths against fixtures | ✅ 107/107 passing |
+| **Unit tests** (`swift test`) | All NTFSCore parsers + write paths against fixtures | ✅ 120/120 passing |
 | **`ntfsfix --no-action`** | Volume passes the canonical Linux NTFS fsck after our writes | ✅ via integration test |
 | **`ntfs-3g` mount + cat** | Canonical Linux NTFS driver reads back our writes byte-exact | ✅ via integration test |
 | **Real Windows-formatted drive** | NTFSCore parses a real 4 TB Western Digital My Passport drive | ✅ via manual `ntfsctl verify` |
@@ -275,7 +275,23 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 8. **`cp --resume`.** Skip files already present at destination (by name + size match, or optional SHA-256). Important for multi-GB copies over flaky USB. ~1 day.
 9. **Streaming bitmap reader.** `$Bitmap` is loaded whole into RAM (~250 MB for 8 TB volumes). Chunk on demand. ~1-2 days. Defer to v0.4.
 10. **`cp -r` bulk-write perf.** Three contributors. **(a)** ~~`refreshParentI30Size` deferral~~ ✅ Done (v0.4 Phase 1). `Volume.beginBulkInsert(into:)` / `endBulkInsert()` defer per-file size-hint refreshes. **(b)** ~~INDX-leaf coalescing~~ ✅ Done (v0.4 Phase 2). `BulkLeafCache` holds parsed leaf state across consecutive inserts; 50-file batches collapse 50 leaf reads + 50 leaf writes into 1 read + 1 final write. Combined ~3-5× speedup expected. **(c) async write pipelining** — issue write N+1 while N is in flight. Bigger refactor (~3-5 days); v0.4 Phase 4, conditional on whether (a)+(b) are enough.
-11. **`$INDEX_ROOT` multi-level split.** ✅ **All four sub-phases done.** Phase 3(A) — `$INDEX_ROOT` height-grow (tree depth 2 → 3). Phase 3(B) — promote median into intermediate INDX block (depth-3 fits case). Phase 3(C) — recursive cascade (when an intermediate overflows, bisect + promote up the chain). Phase 3(D) — height-grow root after cascade exhausts the chain. **Per-dir capacity is now bounded only by free clusters and MFT slots on the volume — no algorithmic cap.** The small fixture caps at ~1077 inserts due to MFT-slot exhaustion (slot 1100 past `$MFT.$DATA`'s allocatedSize); real 4 TB volumes have ~500 million MFT slots, so a single directory can hold any practical number of files. **v0.5 follow-up — `$INDEX_ALLOCATION` runlist cap (file ~350 on real hardware):** the read-path foundation has landed in v0.5 (`Volume.resolveAttribute` / `allAttributesOf` + `$ATTRIBUTE_LIST` entry parse/serialize). The migration write path — relocating an oversized `$INDEX_ALLOCATION` to an extension MFT record — is the next PR.
+11. **`$INDEX_ROOT` multi-level split.** ✅ **All four sub-phases done.** Phase 3(A) — `$INDEX_ROOT` height-grow (tree depth 2 → 3). Phase 3(B) — promote median into intermediate INDX block (depth-3 fits case). Phase 3(C) — recursive cascade (when an intermediate overflows, bisect + promote up the chain). Phase 3(D) — height-grow root after cascade exhausts the chain. **Per-dir capacity is now bounded only by free clusters and MFT slots on the volume — no algorithmic cap.** The small fixture caps at ~1077 inserts due to MFT-slot exhaustion (slot 1100 past `$MFT.$DATA`'s allocatedSize); real 4 TB volumes have ~500 million MFT slots, so a single directory can hold any practical number of files.
+
+    **v0.5 follow-up — `$INDEX_ALLOCATION` runlist cap (file ~350 on real hardware): read + migration write path ✅ landed.** Step 1+2 read-path foundation (`Volume.resolveAttribute` / `allAttributesOf` + `$ATTRIBUTE_LIST` entry parse/serialize) landed earlier in v0.5. Step 3 — the migration write path — now lands: when `$INDEX_ALLOCATION:$I30`'s runlist would overflow the base record's slack, the attribute is migrated to a fresh extension MFT record and a resident `$ATTRIBUTE_LIST` (type 0x20) is built on the base. Compute-first transactional commit; orphan rollback via `reclaimOrphanedMFTRecord` on any failure between extension-slot allocation and final base write. 3 new unit tests; 120/120 NTFSCore tests pass.
+
+    **chkdsk-clean on-disk shape after migration:**
+    - `$STANDARD_INFORMATION` (type 0x10) — stays resident in the base record (chkdsk requirement).
+    - `$FILE_NAME` (type 0x30) — stays resident in the base record (chkdsk requirement).
+    - `$ATTRIBUTE_LIST` (type 0x20) — resident on the base record; body lists every attribute the file owns (base + extension), sorted per NTFS canon (type ascending, then name UTF-16, then lowestVCN). Each entry's `mftReference` packs as `(UInt64(seq) << 48) | (recnum & 0x0000_FFFF_FFFF_FFFF)`.
+    - Extension MFT record — IN_USE flag set, DIRECTORY bit clear, `baseFileReference` packed back at the base record's reference (same 48-bit recnum / 16-bit sequence layout). `mftRecordNumber` populated; USA fix-up applied.
+    - `$INDEX_ROOT:$I30` (type 0x90) — stays resident in the base record.
+    - `$INDEX_ALLOCATION:$I30` (type 0xA0, non-resident) — relocated to the extension record with its full runlist.
+    - `$BITMAP:$I30` (type 0xB0) — stays in the base record in this PR (Step C bitmap migration is deferred).
+
+    **Remaining v0.5 follow-ups (deferred — not blocking this PR):**
+    - **Post-migration write path** — subsequent inserts into an already-migrated directory (i.e., a directory whose `$INDEX_ALLOCATION` already lives on an extension record via `$ATTRIBUTE_LIST`) still go through paths that don't yet follow `$ATTRIBUTE_LIST` on the WRITE side. Tracked on main per commit `bd250a9`. This PR's tests assert reopen + read-path round-trip is durable; further-growth on already-migrated directories needs an additional follow-up. Read path is complete.
+    - **Step 3.5 — non-resident `$ATTRIBUTE_LIST`.** If the resident `$ATTRIBUTE_LIST` body itself wouldn't fit in base record slack, migration throws `unsupportedFeature("Fix B Step 3.5: $ATTRIBUTE_LIST exceeds parent slack — non-resident $ATTRIBUTE_LIST not yet implemented")` and the v0.4 cap continues to hold. Practically unreachable until a directory has very many attributes (many alternate data streams + named EAs). Defer until a real-world fixture demands it.
+    - **`$BITMAP`-only Step C migration.** If `$BITMAP:$I30` (rather than `$INDEX_ALLOCATION:$I30`) is the attribute that overflows, the v0.4 height-grow fall-through still applies. In practice `$INDEX_ALLOCATION` is far larger and overflows long before `$BITMAP`, so this is low priority.
 
 ### Medium-impact
 
