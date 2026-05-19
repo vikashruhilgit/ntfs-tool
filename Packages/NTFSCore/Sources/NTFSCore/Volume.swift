@@ -80,10 +80,11 @@ public actor Volume {
     // base MFT record's attributes overflow into extension records, the base
     // carries a $ATTRIBUTE_LIST (0x20) pointing at the extension recnums.
     // resolveAttribute / allAttributesOf walk that list and concatenate the
-    // base + extension attributes so callers can find $INDEX_ROOT / $INDEX_
-    // ALLOCATION / $BITMAP:$I30 even when they've migrated out of the base.
-    // When $ATTRIBUTE_LIST is absent these helpers behave identically to
-    // `record.attributes()` — read paths that worked pre-Fix-B keep working.
+    // base + extension attributes so callers can find
+    // $INDEX_ROOT / $INDEX_ALLOCATION / $BITMAP:$I30 even when they've
+    // migrated out of the base. When $ATTRIBUTE_LIST is absent these
+    // helpers behave identically to `record.attributes()` — read paths
+    // that worked pre-Fix-B keep working.
 
     public func allAttributesOf(recordNumber: UInt64) async throws -> [Attribute] {
         let mft = self.mft()
@@ -112,6 +113,15 @@ public actor Volume {
             if seenExt.contains(rn) { continue }
             seenExt.insert(rn)
             let extRec = try await mft.record(at: rn)
+            // Defence in depth: an $ATTRIBUTE_LIST entry whose sequenceNumber
+            // doesn't match the resolved extension record's sequenceNumber
+            // means we're following a stale pointer at a recycled MFT slot.
+            // Better to fail loud than silently read the wrong file's data.
+            guard extRec.sequenceNumber == e.sequenceNumber else {
+                throw NTFSError.corruptOnDisk(
+                    description: "ATTR_LIST entry recnum \(rn) seq \(e.sequenceNumber) != record seq \(extRec.sequenceNumber) (base recnum \(recordNumber))"
+                )
+            }
             extAttrs.append(contentsOf: try extRec.attributes())
         }
         return baseAttrs + extAttrs
@@ -2248,9 +2258,7 @@ public actor Volume {
     /// the set of distinct fileReferences visible. Used as a post-split
     /// self-check.
     private func collectAllFileRefsInLargeIndex(parentRecordNumber: UInt64) async throws -> Set<UInt64> {
-        let mft = self.mft()
-        let parent = try await mft.record(at: parentRecordNumber)
-        let attrs = try parent.attributes()
+        let attrs = try await allAttributesOf(recordNumber: parentRecordNumber)
         guard let irAttr = attrs.first(where: { $0.type == .indexRoot && $0.nameOrEmpty == "$I30" }),
               case let .resident(rootBytes, _) = irAttr.value else {
             return []
@@ -2306,7 +2314,12 @@ public actor Volume {
         }
         let attrs: [Attribute]
         do {
-            attrs = try rec.attributes()
+            // $ATTRIBUTE_LIST-aware: once Fix B Step 3 migrates $INDEX_ALLOCATION
+            // into an extension record, the verifier must follow the same path
+            // every reader does. The base-only `rec.attributes()` would miss
+            // the migrated attribute and the LARGE_INDEX assertion below
+            // would false-positive on a well-formed migrated record.
+            attrs = try await allAttributesOf(recordNumber: recordNumber)
         } catch {
             throw NTFSError.corruptOnDisk(
                 description: "verifyParentRecord(\(recordNumber), \(context)): attribute iteration failed: \(error)"
