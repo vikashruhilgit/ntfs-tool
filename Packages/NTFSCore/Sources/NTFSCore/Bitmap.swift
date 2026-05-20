@@ -146,11 +146,16 @@ public struct Bitmap: Sendable, Equatable {
     /// Allocate a single contiguous run of `count` clusters. Returns the
     /// starting LCN. Throws `outOfSpace` if no such run is available.
     /// Mutates the bitmap to mark the run allocated.
-    public mutating func allocate(_ count: UInt64) throws -> Extent {
+    ///
+    /// `startingAt` is the next-fit search hint: the search begins there and
+    /// wraps around to cluster 0, so a stale/high hint never strands free
+    /// space below it. Default 0 preserves first-fit-from-0 behavior for
+    /// callers that don't track a hint.
+    public mutating func allocate(_ count: UInt64, startingAt: UInt64 = 0) throws -> Extent {
         guard count > 0 else {
             throw NTFSError.ioFailure(description: "allocate: count must be > 0")
         }
-        guard let startLCN = findFreeRun(count: count) else {
+        guard let startLCN = findFreeRun(count: count, startingAt: startingAt) else {
             throw NTFSError.outOfSpace(
                 requestedClusters: count,
                 freeClusters: freeClusterCount
@@ -167,17 +172,43 @@ public struct Bitmap: Sendable, Equatable {
         try markFree(startLCN: startLCN, count: extent.clusterCount)
     }
 
-    /// Find the first run of `count` consecutive free clusters at or after
-    /// `startingAt`. Returns nil if no such run exists. O(N) over the
-    /// bitmap — efficient enough for v1 reads; Phase 5b's allocator will add
-    /// a free-list cache for write hot paths.
+    /// Find the first run of `count` consecutive free clusters, searching
+    /// next-fit from `startingAt` with wrap-around: scan `[startingAt,
+    /// clusterCount)` first, then `[0, startingAt)`. Returns nil if no such
+    /// run exists anywhere on the volume. O(N) over the bitmap — efficient
+    /// enough for v1; the rolling hint keeps sequential cp -r writes
+    /// contiguous, and the wrap-around guarantees no free space below the
+    /// hint is stranded.
+    ///
+    /// A run never spans the wrap boundary: each pass scans independently
+    /// with its own accumulator, so a run that would start near the end and
+    /// "continue" past clusterCount into low clusters is never returned —
+    /// that would be a non-contiguous LCN range, which Extent can't express.
+    /// When `startingAt == 0` (or `>= clusterCount`, a stale hint we clamp to
+    /// 0) the second pass is empty, so behavior matches a single full scan.
     public func findFreeRun(count: UInt64, startingAt: UInt64 = 0) -> UInt64? {
         guard count > 0 else { return startingAt }
+        // Clamp a stale hint so it can't break the search.
+        let hint = startingAt < clusterCount ? startingAt : 0
+        // Pass 1: [hint, clusterCount). Pass 2: [0, hint).
+        if let found = findFreeRun(count: count, from: hint, to: clusterCount) {
+            return found
+        }
+        if hint > 0, let found = findFreeRun(count: count, from: 0, to: hint) {
+            return found
+        }
+        return nil
+    }
+
+    /// Single forward pass over `[from, to)` for a run of `count` free
+    /// clusters. The run must lie wholly within the half-open range — the
+    /// accumulator resets at `to`, never wrapping.
+    private func findFreeRun(count: UInt64, from: UInt64, to: UInt64) -> UInt64? {
         var runStart: UInt64? = nil
         var runLength: UInt64 = 0
 
-        var c = startingAt
-        while c < clusterCount {
+        var c = from
+        while c < to {
             if !isAllocated(cluster: c) {
                 if runStart == nil { runStart = c }
                 runLength += 1
