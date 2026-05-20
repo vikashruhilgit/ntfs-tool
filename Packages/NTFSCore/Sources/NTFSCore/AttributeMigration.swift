@@ -32,21 +32,49 @@ public enum AttributeMigration {
         }
     }
 
-    /// Build a migration of the unique `$INDEX_ALLOCATION:$I30` attribute out
-    /// of the base record and into a new extension record, adding a resident
-    /// `$ATTRIBUTE_LIST` to the base in its place.
+    /// Build a migration of a single named-or-unnamed attribute (identified by
+    /// `migratingType` + `migratingName`) out of the base record and into a new
+    /// extension record, adding a resident `$ATTRIBUTE_LIST` to the base in its
+    /// place that names every attribute the file still owns.
     ///
-    /// Throws `NTFSError.unsupportedFeature` if the resident `$ATTRIBUTE_LIST`
-    /// itself does not fit in the base record's slack — non-resident
-    /// `$ATTRIBUTE_LIST` is deferred to v0.5+.
-    public static func buildIndexAllocationMigration(
+    /// The migrant is the unique attribute whose `type == migratingType` and
+    /// `name == migratingName` (use `""` for unnamed attributes). For example
+    /// `migratingType: AttributeType.indexAllocation.rawValue, migratingName: "$I30"`
+    /// migrates a directory's index allocation; `migratingType:
+    /// AttributeType.data.rawValue, migratingName: ""` migrates an unnamed
+    /// `$DATA`.
+    ///
+    /// Throws `NTFSError.corruptOnDisk` if the base record holds no attribute
+    /// matching the requested type/name. Throws `NTFSError.unsupportedFeature`
+    /// if the resident `$ATTRIBUTE_LIST` itself does not fit in the base
+    /// record's slack — non-resident `$ATTRIBUTE_LIST` is deferred to v0.5+.
+    ///
+    /// `newAttributeBytes` (v0.5 Fix B Step 4): when non-nil, the extension
+    /// record holds THESE bytes for the migrant instead of the verbatim copy
+    /// taken from the base record. This is the `$DATA`-overflow path: the
+    /// caller has just grown a file's non-resident `$DATA` past the base
+    /// record's slack and wants the freshly-built (would-overflow) `$DATA`
+    /// attribute persisted in the extension, NOT the stale resident/old
+    /// `$DATA` that is still on the base. The substitute bytes MUST carry the
+    /// SAME attribute ID and SAME `startingVCN` (0 for an unsplit attribute)
+    /// as the migrant they replace, so the `$ATTRIBUTE_LIST` entry — which is
+    /// built from the *scanned migrant's* attributeID / startingVCN — stays
+    /// coherent with what physically lands in the extension. (The unnamed
+    /// `$DATA` write paths satisfy this: they serialize with
+    /// `dataAttr.header.attributeID` and VCN 0, exactly the migrant's values.)
+    /// When nil (the `$INDEX_ALLOCATION` path) the migrant is moved verbatim
+    /// and the output is byte-identical to the pre-Step-4 behaviour.
+    public static func buildAttributeMigration(
         baseRecordBytes: Data,
         baseRN: UInt64,
         baseSeq: UInt16,
         extRN: UInt64,
         extSeq: UInt16,
+        migratingType: UInt32,
+        migratingName: String,
         recordSize: Int,
-        sectorSize: Int
+        sectorSize: Int,
+        newAttributeBytes: Data? = nil
     ) throws -> Result {
         guard baseRecordBytes.count == recordSize else {
             throw NTFSError.corruptOnDisk(
@@ -71,7 +99,7 @@ public enum AttributeMigration {
         //   - the bytes of every attribute (so we can splice them back)
         //   - per-attribute (type, name, attrID, startingVCN) for the
         //     $ATTRIBUTE_LIST entries
-        //   - the migrant ($INDEX_ALLOCATION:$I30) bytes specifically
+        //   - the migrant (matching migratingType/migratingName) bytes specifically
         let scan = try scanAttributes(
             in: baseRecordBytes,
             firstAttributeOffset: Int(firstAttrOffset),
@@ -79,10 +107,10 @@ public enum AttributeMigration {
         )
 
         guard let migrantIndex = scan.firstIndex(where: { entry in
-            entry.type == AttributeType.indexAllocation.rawValue && entry.name == "$I30"
+            entry.type == migratingType && entry.name == migratingName
         }) else {
             throw NTFSError.corruptOnDisk(
-                description: "AttributeMigration: base record has no $INDEX_ALLOCATION:$I30 to migrate"
+                description: "AttributeMigration: base record has no attribute type 0x\(String(migratingType, radix: 16)) name '\(migratingName)' to migrate"
             )
         }
         let migrant = scan[migrantIndex]
@@ -165,10 +193,22 @@ public enum AttributeMigration {
         MFTRecord.writeU32LE(into: &newBase, at: 24, value: UInt32(newUsedSize))
         MFTRecord.writeU16LE(into: &newBase, at: 40, value: nextAttrID &+ 1)
 
-        // Build the extension record holding just the migrated $INDEX_ALLOCATION.
-        let migrantBytes = baseRecordBytes.subdata(
-            in: (baseRecordBytes.startIndex + migrant.start)..<(baseRecordBytes.startIndex + migrant.start + migrant.length)
-        )
+        // Build the extension record holding the migrated attribute. By
+        // default this is the migrant copied VERBATIM out of the base
+        // ($INDEX_ALLOCATION path). For the $DATA-overflow path the caller
+        // supplies `newAttributeBytes` — the freshly-built (would-overflow)
+        // $DATA attribute — and the extension holds THOSE bytes so the new
+        // content is what persists. The $ATTRIBUTE_LIST entry above already
+        // references the migrant by its scanned attributeID + startingVCN, so
+        // the substitute bytes must agree (see this function's doc comment).
+        let migrantBytes: Data
+        if let substitute = newAttributeBytes {
+            migrantBytes = substitute
+        } else {
+            migrantBytes = baseRecordBytes.subdata(
+                in: (baseRecordBytes.startIndex + migrant.start)..<(baseRecordBytes.startIndex + migrant.start + migrant.length)
+            )
+        }
         let newExt = try MFTRecord.buildExtensionRecord(
             recordNumber: extRN,
             sequenceNumber: extSeq,
@@ -184,6 +224,37 @@ public enum AttributeMigration {
         )
 
         return Result(newBaseBytes: newBase, newExtBytes: newExt)
+    }
+
+    /// Build a migration of the unique `$INDEX_ALLOCATION:$I30` attribute out
+    /// of the base record and into a new extension record, adding a resident
+    /// `$ATTRIBUTE_LIST` to the base in its place.
+    ///
+    /// Thin wrapper over `buildAttributeMigration` for the directory-index case.
+    ///
+    /// Throws `NTFSError.unsupportedFeature` if the resident `$ATTRIBUTE_LIST`
+    /// itself does not fit in the base record's slack — non-resident
+    /// `$ATTRIBUTE_LIST` is deferred to v0.5+.
+    public static func buildIndexAllocationMigration(
+        baseRecordBytes: Data,
+        baseRN: UInt64,
+        baseSeq: UInt16,
+        extRN: UInt64,
+        extSeq: UInt16,
+        recordSize: Int,
+        sectorSize: Int
+    ) throws -> Result {
+        try buildAttributeMigration(
+            baseRecordBytes: baseRecordBytes,
+            baseRN: baseRN,
+            baseSeq: baseSeq,
+            extRN: extRN,
+            extSeq: extSeq,
+            migratingType: AttributeType.indexAllocation.rawValue,
+            migratingName: "$I30",
+            recordSize: recordSize,
+            sectorSize: sectorSize
+        )
     }
 
     // MARK: — Internal raw attribute scan
