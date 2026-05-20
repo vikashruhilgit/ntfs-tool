@@ -57,9 +57,13 @@ final class BitmapTests: XCTestCase {
     }
 
     func testFindFreeRunStartingAt() {
+        // 0b11000111: clusters 0,1,2 alloc; 3,4,5 free; 6,7 alloc.
         let bm = Bitmap(bytes: Data([0b11000111]), clusterCount: 8)
         XCTAssertEqual(bm.findFreeRun(count: 2, startingAt: 4), 4)
-        XCTAssertNil(bm.findFreeRun(count: 2, startingAt: 6))  // 6,7 are allocated
+        // v0.5: findFreeRun now wraps around. Starting at 6 (where 6,7 are
+        // allocated) the search wraps to [0,6) and finds the free run at
+        // cluster 3 — no free space below the hint is stranded.
+        XCTAssertEqual(bm.findFreeRun(count: 2, startingAt: 6), 3)
     }
 
     func testFindFreeRunSpansByteBoundary() {

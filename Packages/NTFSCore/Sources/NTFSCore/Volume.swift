@@ -146,6 +146,15 @@ public actor Volume {
 
     private var _bitmap: Bitmap?
 
+    /// Next-fit allocator search hint: the cluster immediately after the last
+    /// one we allocated. `allocateClusters` searches from here (with wrap-
+    /// around) so sequential writes during a single `cp -r` produce
+    /// contiguous, single-extent runlists instead of refilling scattered
+    /// holes near cluster 0. In-memory per-Volume state — resets to 0 on each
+    /// fresh open; not persisted on disk (v0.5). `Volume` is an actor, so
+    /// mutations are already serialized.
+    private var _allocHint: UInt64 = 0
+
     /// Read and cache the volume's $Bitmap. The $Bitmap attribute is one bit
     /// per cluster (1 = allocated, 0 = free). On the read-only mount this
     /// answer is stable for the lifetime of the Volume, so we cache it; the
@@ -3977,9 +3986,13 @@ public actor Volume {
             // at the requested size. Start from remaining and halve until 1.
             var trySize = remaining
             while trySize >= 1 {
-                if let extent = try? bm.allocate(trySize) {
+                if let extent = try? bm.allocate(trySize, startingAt: _allocHint) {
                     extents.append(extent)
                     taken = trySize
+                    // Advance the hint so the next sub-run continues from where
+                    // this one ended, keeping the fragments as close to
+                    // contiguous as the bitmap allows.
+                    advanceAllocHint(after: extent, clusterCount: bm.clusterCount)
                     break
                 }
                 if trySize == 1 { break }
@@ -4818,20 +4831,40 @@ public actor Volume {
     /// is large enough (common on fragmented volumes).
     public func allocateClusters(_ count: UInt64) async throws -> Extent {
         var bm = try await bitmap()
-        let extent = try bm.allocate(count)
+        let extent = try bm.allocate(count, startingAt: _allocHint)
         try await persistBitmap(bm)
         bm.clearDirty()
         _bitmap = bm
+        advanceAllocHint(after: extent, clusterCount: bm.clusterCount)
         return extent
     }
 
+    /// Advance the next-fit hint to the cluster immediately after the last one
+    /// in `extent`, wrapping modulo `clusterCount`. No-op for sparse extents
+    /// or a zero-cluster volume.
+    private func advanceAllocHint(after extent: Extent, clusterCount: UInt64) {
+        guard clusterCount > 0, let startLCN = extent.startLCN else { return }
+        _allocHint = (startLCN + extent.clusterCount) % clusterCount
+    }
+
     /// Free a previously-allocated extent and persist the updated $Bitmap.
+    /// Deliberately does NOT rewind `_allocHint` toward the freed range:
+    /// freeing is rare on the cp -r path, and rewinding would send the next
+    /// allocation back to refill the just-freed holes — re-introducing exactly
+    /// the fragmentation the next-fit hint exists to avoid.
     public func freeClusters(_ extent: Extent) async throws {
         var bm = try await bitmap()
         try bm.free(extent)
         try await persistBitmap(bm)
         bm.clearDirty()
         _bitmap = bm
+    }
+
+    /// Test-only accessor for the next-fit allocator hint. Not part of the
+    /// public API contract — exposed `internal` for `@testable` assertions in
+    /// AllocatorTests.
+    internal func _currentAllocHintForTesting() -> UInt64 {
+        _allocHint
     }
 
     /// Persist the in-memory Bitmap back to the on-disk $Bitmap attribute.
