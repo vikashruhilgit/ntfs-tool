@@ -382,9 +382,10 @@ final class AttributeListMigrationTests: XCTestCase {
         let recordBytes = try builder.build()
 
         // (1) Pure-builder discrimination: the migration builder rejects a
-        //     base record lacking $INDEX_ALLOCATION:$I30 with a clean
-        //     `corruptOnDisk` (the "no $INDEX_ALLOCATION:$I30 to migrate"
-        //     guard). This proves we won't silently no-op or mis-migrate.
+        //     base record lacking the requested migrant with a clean
+        //     `corruptOnDisk`. The generalized builder names the missing
+        //     type/name in its guard (the wrapper requests type 0xA0 / "$I30").
+        //     This proves we won't silently no-op or mis-migrate.
         var threwExpected = false
         do {
             _ = try AttributeMigration.buildIndexAllocationMigration(
@@ -397,10 +398,10 @@ final class AttributeListMigrationTests: XCTestCase {
                 sectorSize: sectorSize
             )
         } catch NTFSError.corruptOnDisk(let desc) where
-            desc.contains("no $INDEX_ALLOCATION:$I30 to migrate") {
+            desc.contains("no attribute type 0xa0 name '$I30' to migrate") {
             threwExpected = true
         } catch {
-            XCTFail("expected corruptOnDisk with 'no $INDEX_ALLOCATION:$I30' guard; got \(error)")
+            XCTFail("expected corruptOnDisk naming the missing 0xa0/'$I30' migrant; got \(error)")
         }
         XCTAssertTrue(threwExpected, "migration builder must refuse records without $INDEX_ALLOCATION:$I30")
 

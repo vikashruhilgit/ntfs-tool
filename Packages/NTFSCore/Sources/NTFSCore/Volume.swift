@@ -3451,6 +3451,19 @@ public actor Volume {
         }
 
         let attrs = try record.attributes()
+        // v0.5 Fix B Step 4 (AC-7): a SUBSEQUENT write to an already-migrated
+        // file — base carries an $ATTRIBUTE_LIST and its unnamed $DATA now
+        // lives in an extension record — is DEFERRED. `rewriteEntireAttribute`
+        // is not $ATTRIBUTE_LIST-aware: it splices into a single record's byte
+        // stream by locating the target type/name IN THAT RECORD, so it would
+        // fail to find $DATA on the base (or, worse, mis-splice). Re-writing a
+        // migrated file's $DATA in place across base+extension is a later
+        // subtask; until then bail cleanly rather than corrupt on disk.
+        if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
+            throw NTFSError.unsupportedFeature(
+                description: "write: MFT record \(recordNumber) has $ATTRIBUTE_LIST (migrated $DATA in extension); re-writing a migrated file is not yet supported"
+            )
+        }
         guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
             throw NTFSError.corruptOnDisk(description: "write: MFT record \(recordNumber) lacks unnamed $DATA")
         }
@@ -3528,16 +3541,34 @@ public actor Volume {
             )
         }
 
-        // Replace the attribute in the MFT record.
-        let newRecordBytes = try rewriteEntireAttribute(
-            in: record.bytes,
-            firstAttributeOffset: Int(record.firstAttributeOffset),
-            usedSize: Int(record.usedSize),
-            recordSize: Int(record.allocatedSize),
-            replacingType: AttributeType.data.rawValue,
-            attributeName: "",
-            replacementBytes: newDataAttr
-        )
+        // Replace the attribute in the MFT record. As in `writeFile`, if the
+        // new $DATA attribute would overflow the base record (v0.5 Fix B Step
+        // 4), migrate the unnamed $DATA into a fresh extension record holding
+        // THESE freshly-built bytes and drop an $ATTRIBUTE_LIST on the base.
+        // The content clusters are already written above; do NOT retry
+        // rewriteEntireAttribute against the now-$DATA-less base.
+        let newRecordBytes: Data
+        do {
+            newRecordBytes = try rewriteEntireAttribute(
+                in: record.bytes,
+                firstAttributeOffset: Int(record.firstAttributeOffset),
+                usedSize: Int(record.usedSize),
+                recordSize: Int(record.allocatedSize),
+                replacingType: AttributeType.data.rawValue,
+                attributeName: "",
+                replacementBytes: newDataAttr
+            )
+        } catch NTFSError.unsupportedFeature(let desc)
+            where isOverflowDescription(desc)
+                && overflowingAttributeType(from: desc) == AttributeType.data.rawValue {
+            try await migrateDataAttributeOnOverflow(
+                baseRecordNumber: recordNumber,
+                newDataAttributeBytes: newDataAttr
+            )
+            try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: UInt64(bytes.count))
+            try? await bumpMTimeOnWrite(recordNumber: recordNumber)
+            return
+        }
         let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
         guard let newUsedSize = newUsedSize else {
             throw NTFSError.corruptOnDisk(description: "write: rewritten record has no end marker")
@@ -3792,6 +3823,16 @@ public actor Volume {
         }
 
         let attrs = try record.attributes()
+        // v0.5 Fix B Step 4 (AC-7): a SUBSEQUENT write to an already-migrated
+        // file — base carries an $ATTRIBUTE_LIST and its unnamed $DATA now
+        // lives in an extension record — is DEFERRED. See `write(at:)` for the
+        // rationale; `rewriteEntireAttribute` is not $ATTRIBUTE_LIST-aware, so
+        // we bail cleanly here rather than mis-splice and corrupt on disk.
+        if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
+            throw NTFSError.unsupportedFeature(
+                description: "writeFile: MFT record \(recordNumber) has $ATTRIBUTE_LIST (migrated $DATA in extension); re-writing a migrated file is not yet supported"
+            )
+        }
         guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
             throw NTFSError.corruptOnDisk(description: "writeFile: MFT record \(recordNumber) lacks unnamed $DATA")
         }
@@ -3851,16 +3892,37 @@ public actor Volume {
             )
         }
 
-        // Replace the attribute in the MFT record.
-        let newRecordBytes = try rewriteEntireAttribute(
-            in: record.bytes,
-            firstAttributeOffset: Int(record.firstAttributeOffset),
-            usedSize: Int(record.usedSize),
-            recordSize: Int(record.allocatedSize),
-            replacingType: AttributeType.data.rawValue,
-            attributeName: "",
-            replacementBytes: newDataAttr
-        )
+        // Replace the attribute in the MFT record. If the new (possibly
+        // larger, non-resident) $DATA attribute would overflow the base
+        // record's slack — the v0.5 Fix B Step 4 trigger, hit at ~file 350
+        // of a bulk `cp -r` when a file's own runlist outgrows the record —
+        // migrate the unnamed $DATA into a fresh extension record carrying
+        // THESE freshly-built bytes and drop an $ATTRIBUTE_LIST on the base.
+        // The content clusters are already written above, so the migration
+        // fully satisfies the write; we MUST NOT retry rewriteEntireAttribute
+        // against the (now $DATA-less) base.
+        let newRecordBytes: Data
+        do {
+            newRecordBytes = try rewriteEntireAttribute(
+                in: record.bytes,
+                firstAttributeOffset: Int(record.firstAttributeOffset),
+                usedSize: Int(record.usedSize),
+                recordSize: Int(record.allocatedSize),
+                replacingType: AttributeType.data.rawValue,
+                attributeName: "",
+                replacementBytes: newDataAttr
+            )
+        } catch NTFSError.unsupportedFeature(let desc)
+            where isOverflowDescription(desc)
+                && overflowingAttributeType(from: desc) == AttributeType.data.rawValue {
+            try await migrateDataAttributeOnOverflow(
+                baseRecordNumber: recordNumber,
+                newDataAttributeBytes: newDataAttr
+            )
+            try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
+            try? await bumpMTimeOnWrite(recordNumber: recordNumber)
+            return
+        }
         let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
         guard let newUsedSize = newUsedSize else {
             throw NTFSError.corruptOnDisk(description: "writeFile: rewritten record has no end marker")
@@ -4475,11 +4537,88 @@ public actor Volume {
     /// `overflowDescription` is the error text that triggered the
     /// migration; we parse its `, type 0xHEX` suffix to discriminate
     /// which attribute overflowed. Only `$INDEX_ALLOCATION` (0xA0) is
-    /// supported in v0.5; other types throw `unsupportedFeature` so the
-    /// v0.4 cap holds for those.
+    /// supported via this entry point; the `$DATA` (0x80) path is
+    /// `migrateDataAttributeOnOverflow`. Other types throw
+    /// `unsupportedFeature` so the v0.4 cap holds for those.
     internal func migrateIndexAllocationOnOverflow(
         baseRecordNumber: UInt64,
         overflowDescription: String
+    ) async throws {
+        // 1. Discriminate which attribute overflowed. Prefer the
+        //    `, type 0xHEX` suffix the throw messages now carry; fall
+        //    back to assuming $INDEX_ALLOCATION since Step B is the
+        //    user-reported `cp -r` directory-index cap trigger.
+        let overflowingType: UInt32 = overflowingAttributeType(from: overflowDescription)
+            ?? AttributeType.indexAllocation.rawValue
+        guard overflowingType == AttributeType.indexAllocation.rawValue else {
+            throw NTFSError.unsupportedFeature(
+                description: "Fix B Step 3 migrate-X not yet implemented; attribute type 0x\(String(overflowingType, radix: 16, uppercase: true))"
+            )
+        }
+        try await migrateAttributeOnOverflow(
+            baseRecordNumber: baseRecordNumber,
+            migratingType: AttributeType.indexAllocation.rawValue,
+            migratingName: "$I30",
+            newAttributeBytes: nil
+        )
+    }
+
+    /// v0.5 Fix B Step 4: migrate the file's unnamed `$DATA` (0x80)
+    /// attribute out of the base MFT record into a freshly-allocated
+    /// extension record and add a resident `$ATTRIBUTE_LIST` to the
+    /// base. This unblocks the user-reported hardware abort at ~file 350
+    /// of a bulk `cp -r`, where a file's own non-resident `$DATA`
+    /// runlist outgrows the base record's slack and
+    /// `rewriteEntireAttribute` throws "would overflow record … type
+    /// 0x80".
+    ///
+    /// Unlike the $INDEX_ALLOCATION path (which moves the migrant
+    /// verbatim then retries `rewriteParentForLeafSplit`), the $DATA
+    /// caller has ALREADY allocated + written the new content clusters
+    /// and built the would-overflow `$DATA` attribute bytes. We pass
+    /// those as `newDataAttributeBytes`: the extension record ends up
+    /// holding the NEW `$DATA` (so the freshly-written content is
+    /// persisted) and the base gets the `$ATTRIBUTE_LIST`. The caller
+    /// MUST NOT retry `rewriteEntireAttribute` against the base — after
+    /// migration the base has no `$DATA` and the write is already
+    /// satisfied by the extension.
+    ///
+    /// Compute-first transactional, identical discipline to the 0xA0
+    /// path: extension committed first, base second, orphan reclaimed on
+    /// any throw between alloc and base commit, caches invalidated.
+    internal func migrateDataAttributeOnOverflow(
+        baseRecordNumber: UInt64,
+        newDataAttributeBytes: Data
+    ) async throws {
+        try await migrateAttributeOnOverflow(
+            baseRecordNumber: baseRecordNumber,
+            migratingType: AttributeType.data.rawValue,
+            migratingName: "",
+            newAttributeBytes: newDataAttributeBytes
+        )
+    }
+
+    /// Shared compute-first transactional core for both the
+    /// $INDEX_ALLOCATION (0xA0) and $DATA (0x80) overflow migrations.
+    ///
+    /// Builds BOTH the new base and new extension bytes via
+    /// `AttributeMigration.buildAttributeMigration` BEFORE the first
+    /// `writeRawRecord`. The extension record is committed FIRST so a
+    /// crash leaves an orphan slot rather than a dangling
+    /// `$ATTRIBUTE_LIST` pointer; on any throw between `allocateMFTRecord`
+    /// and the final base commit, the extension slot is freed via
+    /// `reclaimOrphanedMFTRecord` and the error rethrown.
+    ///
+    /// `newAttributeBytes`: nil moves the migrant verbatim (0xA0); non-nil
+    /// substitutes those bytes for the migrant in the extension (0x80 — the
+    /// freshly-built would-overflow `$DATA`). See
+    /// `AttributeMigration.buildAttributeMigration` for the coherence
+    /// contract on attributeID / startingVCN.
+    private func migrateAttributeOnOverflow(
+        baseRecordNumber: UInt64,
+        migratingType: UInt32,
+        migratingName: String,
+        newAttributeBytes: Data?
     ) async throws {
         let mft = self.mft()
 
@@ -4490,19 +4629,7 @@ public actor Volume {
         let baseRecordBytes = baseRecord.bytes
         let baseSeq = baseRecord.sequenceNumber
 
-        // 2. Discriminate which attribute overflowed.
-        //    Prefer the `, type 0xHEX` suffix the throw messages now
-        //    carry; fall back to assuming $INDEX_ALLOCATION since Step B
-        //    is the user-reported `cp -r` cap trigger.
-        let overflowingType: UInt32 = overflowingAttributeType(from: overflowDescription)
-            ?? AttributeType.indexAllocation.rawValue
-        guard overflowingType == AttributeType.indexAllocation.rawValue else {
-            throw NTFSError.unsupportedFeature(
-                description: "Fix B Step 3 migrate-X not yet implemented; attribute type 0x\(String(overflowingType, radix: 16, uppercase: true))"
-            )
-        }
-
-        // 3. Allocate a fresh extension MFT record. From here until the
+        // 2. Allocate a fresh extension MFT record. From here until the
         //    final base commit, any throw must free this slot.
         let extRN = try await allocateMFTRecord()
 
@@ -4515,29 +4642,32 @@ public actor Volume {
             if extSeq == 0 { extSeq = 1 }
         }
 
-        // 4. Pure compute step. If this throws (e.g. $ATTRIBUTE_LIST
+        // 3. Pure compute step. If this throws (e.g. $ATTRIBUTE_LIST
         //    won't fit resident in the base record's slack — the v0.5+
         //    non-resident-$ATTRIBUTE_LIST cap), the extension slot must
         //    be released.
         let result: AttributeMigration.Result
         do {
-            result = try AttributeMigration.buildIndexAllocationMigration(
+            result = try AttributeMigration.buildAttributeMigration(
                 baseRecordBytes: baseRecordBytes,
                 baseRN: baseRecordNumber,
                 baseSeq: baseSeq,
                 extRN: extRN,
                 extSeq: extSeq,
+                migratingType: migratingType,
+                migratingName: migratingName,
                 recordSize: Int(mftRecordSizeBytes),
-                sectorSize: Int(boot.bytesPerSector)
+                sectorSize: Int(boot.bytesPerSector),
+                newAttributeBytes: newAttributeBytes
             )
         } catch {
             try? await reclaimOrphanedMFTRecord(at: extRN)
             throw error
         }
 
-        // 5. Commit the extension record FIRST. A crash between this
+        // 4. Commit the extension record FIRST. A crash between this
         //    and the base commit leaves an orphan extension slot — the
-        //    base record's existing $INDEX_ALLOCATION still points at
+        //    base record's existing migrant attribute still points at
         //    the original (untouched) clusters, so on next mount the
         //    file is intact and `reclaim-orphans` can sweep the slot.
         do {
@@ -4547,7 +4677,7 @@ public actor Volume {
             throw error
         }
 
-        // 6. Commit the new base record. If THIS fails after the
+        // 5. Commit the new base record. If THIS fails after the
         //    extension is on disk, free the extension slot — the base
         //    still describes the original layout, so the extension is a
         //    leak we can safely reclaim.
@@ -5030,16 +5160,36 @@ public actor Volume {
         let record = try await mft.record(at: recordNumber)
         let attrs = try record.attributes()
 
+        // v0.5 Fix B Step 4 (AC-6): if the base carries an $ATTRIBUTE_LIST the
+        // unnamed $DATA may have been migrated into an extension record (the
+        // $DATA-overflow path). Resolve it through the $ATTRIBUTE_LIST-aware
+        // `resolveAttribute`, which walks the list and follows the extension
+        // recnums, so freshly-migrated content reads back byte-identical.
+        //
+        // We only support the single-attribute migration shape this driver
+        // produces: ONE unnamed $DATA that lives wholly in one record (base or
+        // extension), starting at VCN 0. A genuinely split (multi-fragment via
+        // multiple $ATTRIBUTE_LIST entries) $DATA is still rejected below by
+        // the startingVCN guard rather than silently truncated.
+        let dataAttr: Attribute
         if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
-            throw NTFSError.unsupportedFeature(
-                description: "MFT record \(recordNumber) has $ATTRIBUTE_LIST — multi-record attributes are not yet supported"
-            )
-        }
-
-        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
-            throw NTFSError.corruptOnDisk(
-                description: "MFT record \(recordNumber) has no unnamed $DATA attribute"
-            )
+            guard let resolved = try await resolveAttribute(
+                recordNumber: recordNumber,
+                type: .data,
+                name: ""
+            ) else {
+                throw NTFSError.corruptOnDisk(
+                    description: "MFT record \(recordNumber) has $ATTRIBUTE_LIST but no resolvable unnamed $DATA"
+                )
+            }
+            dataAttr = resolved
+        } else {
+            guard let base = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+                throw NTFSError.corruptOnDisk(
+                    description: "MFT record \(recordNumber) has no unnamed $DATA attribute"
+                )
+            }
+            dataAttr = base
         }
 
         switch dataAttr.value {
