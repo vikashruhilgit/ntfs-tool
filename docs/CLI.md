@@ -168,7 +168,7 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
 | `list` | `<device> [recnum-or-path]` | List directory contents. Default = 5 (root). Pass `--long` for record numbers + sizes + namespace. Accepts a path like `/Backups` instead of a recnum. |
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
-| `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. `--max-records N` (default 4096). `--verbose` for per-record details. |
+| `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 4096). `--verbose` for per-record details. |
 | `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
 | `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
 | `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N`: 0 (rewrite) / file size (append) / `0 < N ≤ size-bytes.count` (in-place mid-file patch). `--from-file <path>` streams from a host file. |
@@ -177,7 +177,7 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `truncate` | `<device> <recnum> <newSize>` | Resize file to any byte-precise size (shrink only; growing requires `write`). |
 | `delete` | `<device> <recnum>` | Single-record delete by recnum. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15. (Prefer `rm` for path-based use.) |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
-| `reclaim-orphans` | `<device>` | Sweep MFT for orphaned records (IN_USE=1 but unreachable from root) and clear them. Dry-run by default — pass `--confirm` to actually clean. `-v` for per-orphan name/parent details. Native equivalent of `ntfsfix` / `chkdsk /f` for orphan recovery. |
+| `reclaim-orphans` | `<device>` | Sweep MFT for orphaned BASE records (IN_USE=1 but unreachable from root) and clear them. Dry-run by default — pass `--confirm` to actually clean. `-v` for per-orphan name/parent details. Native equivalent of `ntfsfix` / `chkdsk /f` for orphan recovery. **Extension-record safe:** never frees a v0.5-migration extension record (a record holding a live file's migrated `$DATA` / `$INDEX_ALLOCATION`) — freeing one would corrupt the base file; leaked extensions are reported with a `chkdsk /f` recommendation, not auto-freed. |
 
 ## Common task recipes
 
@@ -379,7 +379,8 @@ Your parent dir has too many entries. Use a smaller subdirectory. See [Constrain
 ### `verify` reports errors
 
 Paste the error output. Specific failure modes:
-- **"Orphans (in MFT, not in tree): N"** → records allocated but unreachable. Run `ntfsctl reclaim-orphans -v <device>` to inspect them, then `--confirm` to clear. See the [reclaim recipe](#reclaim-orphaned-mft-records-left-by-older-buggy-builds).
+- **"Orphans (base record in MFT, not in tree): N"** → BASE records allocated but unreachable. Run `ntfsctl reclaim-orphans -v <device>` to inspect them, then `--confirm` to clear. See the [reclaim recipe](#reclaim-orphaned-mft-records-left-by-older-buggy-builds). (Note: v0.5-migration extension records are NOT counted here — they're reported separately as `Extension records: N (linked)` and are expected, not errors.)
+- **"Leaked extensions (base record free): N"** → an extension MFT record (one holding a migrated `$DATA` / `$INDEX_ALLOCATION`) whose base record is no longer in use. A real defect — run `chkdsk /f`. `reclaim-orphans` deliberately does NOT free these, since safe removal needs base-side `$ATTRIBUTE_LIST` fixup that ntfsctl doesn't do yet.
 - **"Dangling ($I30 entry but MFT slot free): N"** → directory entries pointing at freed MFT slots. Requires `chkdsk /f` / `ntfsfix` — the corresponding tool isn't built into ntfsctl yet.
 - **"MFT record magic is 'BAAD'"** → that record was previously marked corrupt by Windows. Not necessarily a problem for the volume overall.
 - **"USA sentinel mismatch"** → hardware fault or interrupted write. Run Windows `chkdsk /f` to recover.

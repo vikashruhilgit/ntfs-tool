@@ -38,7 +38,10 @@ struct Verify: AsyncParsableCommand {
         var freeCount = 0
         var errorCount = 0
         var dirCount = 0
-        var inUseUserRecords: Set<UInt64> = []
+        // Summaries of every IN_USE user record (recnum >= 16), tagged
+        // base-vs-extension so the classifier can keep migration extension
+        // records (v0.5 Fix B) out of the orphan set — see MFTConsistency.
+        var inUseUserSummaries: [InUseRecordSummary] = []
         var firstFewErrors: [(UInt64, String)] = []
 
         // Compute the actual MFT logical size from $MFT (record 0)'s $DATA
@@ -71,7 +74,16 @@ struct Verify: AsyncParsableCommand {
                 if record.isInUse {
                     inUseCount += 1
                     if record.isDirectory { dirCount += 1 }
-                    if n >= 16 { inUseUserRecords.insert(n) }
+                    if n >= 16 {
+                        inUseUserSummaries.append(InUseRecordSummary(
+                            recordNumber: n,
+                            isBaseRecord: record.isBaseRecord,
+                            baseRecordNumber: record.isBaseRecord
+                                ? nil
+                                : MFTConsistency.baseRecordNumber(
+                                    fromBaseFileReference: record.baseFileReference)
+                        ))
+                    }
                     if verbose && n < 16 {
                         let attrs = (try? record.attributes()) ?? []
                         let kinds = attrs.compactMap { $0.type }.map { String(describing: $0) }.joined(separator: ",")
@@ -111,13 +123,26 @@ struct Verify: AsyncParsableCommand {
             }
         }
 
+        // Classify the sweep. Orphans are now BASE records only — v0.5 Fix B
+        // extension records (baseFileReference != 0) hold migrated $DATA /
+        // $INDEX_ALLOCATION and are reachable only via their base, never via
+        // $I30, so the old `inUse \ reachable` definition false-flagged every
+        // one of them. The classifier keeps legitimate extensions out of the
+        // orphan set and surfaces leaked extensions (base gone) separately.
         let reachableUserRecords = reachable.filter { $0 >= 16 }
-        let orphans = inUseUserRecords.subtracting(reachableUserRecords)
-        let dangling = reachableUserRecords.subtracting(inUseUserRecords)
+        let classification = MFTConsistency.classifyInUseRecords(
+            inUseUserSummaries, reachable: reachable)
+        let orphans = classification.orphanBaseRecords
+        // Dangling: a $I30 entry points at a slot the MFT doesn't have as an
+        // IN_USE base. (Extensions are never named in $I30, so comparing
+        // against base records is the right set.)
+        let dangling = reachableUserRecords.subtracting(classification.baseRecords)
+        let legitimateExtensions = classification.legitimateExtensions
+        let leakedExtensions = classification.leakedExtensions
 
         print("MFT sweep (records 0..\(mftLogicalRecords - 1)):")
         print("  In use (total):         \(inUseCount)")
-        print("    User (>=16):          \(inUseUserRecords.count)")
+        print("    User (>=16):          \(inUseUserSummaries.count)")
         print("    Directories:          \(dirCount)")
         print("  Free:                   \(freeCount)")
         print("  Parse errors:           \(errorCount)")
@@ -128,11 +153,16 @@ struct Verify: AsyncParsableCommand {
         }
         print("Directory tree (from root):")
         print("  Reachable user files:   \(reachableUserRecords.count)")
-        print("  Orphans (in MFT, not in tree): \(orphans.count)")
+        print("  Extension records:      \(legitimateExtensions.count) (linked)")
+        print("  Orphans (base record in MFT, not in tree): \(orphans.count)")
+        print("  Leaked extensions (base record free): \(leakedExtensions.count)")
         print("  Dangling ($I30 entry but MFT slot free): \(dangling.count)")
         if verbose {
             for rn in orphans.sorted().prefix(20) {
                 print("    orphan recnum \(rn)")
+            }
+            for rn in leakedExtensions.sorted().prefix(20) {
+                print("    leaked extension recnum \(rn)")
             }
             for rn in dangling.sorted().prefix(20) {
                 print("    dangling recnum \(rn)")
@@ -145,8 +175,9 @@ struct Verify: AsyncParsableCommand {
             }
         }
 
-        if errorCount > 0 || !orphans.isEmpty || !dangling.isEmpty || !unreachableEnumerationErrors.isEmpty {
-            print("\nVerify FAILED — \(errorCount) parse, \(orphans.count) orphan, \(dangling.count) dangling, \(unreachableEnumerationErrors.count) enum errors. Suggest running ntfsfix or chkdsk /f.")
+        if errorCount > 0 || !orphans.isEmpty || !leakedExtensions.isEmpty
+            || !dangling.isEmpty || !unreachableEnumerationErrors.isEmpty {
+            print("\nVerify FAILED — \(errorCount) parse, \(orphans.count) orphan, \(leakedExtensions.count) leaked-extension, \(dangling.count) dangling, \(unreachableEnumerationErrors.count) enum errors. Suggest running ntfsfix or chkdsk /f.")
             throw ExitCode(1)
         }
         print("\nVerify PASSED.")
