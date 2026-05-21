@@ -21,6 +21,13 @@ let package = Package(
                 "NTFSCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ]
+        ),
+        .testTarget(
+            name: "ntfsctlTests",
+            dependencies: [
+                "ntfsctl",
+                "NTFSCore"
+            ]
         )
     ]
 )

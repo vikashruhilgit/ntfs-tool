@@ -170,7 +170,7 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
 | `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 4096). `--verbose` for per-record details. |
 | `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
-| `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
+| `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `-T`/`--no-target-directory` merges a directory source's contents into an existing dest dir (instead of nesting). `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
 | `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N`: 0 (rewrite) / file size (append) / `0 < N ≤ size-bytes.count` (in-place mid-file patch). `--from-file <path>` streams from a host file. |
 | `rm` | `<device> <recnum-or-path>` | Delete a file or directory. `-r` recursive. `-v` verbose. |
 | `mv` | `<device> <src-path> <dest-path>` | Rename or move (with auto-create of intermediate destination dirs). |
@@ -233,6 +233,60 @@ diskutil mount /dev/disk10s1
 ```
 
 `cp` resolves the destination path: trailing slash (or matching an existing directory) treats it as the parent and appends the source basename; otherwise it copies under the given name. Intermediate destination directories are auto-created.
+
+#### Merge a directory's contents into an existing dir (`-T` / `--no-target-directory`)
+
+By default, `cp` follows POSIX nesting rules. If the destination path does **not** exist, the source lands there directly (`cp -r src/Android /dev/disk10s1 /gallery/Android` → `/gallery/Android`). If the destination directory **already exists**, the source is nested under `dest/<sourceBasename>` — so re-running `cp -r src/Android /dev/disk10s1 /gallery/Android` once `/gallery/Android` exists yields a surprising `/gallery/Android/Android`. Pass `-T`/`--no-target-directory` to instead **merge the source's contents into the destination directory itself**:
+
+```bash
+# MERGE: source/Android's children land directly inside /gallery/Android.
+# (NOT /gallery/src/Android, NOT /gallery/Android/Android.)
+sudo ntfsctl cp -rT ~/Desktop/s21fe-backup/Android /dev/disk10s1 /gallery/Android
+```
+
+So `source/Android` → `dest/Android`: files already present on the volume are merged with the incoming tree rather than the whole source folder being dropped inside as a new sub-level. `-T` only merges **directory** sources — a single-file source still nests under the destination.
+
+#### Conflict policy on merge: replace (default) vs skip (`-n`)
+
+When a merge (or any `cp`) hits a destination file that already exists, the per-file policy decides what happens:
+
+- **default = replace** — the existing destination file is deleted and recreated from the host source. Use this to refresh a backup with newer content.
+- **`-n` / `--no-clobber` = skip** — existing destination files are left untouched; only files that don't yet exist are created. `-n` is the **safe re-run mode**: if a big `cp -rT` was interrupted, re-running it with `-n` fills in only the missing files and never touches what already copied.
+
+```bash
+# First run: full merge, replacing any stale files.
+sudo ntfsctl cp -rT ~/Desktop/s21fe-backup /dev/disk10s1 /gallery/s21fe-backup
+
+# Interrupted? Re-run safely — only missing files are added, existing ones kept.
+sudo ntfsctl cp -rTn ~/Desktop/s21fe-backup /dev/disk10s1 /gallery/s21fe-backup
+```
+
+#### Preflight summary line
+
+Before any bytes move (in both real and `--dry-run` runs), `cp` prints a one-line summary of where the source will land, so you can confirm the resolved destination before committing:
+
+```
+→ creating /gallery/s21fe-backup (new)
+→ nesting under /gallery/s21fe-backup (dest exists; pass -T to merge)
+→ merging into /gallery/s21fe-backup (existing dir; conflicts: replace)
+```
+
+The third form also reports the active conflict policy (`replace` or `skip`). Combine with `--dry-run` to preview a merge without writing anything.
+
+#### Backup workflow example
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# Mirror a phone backup folder into an existing /gallery/s21fe-backup dir,
+# merging contents and refreshing changed files:
+sudo ntfsctl cp -rT ~/Desktop/s21fe-backup /dev/disk10s1 /gallery/s21fe-backup
+
+# Re-run later to top up only new files (safe, skips existing):
+sudo ntfsctl cp -rTn ~/Desktop/s21fe-backup /dev/disk10s1 /gallery/s21fe-backup
+
+diskutil mount /dev/disk10s1
+```
 
 **Per-leaf cap reminder:** v1's LARGE_INDEX support has no leaf split. If you're copying many files into a single fresh directory, expect ~30-50 files per directory before hitting `unsupportedFeature(...leaf full)`. Existing Windows-formatted volumes typically already have multi-leaf trees so this matters less for inserts into pre-existing folders.
 
