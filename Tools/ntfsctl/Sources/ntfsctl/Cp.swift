@@ -56,6 +56,9 @@ struct Cp: AsyncParsableCommand {
     @Flag(name: [.short, .long], help: "Don't overwrite existing destination files.")
     var noClobber: Bool = false
 
+    @Flag(name: [.customShort("T"), .long], help: "No-target-directory: when DEST is an existing directory, merge SOURCE's contents into it instead of nesting under DEST/<sourceBasename>.")
+    var noTargetDirectory: Bool = false
+
     @Flag(name: [.short, .long], help: "Verbose: print each file as it's copied.")
     var verbose: Bool = false
 
@@ -106,12 +109,36 @@ struct Cp: AsyncParsableCommand {
         let endsWithSlash = destination.hasSuffix("/")
         let trimmedDest = destination.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let sourceBasename = (source as NSString).lastPathComponent
-        let (destParent, destName) = try await resolveDestination(
-            volume: volume,
-            requested: trimmedDest,
-            endsWithSlash: endsWithSlash,
-            sourceBasename: sourceBasename
-        )
+
+        // Resolve the requested destination path once. An empty requested path
+        // (i.e. "" or "/") maps to the volume root (recnum 5), which always
+        // exists and is a directory.
+        let resolvedRecnum: UInt64?
+        let destIsDir: Bool
+        if trimmedDest.isEmpty {
+            resolvedRecnum = 5
+            destIsDir = true
+        } else if let resolved = try await volume.resolvePath(trimmedDest) {
+            resolvedRecnum = resolved
+            destIsDir = try await isDirectory(volume: volume, recnum: resolved)
+        } else {
+            resolvedRecnum = nil
+            destIsDir = false
+        }
+
+        // Pure decision: NEW vs NEST vs MERGE + conflict policy.
+        let outcome: DestinationOutcome
+        do {
+            outcome = try DestinationPlan.resolve(
+                destExists: resolvedRecnum != nil,
+                destIsDirectory: destIsDir,
+                sourceIsDirectory: srcIsDir.boolValue,
+                noTargetDirectory: noTargetDirectory,
+                noClobber: noClobber
+            )
+        } catch DestinationPlanError.destinationIsFile {
+            throw ValidationError("destination already exists as a file: /\(trimmedDest) (pass to a directory ending with '/' to copy under it)")
+        }
 
         // Scan source to build a plan + size totals.
         var totalFiles = 0
@@ -136,8 +163,17 @@ struct Cp: AsyncParsableCommand {
             }
         }
 
+        // Preflight resolved-destination summary (shown in both dry-run and
+        // real runs, before any bytes move).
+        let summaryLine = destinationSummaryLine(
+            outcome: outcome,
+            requested: trimmedDest,
+            sourceBasename: sourceBasename
+        )
+        FileHandle.standardOutput.write(Data((summaryLine + "\n").utf8))
+
         if dryRun {
-            FileHandle.standardOutput.write(Data("DRY-RUN: would copy \(totalFiles) file(s), \(humanBytes(totalBytes)) total → /\(joinedDestPath(destParent: destParent, name: destName, volume: volume))\n".utf8))
+            FileHandle.standardOutput.write(Data("DRY-RUN: would copy \(totalFiles) file(s), \(humanBytes(totalBytes)) total\n".utf8))
             return
         }
 
@@ -153,30 +189,65 @@ struct Cp: AsyncParsableCommand {
         // it's impossible to tell whether Phase 1 / Phase 2 perf work
         // actually moved the needle.
         let cpStart = Date()
-        if srcIsDir.boolValue {
-            let dirRN = try await ensureDirectory(volume: volume, parent: destParent, name: destName)
+        switch outcome {
+        case .merge:
+            // Merge: the recursion root IS the resolved dest dir itself, so
+            // source's CHILDREN land directly inside it (source/Android →
+            // dest/Android, NOT dest/<sourceBasename>/Android). The planner
+            // only returns .merge for dir sources. Per-file conflict policy
+            // (skip/replace) is enforced inside copyOneFile via noClobber.
+            // .merge is only returned when destExists, so resolvedRecnum is
+            // non-nil here; guard rather than force-unwrap to keep the
+            // no-crash guarantee local (CLAUDE.md: no fatalError in code).
+            guard let mergeRoot = resolvedRecnum else {
+                throw ValidationError("internal: merge outcome without a resolved destination")
+            }
             try await copyDirectoryRecursive(
                 volume: volume,
                 hostDir: source,
-                ntfsParent: dirRN,
+                ntfsParent: mergeRoot,
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
                 totalFiles: totalFiles,
                 totalBytes: totalBytes,
                 startTime: cpStart
             )
-        } else {
-            try await copyOneFile(
+        case .nest, .new:
+            // For .nest the resolved dir exists → nest under it as
+            // <sourceBasename>. For .new the parent is walked/created and the
+            // leaf name is taken from the requested path (or sourceBasename
+            // for trailing-slash / root). resolveDestination handles both.
+            let (destParent, destName) = try await resolveDestination(
                 volume: volume,
-                hostFile: source,
-                ntfsParent: destParent,
-                name: destName,
-                copiedFiles: &copiedFiles,
-                copiedBytes: &copiedBytes,
-                totalFiles: totalFiles,
-                totalBytes: totalBytes,
-                startTime: cpStart
+                requested: trimmedDest,
+                endsWithSlash: endsWithSlash,
+                sourceBasename: sourceBasename
             )
+            if srcIsDir.boolValue {
+                let dirRN = try await ensureDirectory(volume: volume, parent: destParent, name: destName)
+                try await copyDirectoryRecursive(
+                    volume: volume,
+                    hostDir: source,
+                    ntfsParent: dirRN,
+                    copiedFiles: &copiedFiles,
+                    copiedBytes: &copiedBytes,
+                    totalFiles: totalFiles,
+                    totalBytes: totalBytes,
+                    startTime: cpStart
+                )
+            } else {
+                try await copyOneFile(
+                    volume: volume,
+                    hostFile: source,
+                    ntfsParent: destParent,
+                    name: destName,
+                    copiedFiles: &copiedFiles,
+                    copiedBytes: &copiedBytes,
+                    totalFiles: totalFiles,
+                    totalBytes: totalBytes,
+                    startTime: cpStart
+                )
+            }
         }
         try await volume.endWriteSession()
 
@@ -190,10 +261,27 @@ struct Cp: AsyncParsableCommand {
         }
     }
 
-    private func joinedDestPath(destParent: UInt64, name: String, volume _: NTFSCore.Volume) -> String {
-        // Approximate display: we don't reverse-resolve parent → path here;
-        // print parent recnum + name for transparency.
-        return "(parent recnum \(destParent))/\(name)"
+    /// One-line resolved-destination summary, derived purely from the planner
+    /// outcome plus the requested display path string. We deliberately do NOT
+    /// reverse-resolve a recnum → path; we show the requested `trimmedDest`
+    /// prefixed with '/' (root/empty renders as just "/").
+    private func destinationSummaryLine(
+        outcome: DestinationOutcome,
+        requested: String,
+        sourceBasename: String
+    ) -> String {
+        // Display path: "/" for the root/empty case, "/<requested>" otherwise.
+        let displayPath = requested.isEmpty ? "/" : "/\(requested)"
+        switch outcome {
+        case .new:
+            return "→ creating \(displayPath) (new)"
+        case .nest:
+            // Avoid a double slash when displayPath is the bare root "/".
+            let nestPath = displayPath == "/" ? "/\(sourceBasename)" : "\(displayPath)/\(sourceBasename)"
+            return "→ nesting under \(nestPath) (dest exists; pass -T to merge)"
+        case let .merge(conflict):
+            return "→ merging into \(displayPath) (existing dir; conflicts: \(conflict.rawValue))"
+        }
     }
 
     private func walkHostDir(_ root: String, visit: (_ path: String, _ size: UInt64) throws -> Void) throws {
@@ -250,13 +338,13 @@ struct Cp: AsyncParsableCommand {
         return (current, leafName)
     }
 
-    private func isDirectory(volume: NTFSCore.Volume, recnum: UInt64) async throws -> Bool {
+    func isDirectory(volume: NTFSCore.Volume, recnum: UInt64) async throws -> Bool {
         let mft = await volume.mft()
         let rec = try await mft.record(at: recnum)
         return rec.isDirectory
     }
 
-    private func childRecnum(volume: NTFSCore.Volume, parent: UInt64, name: String) async throws -> UInt64? {
+    func childRecnum(volume: NTFSCore.Volume, parent: UInt64, name: String) async throws -> UInt64? {
         let entries = try await volume.enumerate(directory: parent)
         let needle = name.lowercased()
         return entries.first {
@@ -265,7 +353,7 @@ struct Cp: AsyncParsableCommand {
         }?.recordNumber
     }
 
-    private func ensureDirectory(volume: NTFSCore.Volume, parent: UInt64, name: String) async throws -> UInt64 {
+    func ensureDirectory(volume: NTFSCore.Volume, parent: UInt64, name: String) async throws -> UInt64 {
         if let existing = try await childRecnum(volume: volume, parent: parent, name: name) {
             if try await isDirectory(volume: volume, recnum: existing) { return existing }
             throw ValidationError("destination /\(name) exists as a file, refusing to clobber")
@@ -273,7 +361,7 @@ struct Cp: AsyncParsableCommand {
         return try await volume.createFile(named: name, inDirectory: parent, isDirectory: true)
     }
 
-    private func copyOneFile(
+    func copyOneFile(
         volume: NTFSCore.Volume,
         hostFile: String,
         ntfsParent: UInt64,
@@ -317,7 +405,7 @@ struct Cp: AsyncParsableCommand {
         }
     }
 
-    private func copyDirectoryRecursive(
+    func copyDirectoryRecursive(
         volume: NTFSCore.Volume,
         hostDir: String,
         ntfsParent: UInt64,
