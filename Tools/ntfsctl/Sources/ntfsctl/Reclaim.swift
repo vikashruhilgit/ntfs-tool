@@ -75,13 +75,24 @@ struct ReclaimOrphans: AsyncParsableCommand {
             mftLogicalRecords = maxRecords == 0 ? 4096 : maxRecords
         }
 
-        // Step 2: collect all IN_USE user records.
-        var inUseUserRecords: Set<UInt64> = []
+        // Step 2: collect all IN_USE user records, tagged base-vs-extension so
+        // the classifier can keep v0.5 Fix B migration extension records out of
+        // the reclaim set (see MFTConsistency). An extension record holds a
+        // live file's migrated $DATA / $INDEX_ALLOCATION and is reachable only
+        // via its base — freeing one corrupts the base file.
+        var inUseUserSummaries: [InUseRecordSummary] = []
         for n: UInt64 in 0..<mftLogicalRecords {
             do {
                 let rec = try await mft.record(at: n)
                 if rec.isInUse, n >= 16 {
-                    inUseUserRecords.insert(n)
+                    inUseUserSummaries.append(InUseRecordSummary(
+                        recordNumber: n,
+                        isBaseRecord: rec.isBaseRecord,
+                        baseRecordNumber: rec.isBaseRecord
+                            ? nil
+                            : MFTConsistency.baseRecordNumber(
+                                fromBaseFileReference: rec.baseFileReference)
+                    ))
                 }
             } catch {
                 // Parse failure / zeroed slot — skip; verify would flag this
@@ -108,16 +119,48 @@ struct ReclaimOrphans: AsyncParsableCommand {
             }
         }
 
-        let orphans = inUseUserRecords.subtracting(reachable.filter { $0 >= 16 }).sorted()
+        // Classify. Reclaim acts ONLY on orphaned BASE records. Extension
+        // records (legitimate OR leaked) are never reclaimed: a legitimate
+        // extension's slot belongs to a live base file, and freeing it detaches
+        // the migrated $DATA / $INDEX_ALLOCATION and corrupts that file; a
+        // leaked extension needs base-side / $ATTRIBUTE_LIST fixup that v0.5
+        // doesn't do, so we defer it to chkdsk /f rather than free it blind.
+        let classification = MFTConsistency.classifyInUseRecords(
+            inUseUserSummaries, reachable: reachable)
+        let extensionRecnums = classification.legitimateExtensions
+            .union(classification.leakedExtensions)
+
+        // Defensive guard: orphanBaseRecords excludes extensions BY
+        // CONSTRUCTION, but assert it explicitly so a future refactor of the
+        // classifier can never reintroduce the "reclaim freed an extension and
+        // corrupted the base" bug. Reclaim must NEVER touch an extension slot.
+        let orphans = classification.orphanBaseRecords
+            .subtracting(extensionRecnums)
+            .sorted()
+        precondition(
+            Set(orphans).isDisjoint(with: extensionRecnums),
+            "reclaim-orphans invariant violated: an extension record reached the reclaim set"
+        )
 
         // Step 4: report.
         print("MFT sweep:               records 0..\(mftLogicalRecords - 1)")
-        print("In-use user records:     \(inUseUserRecords.count)")
+        print("In-use user records:     \(inUseUserSummaries.count)")
         print("Reachable from root:     \(reachable.filter { $0 >= 16 }.count)")
+        print("Extension records:       \(classification.legitimateExtensions.count) (linked, never reclaimed)")
         print("Orphans found:           \(orphans.count)")
 
+        if !classification.leakedExtensions.isEmpty {
+            // Leaked extensions are a real defect but not safe to auto-free in
+            // v0.5 (would need to also repair the base / $ATTRIBUTE_LIST).
+            print("Leaked extensions:       \(classification.leakedExtensions.count) (NOT reclaimed — run `chkdsk /f`)")
+        }
+
         if orphans.isEmpty {
-            print("No orphans to reclaim. Volume is clean.")
+            if classification.leakedExtensions.isEmpty {
+                print("No orphans to reclaim. Volume is clean.")
+            } else {
+                print("No orphan base records to reclaim, but leaked extensions exist — run `chkdsk /f`.")
+            }
             return
         }
 
