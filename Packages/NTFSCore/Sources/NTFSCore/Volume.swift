@@ -2627,10 +2627,23 @@ public actor Volume {
         for blockIndex in blockIndices {
             let byteIdx = Int(blockIndex / 8)
             let bitIdx = Int(blockIndex % 8)
-            guard byteIdx < updated.count else {
-                throw NTFSError.unsupportedFeature(
-                    description: "updateBitmap: block index \(blockIndex) exceeds bitmap capacity \(updated.count * 8); growing $BITMAP not yet supported"
-                )
+            // v0.5: GROW the resident $BITMAP:$I30 body when the requested
+            // block index falls beyond the current capacity, instead of
+            // throwing. This is append-only zero-fill — we never rebuild,
+            // truncate, or reorder, so every previously-set bit survives.
+            // The new length is rounded UP to a multiple of 8 bytes to
+            // match NTFS index-bitmap alignment. Repeated within the loop
+            // so a later `blockIndex` in the same call can trigger a
+            // second growth. If the grown attribute eventually exceeds the
+            // parent MFT record's slack, the downstream rewrite path
+            // (rewriteEntireAttribute) throws a clean `unsupportedFeature`
+            // and builds its output into a fresh buffer, so on-disk state
+            // is left unchanged (no partial write). At v0.5's 8-byte growth
+            // increment that boundary is effectively unreachable.
+            if byteIdx >= updated.count {
+                let requiredCount = byteIdx + 1
+                let alignedCount = ((requiredCount + 7) / 8) * 8
+                updated.append(contentsOf: repeatElement(UInt8(0), count: alignedCount - updated.count))
             }
             updated[updated.startIndex + byteIdx] |= (UInt8(1) << bitIdx)
         }
