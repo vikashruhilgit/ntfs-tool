@@ -119,27 +119,66 @@ struct ReclaimOrphans: AsyncParsableCommand {
             }
         }
 
-        // Classify. Reclaim acts ONLY on orphaned BASE records. Extension
-        // records (legitimate OR leaked) are never reclaimed: a legitimate
-        // extension's slot belongs to a live base file, and freeing it detaches
-        // the migrated $DATA / $INDEX_ALLOCATION and corrupts that file; a
-        // leaked extension needs base-side / $ATTRIBUTE_LIST fixup that v0.5
-        // doesn't do, so we defer it to chkdsk /f rather than free it blind.
+        // Classify. Reclaim acts on orphaned BASE records and on base-FREE
+        // leaked extensions. A legitimate extension's slot belongs to a live
+        // base file — freeing it detaches the migrated $DATA / $INDEX_ALLOCATION
+        // and corrupts that file, so legitimate extensions are NEVER reclaimed.
         let classification = MFTConsistency.classifyInUseRecords(
             inUseUserSummaries, reachable: reachable)
         let extensionRecnums = classification.legitimateExtensions
             .union(classification.leakedExtensions)
 
-        // Defensive guard: orphanBaseRecords excludes extensions BY
-        // CONSTRUCTION, but assert it explicitly so a future refactor of the
-        // classifier can never reintroduce the "reclaim freed an extension and
-        // corrupted the base" bug. Reclaim must NEVER touch an extension slot.
+        // The classifier's `leakedExtensions` conflates "base genuinely free"
+        // (reclaimable) with "base IN_USE-but-unparseable" (a LIVE file we must
+        // not touch), because classifyInUseRecords only sees the IN_USE records
+        // the sweep PARSED — a leaked extension's base may be IN_USE yet absent
+        // from the parsed set. So AUTHORITATIVELY read each leaked extension's
+        // base record off disk; a base counts as free ONLY if the read succeeds
+        // and IN_USE=0. Read failure or IN_USE=1 ⇒ defer (default-deny).
+        var basesConfirmedFree: Set<UInt64> = []
+        let leakedBaseRecnums = Set(
+            inUseUserSummaries
+                .filter { classification.leakedExtensions.contains($0.recordNumber) }
+                .compactMap { $0.baseRecordNumber }
+        )
+        for baseRN in leakedBaseRecnums {
+            do {
+                let rec = try await mft.record(at: baseRN)
+                if !rec.isInUse { basesConfirmedFree.insert(baseRN) }
+            } catch {
+                // Ambiguous (parse error / out of bounds) ⇒ defer, don't free.
+                continue
+            }
+        }
+
+        let split = MFTConsistency.splitLeakedExtensions(
+            inUseUserSummaries,
+            leakedExtensions: classification.leakedExtensions,
+            basesConfirmedFree: basesConfirmedFree)
+
+        // Reclaim set: orphaned BASE records (empty-resident, freed via
+        // reclaimOrphanedMFTRecord) PLUS base-free leaked EXTENSIONS (freed via
+        // freeExtensionRecord, which also releases their non-resident clusters).
+        // Orphans always exclude ALL extensions (a base record is never an
+        // extension); the two reclaim sets are disjoint and freed differently.
         let orphans = classification.orphanBaseRecords
             .subtracting(extensionRecnums)
             .sorted()
+        let baseFreeExtensions = split.baseFreeExtensions.sorted()
+
+        // Safety invariant (AC-10): the reclaim set must NEVER include a
+        // legitimate extension (base IN_USE → live file) or an unresolved one
+        // (base not provably free → could be live). Assert it explicitly so a
+        // future refactor can't reintroduce the "freed a live file's extension"
+        // corruption.
+        let reclaimSet = Set(orphans).union(baseFreeExtensions)
         precondition(
-            Set(orphans).isDisjoint(with: extensionRecnums),
-            "reclaim-orphans invariant violated: an extension record reached the reclaim set"
+            reclaimSet.isDisjoint(with: classification.legitimateExtensions),
+            "reclaim-orphans invariant violated: a legitimate extension reached the reclaim set"
+        )
+        precondition(
+            reclaimSet.isDisjoint(with: split.baseUnresolvedExtensions),
+            "reclaim-orphans invariant violated: a base-unresolved extension reached the reclaim set"
         )
 
         // Step 4: report.
@@ -150,16 +189,18 @@ struct ReclaimOrphans: AsyncParsableCommand {
         print("Orphans found:           \(orphans.count)")
 
         if !classification.leakedExtensions.isEmpty {
-            // Leaked extensions are a real defect but not safe to auto-free in
-            // v0.5 (would need to also repair the base / $ATTRIBUTE_LIST).
-            print("Leaked extensions:       \(classification.leakedExtensions.count) (NOT reclaimed — run `chkdsk /f`)")
+            print("Leaked extensions:       \(classification.leakedExtensions.count) total")
+            print("  reclaimable (base free): \(split.baseFreeExtensions.count)")
+            if !split.baseUnresolvedExtensions.isEmpty {
+                print("  deferred (base in use / unparseable): \(split.baseUnresolvedExtensions.count) (run `chkdsk /f`)")
+            }
         }
 
-        if orphans.isEmpty {
-            if classification.leakedExtensions.isEmpty {
+        if orphans.isEmpty && baseFreeExtensions.isEmpty {
+            if split.baseUnresolvedExtensions.isEmpty {
                 print("No orphans to reclaim. Volume is clean.")
             } else {
-                print("No orphan base records to reclaim, but leaked extensions exist — run `chkdsk /f`.")
+                print("No reclaimable records, but deferred leaked extensions exist — run `chkdsk /f`.")
             }
             return
         }
@@ -183,16 +224,28 @@ struct ReclaimOrphans: AsyncParsableCommand {
             if orphans.count > 50 {
                 print("  … (\(orphans.count - 50) more)")
             }
+            for rn in baseFreeExtensions.prefix(50) {
+                print("  base-free extension recnum \(rn) (clusters + slot will be freed)")
+            }
+            if baseFreeExtensions.count > 50 {
+                print("  … (\(baseFreeExtensions.count - 50) more)")
+            }
         }
+
+        let totalToReclaim = orphans.count + baseFreeExtensions.count
 
         if !confirm {
             print("")
             print("Dry-run — no changes made. Re-run with --confirm to clear the IN_USE flag")
-            print("and free the $MFT.$BITMAP bit for each orphan listed above.")
+            print("and free the $MFT.$BITMAP bit for each orphan, and to free the clusters +")
+            print("slot of each base-free leaked extension listed above.")
             return
         }
 
-        // Step 5: clean. Wrap in dirty-bit transaction.
+        // Step 5: clean. Wrap in dirty-bit transaction. Orphan base records are
+        // empty-resident — reclaimOrphanedMFTRecord just flips the slot. Base-
+        // free leaked extensions own non-resident clusters, so they go through
+        // freeExtensionRecord (frees clusters FIRST, then the slot — AC-9).
         try await volume.beginWriteSession()
         var cleaned = 0
         var failed: [(UInt64, String)] = []
@@ -204,11 +257,19 @@ struct ReclaimOrphans: AsyncParsableCommand {
                 failed.append((rn, "\(error)"))
             }
         }
+        for rn in baseFreeExtensions {
+            do {
+                try await volume.freeExtensionRecord(at: rn)
+                cleaned += 1
+            } catch {
+                failed.append((rn, "\(error)"))
+            }
+        }
         try await volume.endWriteSession()
         try await blockDevice.synchronize()
 
         print("")
-        print("Reclaimed:               \(cleaned)/\(orphans.count) orphan(s)")
+        print("Reclaimed:               \(cleaned)/\(totalToReclaim) record(s)")
         if !failed.isEmpty {
             print("Failed:                  \(failed.count)")
             for (rn, msg) in failed.prefix(10) {
