@@ -75,6 +75,33 @@ public struct MFTClassification: Sendable, Equatable {
     }
 }
 
+/// `classifyInUseRecords`'s `leakedExtensions` set conflates two very different
+/// situations, because the classifier is pure and builds `baseRecords` only
+/// from the IN_USE records the sweep SUCCESSFULLY PARSED. A leaked extension is
+/// therefore "extension whose base recnum isn't in the parsed-in-use set" —
+/// which means the base is EITHER genuinely FREE (dead extension, reclaimable)
+/// OR IN_USE-but-unparseable (a LIVE file whose extension must NOT be freed).
+/// This split lets the caller separate the two by AUTHORITATIVELY reading each
+/// extension's base record off disk and reporting which bases it confirmed free.
+public struct LeakedExtensionSplit: Sendable, Equatable {
+    /// Leaked extension whose base record was read and confirmed IN_USE=0 — the
+    /// base is genuinely gone, so the extension is dead and reclaimable (free
+    /// its clusters + slot).
+    public var baseFreeExtensions: Set<UInt64>
+    /// Leaked extension whose base could NOT be confirmed free (base IN_USE,
+    /// unparseable, or unresolvable) — could be a live file; NEVER auto-freed,
+    /// defer to `chkdsk /f`.
+    public var baseUnresolvedExtensions: Set<UInt64>
+
+    public init(
+        baseFreeExtensions: Set<UInt64> = [],
+        baseUnresolvedExtensions: Set<UInt64> = []
+    ) {
+        self.baseFreeExtensions = baseFreeExtensions
+        self.baseUnresolvedExtensions = baseUnresolvedExtensions
+    }
+}
+
 public enum MFTConsistency {
     /// Low 48 bits of a packed MFT reference hold the record number; the high
     /// 16 bits hold the sequence number. `baseFileReference` is packed the same
@@ -135,5 +162,44 @@ public enum MFTConsistency {
             legitimateExtensions: legitimateExtensions,
             leakedExtensions: leakedExtensions
         )
+    }
+
+    /// Split `classification.leakedExtensions` by the AUTHORITATIVE state of
+    /// each extension's base record. The caller must have read every distinct
+    /// base record off disk and passed in `basesConfirmedFree` — the set of base
+    /// recnums it found IN_USE=0. A leaked extension is reclaimable iff its base
+    /// recnum is in `basesConfirmedFree`; everything else is deferred.
+    ///
+    /// - `records`: the same summaries passed to `classifyInUseRecords`; supplies
+    ///   each extension's `baseRecordNumber`.
+    /// - `leakedExtensions`: the leaked set to split.
+    /// - `basesConfirmedFree`: base recnums the caller AUTHORITATIVELY read and
+    ///   found IN_USE=0.
+    ///
+    /// Default-deny: a leaked extension whose base is not in `basesConfirmedFree`
+    /// — including one whose base recnum can't be found in `records` at all —
+    /// goes to `baseUnresolvedExtensions`. Only a base PROVABLY free yields a
+    /// reclaimable extension.
+    public static func splitLeakedExtensions(
+        _ records: [InUseRecordSummary],
+        leakedExtensions: Set<UInt64>,
+        basesConfirmedFree: Set<UInt64>
+    ) -> LeakedExtensionSplit {
+        var baseByRecnum: [UInt64: UInt64] = [:]
+        for record in records where !record.isBaseRecord {
+            if let base = record.baseRecordNumber {
+                baseByRecnum[record.recordNumber] = base
+            }
+        }
+
+        var split = LeakedExtensionSplit()
+        for recnum in leakedExtensions {
+            if let base = baseByRecnum[recnum], basesConfirmedFree.contains(base) {
+                split.baseFreeExtensions.insert(recnum)
+            } else {
+                split.baseUnresolvedExtensions.insert(recnum)
+            }
+        }
+        return split
     }
 }

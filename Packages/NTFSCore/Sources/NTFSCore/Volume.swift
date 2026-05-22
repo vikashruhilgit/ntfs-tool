@@ -127,6 +127,24 @@ public actor Volume {
         return baseAttrs + extAttrs
     }
 
+    /// Read and parse the entries of a $ATTRIBUTE_LIST attribute (resident or
+    /// non-resident body). Used by deleteFile to enumerate the extension
+    /// records that must be freed alongside the base.
+    private func attributeListEntries(of attrListAttr: Attribute) async throws -> [AttributeListEntry] {
+        let body: Data
+        switch attrListAttr.value {
+        case let .resident(b, _):
+            body = b
+        case let .nonResident(_, _, _, _, _, realSize, _, extents):
+            body = try await readNonResidentData(
+                extents: extents,
+                realSize: realSize,
+                lastVCN: 0
+            )
+        }
+        return try AttributeListEntry.parseAll(in: body)
+    }
+
     public func resolveAttribute(
         recordNumber: UInt64,
         type: AttributeType,
@@ -4758,6 +4776,51 @@ public actor Volume {
         try? await freeMFTRecord(recordNumber)
     }
 
+    /// Free ONE extension MFT record fully — its non-resident clusters, then
+    /// its slot (IN_USE off, sequence bumped, $MFT bitmap bit cleared).
+    /// Idempotent. Shared by `deleteFile` and the reclaim path.
+    public func freeExtensionRecord(at recordNumber: UInt64) async throws {
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else { return }  // idempotent — already freed
+        // Free the migrated non-resident clusters BEFORE the slot (the slot free
+        // doesn't touch clusters; doing the slot first would orphan them if
+        // interrupted).
+        for attr in try record.attributes() {
+            if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
+                for extent in extents {
+                    try await freeClusters(extent)
+                }
+            }
+        }
+        // Clear IN_USE and bump the sequence so stale $ATTRIBUTE_LIST /
+        // baseFileReference pointers detect the recycled slot (mirrors the
+        // base-record free).
+        var newFlags = record.flags
+        newFlags.remove(.inUse)
+        var newSeq = record.sequenceNumber &+ 1
+        if newSeq == 0 { newSeq = 1 }
+        let updated = MFTRecord(
+            magic: record.magic,
+            usaOffset: record.usaOffset,
+            usaCount: record.usaCount,
+            logFileSequenceNumber: record.logFileSequenceNumber,
+            sequenceNumber: newSeq,
+            hardLinkCount: record.hardLinkCount,
+            firstAttributeOffset: record.firstAttributeOffset,
+            flags: newFlags,
+            usedSize: record.usedSize,
+            allocatedSize: record.allocatedSize,
+            baseFileReference: record.baseFileReference,
+            nextAttributeID: record.nextAttributeID,
+            mftRecordNumber: record.mftRecordNumber,
+            bytes: record.bytes
+        )
+        try await mft.writeRecord(at: recordNumber, updated)
+        // Mirror free state in $MFT $BITMAP (best-effort).
+        try? await freeMFTRecord(recordNumber)
+    }
+
     /// Delete a file. Stage 3b complete: frees non-resident clusters, marks
     /// the MFT record IN_USE=0, bumps the sequence number, AND removes the
     /// corresponding entry from the parent directory's $I30 index.
@@ -4799,11 +4862,45 @@ public actor Volume {
             )
         }
 
-        // 2) Free non-resident clusters.
-        for attr in attrs {
-            if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
-                for extent in extents {
-                    try await freeClusters(extent)
+        // 2) Free non-resident clusters and any $ATTRIBUTE_LIST extension
+        // records. Detect whether attributes overflowed into extension records
+        // (base carries a $ATTRIBUTE_LIST, type 0x20). Absent → common case →
+        // behave exactly as before: free only the base record's own clusters,
+        // no extra reads.
+        let attrListAttr = attrs.first {
+            $0.rawType == AttributeType.attributeList.rawValue
+        }
+        if let attrListAttr {
+            // Migrated file: free each extension record (clusters + slot) before
+            // the base.
+            let entries = try await attributeListEntries(of: attrListAttr)
+            var seenExt: Set<UInt64> = []
+            for e in entries {
+                let extRN = e.recordNumber  // already masked by AttributeListEntry
+                if extRN == recordNumber { continue }
+                if !seenExt.insert(extRN).inserted { continue }
+                let extRec = try await mft.record(at: extRN)
+                guard extRec.isInUse else { continue }  // idempotent re-run skip
+                // Recycled slot — not ours, skip (do NOT throw).
+                guard extRec.sequenceNumber == e.sequenceNumber else { continue }
+                try await freeExtensionRecord(at: extRN)
+            }
+            // Free the base record's own non-resident clusters (extension
+            // clusters were freed above; base/extension attribute sets are
+            // disjoint → each non-resident cluster is freed exactly once).
+            for attr in attrs {
+                if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
+                    for extent in extents {
+                        try await freeClusters(extent)
+                    }
+                }
+            }
+        } else {
+            for attr in attrs {
+                if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
+                    for extent in extents {
+                        try await freeClusters(extent)
+                    }
                 }
             }
         }
