@@ -462,4 +462,367 @@ final class AttributeListMigrationTests: XCTestCase {
         }
         return UInt32(hex, radix: 16)
     }
+
+    // MARK: - delete-path migration helpers (mirror DataMigrationTests)
+
+    /// Deterministic content generator so a multi-megabyte payload can be fed
+    /// to `writeFile` without holding a separate reference copy.
+    private static func contentByte(at i: UInt64) -> UInt8 {
+        UInt8((i &* 31 &+ 7) & 0xFF)
+    }
+
+    /// Carve free space into a swiss-cheese bitmap (max contiguous run == 1
+    /// cluster) so the subsequent `writeFile` is forced to allocate a long,
+    /// highly-fragmented runlist. Returns free clusters remaining after carving.
+    private func fragmentFreeSpace(_ volume: Volume) async throws -> UInt64 {
+        var singles: [Extent] = []
+        while let e = try? await volume.allocateClusters(1) {
+            singles.append(e)
+            if singles.count > 4096 { break }
+        }
+        for (i, e) in singles.enumerated() where i % 2 == 0 {
+            try await volume.freeClusters(e)
+        }
+        return try await volume.allocationStats().freeClusters
+    }
+
+    /// Drive a fully-organic non-resident `$DATA` overflow on a fragmented
+    /// volume — the cleanest *deletable* migrated object (root and migrated
+    /// subdirs are not safely deletable). Mirrors `DataMigrationTests`'s helper.
+    ///
+    /// Returns the file's record number AND the free-cluster count measured
+    /// *after* the swiss-cheese carve but *before* `writeFile` — i.e. the exact
+    /// free count a subsequent `deleteFile(at: rn)` must restore (createFile's
+    /// empty record costs no clusters; the carve's permanently-allocated holes
+    /// are below this baseline and are NOT reclaimed by the delete). Returns
+    /// `nil` if the fixture has too little free space to fragment for the
+    /// requested overflow (caller XCTSkips).
+    private func driveDataOverflow(
+        volume: Volume,
+        named name: String,
+        inDirectory parentRN: UInt64 = 5,
+        clusters: UInt64 = 260,
+        fragment: Bool = true
+    ) async throws -> (recordNumber: UInt64, freeBeforeWrite: UInt64)? {
+        let rn = try await volume.createFile(named: name, inDirectory: parentRN)
+        // `fragment: false` reuses the fragmentation an earlier file already
+        // imposed on the volume — used by the two-file test, where a second
+        // swiss-cheese carve would strand the remaining space and starve B.
+        let freeBeforeWrite = fragment
+            ? try await fragmentFreeSpace(volume)
+            : try await volume.allocationStats().freeClusters
+        guard freeBeforeWrite > clusters + 1 else { return nil }
+        let total = Int(clusters * UInt64(volume.bytesPerCluster)) - 17
+        var payload = Data(count: total)
+        for i in 0..<total { payload[i] = Self.contentByte(at: UInt64(i)) }
+        var cursor = 0
+        try await volume.writeFile(at: rn, totalSize: UInt64(total)) {
+            if cursor >= total { return Data() }
+            let take = min(1 << 16, total - cursor)
+            let chunk = payload.subdata(in: cursor..<(cursor + take))
+            cursor += take
+            return chunk
+        }
+        return (rn, freeBeforeWrite)
+    }
+
+    /// True iff record `rn`'s base carries a `$ATTRIBUTE_LIST` (type 0x20) AND
+    /// at least one extension record points back at it — i.e. migration fired.
+    private func didMigrate(_ rn: UInt64, in volume: Volume) async throws -> Bool {
+        let mft = await volume.mft()
+        let attrs = try await mft.record(at: rn).attributes()
+        let hasAttrList = attrs.contains { $0.rawType == AttributeType.attributeList.rawValue }
+        let hasExt = try await findExtensionRecord(for: rn, in: volume) != nil
+        return hasAttrList && hasExt
+    }
+
+    /// Collect every distinct extension record number belonging to base `rn`.
+    private func extensionRecords(for rn: UInt64, in volume: Volume, maxRN: UInt64 = 512) async throws -> [UInt64] {
+        let mft = await volume.mft()
+        let mask: UInt64 = 0x0000_FFFF_FFFF_FFFF
+        var found: [UInt64] = []
+        for ext: UInt64 in 0..<maxRN {
+            guard let rec = try? await mft.record(at: ext) else { continue }
+            if rec.baseFileReference != 0, (rec.baseFileReference & mask) == (rn & mask) {
+                found.append(ext)
+            }
+        }
+        return found
+    }
+
+    /// Build `[InUseRecordSummary]` over the MFT and assert the pure classifier
+    /// reports zero leaked extensions — a stronger orphan check than `orphans`.
+    private func assertNoLeakedExtensions(in volume: Volume, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let mft = await volume.mft()
+        let mask: UInt64 = 0x0000_FFFF_FFFF_FFFF
+        var summaries: [InUseRecordSummary] = []
+        for rn: UInt64 in 16..<512 {
+            guard let rec = try? await mft.record(at: rn), rec.isInUse else { continue }
+            if rec.baseFileReference != 0 {
+                summaries.append(InUseRecordSummary(
+                    recordNumber: rn, isBaseRecord: false,
+                    baseRecordNumber: rec.baseFileReference & mask
+                ))
+            } else {
+                summaries.append(InUseRecordSummary(
+                    recordNumber: rn, isBaseRecord: true, baseRecordNumber: nil
+                ))
+            }
+        }
+        let reachable = try await reachableSet(in: volume)
+        let result = MFTConsistency.classifyInUseRecords(summaries, reachable: reachable)
+        XCTAssertTrue(
+            result.leakedExtensions.isEmpty,
+            "post-delete classifier must report zero leaked extensions; got \(result.leakedExtensions.sorted())",
+            file: file, line: line
+        )
+    }
+
+    /// $I30-reachability set from root (record 5), mirroring `orphans`.
+    private func reachableSet(in volume: Volume) async throws -> Set<UInt64> {
+        var reachable: Set<UInt64> = [5]
+        var queue: [UInt64] = [5]
+        while let dir = queue.popLast() {
+            guard let entries = try? await volume.enumerate(directory: dir) else { continue }
+            for e in entries where e.fileName.namespace != .dos {
+                if !reachable.contains(e.recordNumber) {
+                    reachable.insert(e.recordNumber)
+                    if e.isDirectory { queue.append(e.recordNumber) }
+                }
+            }
+        }
+        return reachable
+    }
+
+    // MARK: - AC-7 / AC-3: delete frees extension records AND their clusters
+
+    func testDeleteMigratedFileFreesExtensionRecordsAndClusters() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        // The migration baseline is the free count after the swiss-cheese
+        // carve but before writeFile (the carve permanently strands ~half the
+        // free space; the delete only reclaims what writeFile allocated). The
+        // delete must return us EXACTLY to this point — ALL migrated clusters
+        // back, none over- or under-freed.
+        guard let (rn, freeBeforeWrite) =
+            try await driveDataOverflow(volume: volume, named: "del-migrated.bin") else {
+            throw XCTSkip("small.img has too little free space to fragment for the overflow")
+        }
+        guard try await didMigrate(rn, in: volume) else {
+            throw XCTSkip("could not force $DATA-migration on small.img for delete test")
+        }
+
+        let extRecords = try await extensionRecords(for: rn, in: volume)
+        XCTAssertFalse(extRecords.isEmpty, "precondition: migrated file must own >= 1 extension record")
+
+        try await volume.deleteFile(at: rn)
+
+        // (a) base record freed.
+        let mft = await volume.mft()
+        let base = try await mft.record(at: rn)
+        XCTAssertFalse(base.isInUse, "base record \(rn) must be IN_USE=0 after delete")
+
+        // (b) every extension record freed.
+        for ext in extRecords {
+            let er = try await mft.record(at: ext)
+            XCTAssertFalse(er.isInUse, "extension record \(ext) must be IN_USE=0 after delete")
+        }
+
+        // (c) free-cluster count restored to the pre-write baseline — ALL
+        //     migrated clusters returned (AC-3 cluster accounting).
+        let afterFree = try await volume.allocationStats().freeClusters
+        XCTAssertEqual(
+            afterFree, freeBeforeWrite,
+            "all migrated clusters must be reclaimed: pre-write \(freeBeforeWrite), after-delete \(afterFree)"
+        )
+
+        // (d) orphan + leaked-extension walk clean on reopen.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let leaked = try await orphans(in: reopen)
+        XCTAssertTrue(leaked.isEmpty, "post-delete reopen must be orphan-free; got \(leaked.sorted().prefix(10))")
+        try await assertNoLeakedExtensions(in: reopen)
+    }
+
+    // MARK: - AC-2: deleting one migrated file leaves another intact
+
+    func testDeleteOneMigratedFileLeavesAnotherMigratedFileIntact() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        // Two migrated files. Migration needs a ~250-fragment runlist to exceed
+        // the base record's ~752-byte slack, and the swiss-cheese carve strands
+        // ~half the free space; on the 4 MiB small.img (~640 free clusters)
+        // fitting TWO independent migrations does not fit. We still attempt it
+        // (the second reuses A's fragmentation, no fresh carve) and XCTSkip
+        // cleanly if the fixture can't host both — the per-record "don't free
+        // the wrong record" guarantee is also covered by the leaked-extension
+        // classifier tests in MFTConsistencyTests.
+        guard let (rnA, _) =
+            try await driveDataOverflow(volume: volume, named: "keep.bin", clusters: 260) else {
+            throw XCTSkip("small.img has too little free space for the first overflow")
+        }
+        guard let (rnB, _) =
+            try await driveDataOverflow(volume: volume, named: "drop.bin", clusters: 260, fragment: false) else {
+            throw XCTSkip("small.img cannot fit a second migrated file alongside the first")
+        }
+        guard try await didMigrate(rnA, in: volume), try await didMigrate(rnB, in: volume) else {
+            throw XCTSkip("could not force two concurrent $DATA-migrations on small.img")
+        }
+
+        let keepExts = try await extensionRecords(for: rnA, in: volume)
+        XCTAssertFalse(keepExts.isEmpty, "the kept file must own an extension record")
+        let keepContent = try await volume.readFile(at: rnA)
+
+        // Delete only file B.
+        try await volume.deleteFile(at: rnB)
+
+        // File A's base + extension(s) must remain IN_USE and read unchanged.
+        let mft = await volume.mft()
+        let baseA = try await mft.record(at: rnA)
+        XCTAssertTrue(baseA.isInUse, "the kept file's base record \(rnA) must stay IN_USE")
+        for ext in keepExts {
+            let extInUse = try await mft.record(at: ext).isInUse
+            XCTAssertTrue(extInUse, "the kept file's extension record \(ext) must stay IN_USE")
+        }
+        let reread = try await volume.readFile(at: rnA)
+        XCTAssertEqual(reread, keepContent, "deleting the other file must not corrupt the kept file's data")
+
+        // And the kept file survives a reopen byte-identical.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let reopenContent = try await reopen.readFile(at: rnA)
+        XCTAssertEqual(reopenContent, keepContent, "kept file must read identically after reopen")
+        try await assertNoLeakedExtensions(in: reopen)
+    }
+
+    // MARK: - AC-4: delete + freeExtensionRecord are idempotent (no double-free)
+
+    func testDeleteMigratedFileIsIdempotent() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        guard let (rn, _) =
+            try await driveDataOverflow(volume: volume, named: "idem.bin") else {
+            throw XCTSkip("small.img has too little free space to fragment for the overflow")
+        }
+        guard try await didMigrate(rn, in: volume) else {
+            throw XCTSkip("could not force $DATA-migration on small.img for idempotency test")
+        }
+        let extRecords = try await extensionRecords(for: rn, in: volume)
+        XCTAssertFalse(extRecords.isEmpty, "precondition: migrated file must own >= 1 extension record")
+
+        try await volume.deleteFile(at: rn)
+        let freeAfterFirst = try await volume.allocationStats().freeClusters
+
+        // A second full deleteFile short-circuits on the BASE record's isInUse
+        // guard, so the meaningful observable is the BASE record's sequence
+        // number. The first delete clears IN_USE and bumps the sequence once;
+        // capture it now.
+        let mftAfterFirst = await volume.mft()
+        let baseAfterFirst = try await mftAfterFirst.record(at: rn)
+        XCTAssertFalse(baseAfterFirst.isInUse, "base record \(rn) must be IN_USE=0 after the first delete")
+        let baseSeqAfterFirstDelete = baseAfterFirst.sequenceNumber
+
+        // Second delete must not throw and must not change the free count.
+        try await volume.deleteFile(at: rn)
+        let freeAfterSecond = try await volume.allocationStats().freeClusters
+        XCTAssertEqual(
+            freeAfterSecond, freeAfterFirst,
+            "a second deleteFile must be a no-op (no double-free): \(freeAfterFirst) → \(freeAfterSecond)"
+        )
+
+        // The free-cluster count is a weak signal (Bitmap.free is bit-idempotent
+        // so re-freeing clusters is invisible to it). The base record's SEQUENCE
+        // NUMBER is the observable that bites: the base isInUse guard must
+        // short-circuit the second delete so the sequence is NOT bumped again.
+        // (Removing the guard rewrites the base and bumps it a second time.)
+        let baseAfterSecond = try await mftAfterFirst.record(at: rn)
+        XCTAssertFalse(baseAfterSecond.isInUse, "base record \(rn) must remain IN_USE=0 after the second delete")
+        XCTAssertEqual(
+            baseAfterSecond.sequenceNumber, baseSeqAfterFirstDelete,
+            "second delete must be a clean no-op: the base isInUse guard must prevent a second sequence bump"
+        )
+
+        // freeExtensionRecord on an already-freed extension is also a no-op.
+        try await volume.freeExtensionRecord(at: extRecords[0])
+        let freeAfterExt = try await volume.allocationStats().freeClusters
+        XCTAssertEqual(
+            freeAfterExt, freeAfterSecond,
+            "freeExtensionRecord on an already-freed extension must not change the free count"
+        )
+    }
+
+    // MARK: - AC-9: freeExtensionRecord frees clusters + slot, then idempotent
+
+    func testFreeExtensionRecordFreesClustersAndSlotThenIdempotent() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        guard let (rn, _) =
+            try await driveDataOverflow(volume: volume, named: "freeext.bin") else {
+            throw XCTSkip("small.img has too little free space to fragment for the overflow")
+        }
+        guard try await didMigrate(rn, in: volume) else {
+            throw XCTSkip("could not force $DATA-migration on small.img for freeExtensionRecord test")
+        }
+        guard let extRN = try await findExtensionRecord(for: rn, in: volume) else {
+            return XCTFail("expected an extension record for migrated file \(rn)")
+        }
+
+        // Sum the extension record's own non-resident allocation up front.
+        let mft = await volume.mft()
+        let extRec = try await mft.record(at: extRN)
+        XCTAssertTrue(extRec.isInUse, "precondition: extension record must start IN_USE")
+        var extClusters: UInt64 = 0
+        for attr in try extRec.attributes() {
+            if case let .nonResident(_, _, _, _, _, _, _, extents) = attr.value {
+                for e in extents { extClusters += e.clusterCount }
+            }
+        }
+        XCTAssertGreaterThan(extClusters, 0, "the migrated extension must hold non-resident clusters")
+
+        let freeBefore = try await volume.allocationStats().freeClusters
+        try await volume.freeExtensionRecord(at: extRN)
+
+        // Slot freed; capture the post-first-free sequence number. The first
+        // free clears IN_USE and bumps the sequence exactly once.
+        let extRecAfterFirst = try await mft.record(at: extRN)
+        XCTAssertFalse(extRecAfterFirst.isInUse,
+                       "extension record \(extRN) must be IN_USE=0 after freeExtensionRecord")
+        let seqAfterFirstFree = extRecAfterFirst.sequenceNumber
+        // Free count rose by exactly the extension's allocation.
+        let freeAfter = try await volume.allocationStats().freeClusters
+        XCTAssertEqual(
+            freeAfter, freeBefore + extClusters,
+            "freeExtensionRecord must return exactly the extension's \(extClusters) clusters"
+        )
+
+        // Idempotent second call. The free-cluster count is a weak signal here —
+        // Bitmap.free is bit-idempotent, so re-freeing already-clear clusters is
+        // invisible to it. The SEQUENCE NUMBER is the observable that bites: the
+        // isInUse guard must short-circuit the second call so the sequence is
+        // NOT bumped a second time. (Removing the guard rewrites the record and
+        // bumps the sequence again — exactly what we assert against.)
+        try await volume.freeExtensionRecord(at: extRN)
+        let extRecAfterSecond = try await mft.record(at: extRN)
+        XCTAssertFalse(extRecAfterSecond.isInUse,
+                       "extension record \(extRN) must remain IN_USE=0 after a second freeExtensionRecord")
+        XCTAssertEqual(
+            extRecAfterSecond.sequenceNumber, seqAfterFirstFree,
+            "second free must be a no-op: the isInUse guard must prevent a second sequence bump (no double-free)"
+        )
+        let freeAfterSecond = try await volume.allocationStats().freeClusters
+        XCTAssertEqual(
+            freeAfterSecond, freeAfter,
+            "a second freeExtensionRecord must be a no-op (no double-free)"
+        )
+    }
 }
