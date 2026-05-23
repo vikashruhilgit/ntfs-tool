@@ -825,4 +825,136 @@ final class AttributeListMigrationTests: XCTestCase {
             "a second freeExtensionRecord must be a no-op (no double-free)"
         )
     }
+
+    // MARK: - allAttributesOf surfaces migrated $DATA at the exact written size
+
+    /// The FSKit target's `makeFreshAttributes` reads a migrated file's size via
+    /// `coreVolume.allAttributesOf(recordNumber:)`. That target can't be
+    /// swift-tested, so this is its indirect proof: force a $DATA migration with a
+    /// known byte length, then confirm `allAttributesOf` surfaces the unnamed
+    /// $DATA from the extension record AND that its `realSize` equals exactly the
+    /// bytes written. A wrong size here is precisely the bug FSKit would report.
+    func testAllAttributesOfReturnsMigratedDataWithCorrectSize() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        let clusters: UInt64 = 260
+        guard let (rn, _) = try await driveDataOverflow(
+            volume: volume, named: "size-migrated.bin", clusters: clusters
+        ) else {
+            throw XCTSkip("small.img has too little free space to fragment for the overflow")
+        }
+        guard try await didMigrate(rn, in: volume) else {
+            throw XCTSkip("could not force $DATA-migration on small.img for size test")
+        }
+
+        // driveDataOverflow writes exactly `clusters * bytesPerCluster - 17`
+        // bytes — recompute the same way so the assertion tracks the helper.
+        let expectedSize = UInt64(Int(clusters * UInt64(volume.bytesPerCluster)) - 17)
+
+        // The base record alone does NOT carry the unnamed $DATA after migration
+        // (it lives in the extension via $ATTRIBUTE_LIST) — that's the whole
+        // point of the $ATTRIBUTE_LIST-aware read path FSKit now depends on.
+        let mft = await volume.mft()
+        let baseOnly = try await mft.record(at: rn).attributes()
+        XCTAssertFalse(
+            baseOnly.contains { $0.type == .data && $0.nameOrEmpty == "" },
+            "precondition: post-migration the base record must NOT hold the unnamed $DATA itself"
+        )
+
+        // allAttributesOf walks $ATTRIBUTE_LIST into the extension record and
+        // surfaces the migrated unnamed $DATA.
+        let all = try await volume.allAttributesOf(recordNumber: rn)
+        guard let dataAttr = all.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            return XCTFail("allAttributesOf must surface the migrated unnamed $DATA from the extension record")
+        }
+        guard case let .nonResident(_, _, _, _, _, realSize, _, _) = dataAttr.value else {
+            return XCTFail("a migrated $DATA must be non-resident")
+        }
+        XCTAssertEqual(
+            realSize, expectedSize,
+            "the $DATA size FSKit's makeFreshAttributes reads must equal the bytes written: expected \(expectedSize), got \(realSize)"
+        )
+    }
+
+    // MARK: - truncate on a migrated file fails cleanly without mutating state
+
+    /// truncate on a migrated file (base carries $ATTRIBUTE_LIST, unnamed $DATA
+    /// in an extension record) must reject with a clean `unsupportedFeature` —
+    /// NOT a false `corruptOnDisk` — for every newSize including 0, and must do
+    /// so BEFORE freeing any clusters or writing anything. Proves the guard bails
+    /// ahead of any mutation.
+    func testTruncateMigratedFileThrowsCleanUnsupported() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        guard let (rn, _) = try await driveDataOverflow(
+            volume: volume, named: "trunc-migrated.bin"
+        ) else {
+            throw XCTSkip("small.img has too little free space to fragment for the overflow")
+        }
+        guard try await didMigrate(rn, in: volume) else {
+            throw XCTSkip("could not force $DATA-migration on small.img for truncate test")
+        }
+
+        // Capture the exact pre-truncate state the guard must preserve: the
+        // original bytes (read via the migrated $DATA) and the free-cluster count.
+        let originalContent = try await volume.readFile(at: rn)
+        XCTAssertFalse(originalContent.isEmpty, "precondition: migrated file must have content")
+        let freeBefore = try await volume.allocationStats().freeClusters
+
+        // Both a non-zero shrink AND 0 must throw unsupportedFeature, never
+        // corruptOnDisk (the latter would mean the lacks-$DATA guard misfired on
+        // a healthy migrated file).
+        let nonZeroShrink = UInt64(max(1, originalContent.count / 2))
+        for target: UInt64 in [nonZeroShrink, 0] {
+            await XCTAssertThrowsErrorAsync(
+                try await volume.truncate(at: rn, newSize: target),
+                "truncate(newSize: \(target)) on a migrated file must throw"
+            ) { error in
+                guard case NTFSError.unsupportedFeature = error else {
+                    if case NTFSError.corruptOnDisk = error {
+                        XCTFail("truncate(newSize: \(target)) threw corruptOnDisk on a healthy migrated file; must be unsupportedFeature")
+                    } else {
+                        XCTFail("truncate(newSize: \(target)) threw \(error); expected unsupportedFeature")
+                    }
+                    return
+                }
+            }
+        }
+
+        // Nothing was mutated: no clusters freed and the file still reads back its
+        // original bytes via the migrated $DATA — the guard bailed pre-mutation.
+        let freeAfter = try await volume.allocationStats().freeClusters
+        XCTAssertEqual(
+            freeAfter, freeBefore,
+            "rejected truncate must not free any clusters: before \(freeBefore), after \(freeAfter)"
+        )
+        let afterContent = try await volume.readFile(at: rn)
+        XCTAssertEqual(
+            afterContent, originalContent,
+            "rejected truncate must leave the migrated file's bytes unchanged"
+        )
+    }
+}
+
+/// Async-throwing assertion helper — XCTest's `XCTAssertThrowsError` is sync, so
+/// awaiting expressions need this wrapper to capture + inspect the thrown error.
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ message: String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ errorHandler: (_ error: Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail(message.isEmpty ? "expected an error to be thrown but none was" : message, file: file, line: line)
+    } catch {
+        errorHandler(error)
+    }
 }

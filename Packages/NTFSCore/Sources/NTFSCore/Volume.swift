@@ -4128,6 +4128,17 @@ public actor Volume {
         let mft = self.mft()
         let record = try await mft.record(at: recordNumber)
         let attrs = try record.attributes()
+        // A migrated file — base carries an $ATTRIBUTE_LIST, unnamed $DATA lives
+        // in an extension record — is deferred for truncate. The paths below read
+        // base-only $DATA and free its extents, which on a migrated file live in
+        // the extension record (so they'd be missed), and the lacks-$DATA guard
+        // would mis-report a healthy volume as corrupt. Bail cleanly before
+        // freeing or writing anything.
+        if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
+            throw NTFSError.unsupportedFeature(
+                description: "truncate: MFT record \(recordNumber) has $ATTRIBUTE_LIST (migrated $DATA in extension); truncating a migrated file is not yet supported"
+            )
+        }
         guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
             throw NTFSError.corruptOnDisk(description: "truncate: record \(recordNumber) lacks unnamed $DATA")
         }

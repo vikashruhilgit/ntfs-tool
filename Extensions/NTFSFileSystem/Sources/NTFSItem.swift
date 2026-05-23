@@ -155,7 +155,14 @@ final class NTFSItem: FSItem {
             result.flags      = si.fileAttributes
         }
 
-        if let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) {
+        // The unnamed $DATA can migrate out of the base record into an
+        // extension record (base then carries an $ATTRIBUTE_LIST). Read it via
+        // the $ATTRIBUTE_LIST-aware union so a migrated file's size/allocSize
+        // reflect the real $DATA rather than falling back to a stale
+        // $FILE_NAME value (typically 0). $STANDARD_INFORMATION and
+        // hardLinkCount stay in the base record and are read above/below.
+        let allAttrs = try await coreVolume.allAttributesOf(recordNumber: recordNumber)
+        if let dataAttr = allAttrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) {
             switch dataAttr.value {
             case let .resident(bytes, _):
                 result.size = UInt64(bytes.count)
