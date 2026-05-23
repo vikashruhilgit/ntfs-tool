@@ -2,6 +2,22 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — v0.5.1 candidate
+
+### Fixed
+
+- **v0.5.1: `truncate` returns a clean `unsupportedFeature` (not a false `corruptOnDisk`) on a migrated file.** A "migrated" file — one whose unnamed `$DATA` was moved out of the base MFT record into an extension record, leaving an `$ATTRIBUTE_LIST` (type 0x20) on the base — was not recognized by `Volume.truncate(at:newSize:)`. The truncate paths read base-only `$DATA` and free its extents (which on a migrated file live in the extension record, so they'd be missed), and the lacks-`$DATA` guard would mis-report a healthy migrated file as `corruptOnDisk`. `truncate` now detects the `$ATTRIBUTE_LIST` on the base and throws `NTFSError.unsupportedFeature("truncate: MFT record N has $ATTRIBUTE_LIST (migrated $DATA in extension); truncating a migrated file is not yet supported")` for ALL `newSize` (including 0) — **before** freeing any clusters or writing anything, so the rejected truncate leaves volume state byte-identical. Truncating a migrated file remains deferred (fail-closed, never corruption); non-migrated files take the same byte-precise shrink path as before.
+
+- **v0.5.1: FSKit reports the correct size for migrated files.** The FSKit extension's `makeFreshAttributes` previously read a file's `$DATA` size from the base MFT record only, so a migrated file (whose `$DATA` lives in an extension record via `$ATTRIBUTE_LIST`) would report a wrong/zero size to Finder. It now reads the size via `coreVolume.allAttributesOf(recordNumber:)`, which walks `$ATTRIBUTE_LIST` into the extension record and surfaces the migrated unnamed `$DATA` at its exact `realSize`.
+
+### Changed
+
+- **v0.5.1: file-attribute-path extension-awareness audit CLOSED.** With the `truncate` clean-error fix and the FSKit `makeFreshAttributes` size fix above, every file-attribute mutation/read path was confirmed migration-aware (`$ATTRIBUTE_LIST`-aware) or cleanly deferred. The remaining paths were confirmed already-correct / already-deferred: `rename` (operates on `$FILE_NAME` + the parent `$I30`, which stay resident in the base record — unaffected by `$DATA` migration), `write` and `writeFile` (a subsequent write to an already-migrated file fails closed with a clean error, never a partial mutation — tracked as a deferred follow-up), and `deleteFile` (already `$ATTRIBUTE_LIST`-aware as of v0.5 — frees extension records and their migrated clusters). No further file-attribute-path extension-awareness work is outstanding for v0.5.
+
+### Tests
+
+- **2 new NTFSCore unit tests; 145 NTFSCore tests pass (was 143), 1 skip, 0 failures.** In `Packages/NTFSCore/Tests/NTFSCoreTests/AttributeListMigrationTests.swift`: `testAllAttributesOfReturnsMigratedDataWithCorrectSize` (forces a `$DATA` migration with a known byte length, confirms the base record no longer holds the unnamed `$DATA`, and asserts `allAttributesOf` surfaces the migrated non-resident `$DATA` at exactly the bytes written — the indirect proof for the FSKit `size` read, which can't be swift-tested) and `testTruncateMigratedFileThrowsCleanUnsupported` (asserts `truncate` on a migrated file throws `unsupportedFeature` — never `corruptOnDisk` — for both a non-zero shrink and 0, and that no clusters were freed and the file still reads its original bytes via the migrated `$DATA`, proving the guard bails before mutating anything).
+
 ## [Unreleased] — v0.5.0 candidate
 
 ### Added
