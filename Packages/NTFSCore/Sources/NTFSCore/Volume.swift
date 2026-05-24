@@ -4988,6 +4988,32 @@ public actor Volume {
         _allocHint
     }
 
+    /// Test-only seam: drive the REAL runlist encoder directly so tests can
+    /// exercise large-LCN / backward-delta extent configurations that are hard
+    /// to reach organically on a tiny fixture image. No behavior change —
+    /// this just forwards to the private `encodeRunlist`. Used by
+    /// MultiExtentDataTests to assert spec-conformance against an independent
+    /// decoder. (v0.5 multi-extent portability diagnosis.)
+    internal func _encodeRunlistForTesting(_ extents: [Extent]) -> Data {
+        encodeRunlist(extents: extents)
+    }
+
+    /// Test-only seam: drive the REAL non-resident $DATA serializer directly
+    /// (header coverage fields + runlist) for spec-conformance assertions.
+    internal func _serializeNonResidentDataForTesting(
+        realSize: UInt64,
+        allocatedSize: UInt64,
+        extents: [Extent]
+    ) -> Data {
+        serializeNonResidentDataAttribute(
+            attrID: 0,
+            flags: 0,
+            realSize: realSize,
+            allocatedSize: allocatedSize,
+            extentList: extents
+        )
+    }
+
     /// Persist the in-memory Bitmap back to the on-disk $Bitmap attribute.
     /// Walks $Bitmap's $DATA extents and writes the corresponding bitmap
     /// bytes via `BlockDevice.write`. For a resident $Bitmap (a degenerate
