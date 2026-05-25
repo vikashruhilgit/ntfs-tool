@@ -8,10 +8,14 @@ import NTFSCore
 /// STRICTLY READ-ONLY. Opens the device with the read-only
 /// `FileHandleBlockDevice(openingFileAt:)` initializer and calls no mutating
 /// Volume APIs. The per-$DATA / per-extent classification is driven entirely by
-/// `Volume.auditDataRunlistAgainstBitmap`, so `dump` and `verify --deep` share
-/// the exact same logic for free-but-referenced / out-of-range / reserved
-/// detection. Built to localize a real WD-drive fault where multi-extent
-/// $DATA files read fine here but throw I/O errors in macOS's native driver.
+/// `Volume.auditDataRunlistAgainstBitmap`, so `dump` and `verify --deep` agree
+/// exactly on the verdict, which covers ONLY free-but-referenced /
+/// out-of-range / double-allocated clusters. Reserved-region overlap is
+/// ADVISORY: it's surfaced per-extent as the `OVERLAPS_RESERVED(!)` status
+/// column flag but is NOT part of the `runlist OK` / `runlist FAULTY` verdict
+/// (best-effort reserved-region detection must not raise a false alarm).
+/// Built to localize a real WD-drive fault where multi-extent $DATA files read
+/// fine here but throw I/O errors in macOS's native driver.
 struct Dump: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "dump",

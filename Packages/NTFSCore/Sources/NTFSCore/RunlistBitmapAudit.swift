@@ -350,11 +350,15 @@ extension Volume {
                     "extent VCN \(vcn) LCN \(startLCN)+\(count): \(outOfRange) cluster(s) out of volume range (>= \(totalClusters))"
                 )
             }
-            if overlapsReserved {
-                anomalies.append(
-                    "extent VCN \(vcn) LCN \(startLCN)+\(count): overlaps a reserved region ($MFT/$MFTMirr/$Bitmap)"
-                )
-            }
+            // Reserved-region overlap is ADVISORY ONLY: it is surfaced via the
+            // per-extent `overlapsReserved` flag (computed above and stored on
+            // ExtentAudit) but is deliberately NOT appended to `anomalies`, so it
+            // does not affect `RunlistBitmapAudit.isClean`. This keeps the
+            // per-record verdict scoped to exactly free-but-referenced +
+            // out-of-range, matching `VolumeRunlistAudit.isClean` / `verify
+            // --deep` so the two commands can never disagree. Reserved-region
+            // detection is best-effort/approximate ($MFTMirr uses a fallback),
+            // so excluding it from the verdict also avoids false alarms.
 
             extentAudits.append(ExtentAudit(
                 vcnStart: vcn,
