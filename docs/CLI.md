@@ -168,7 +168,8 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
 | `list` | `<device> [recnum-or-path]` | List directory contents. Default = 5 (root). Pass `--long` for record numbers + sizes + namespace. Accepts a path like `/Backups` instead of a recnum. |
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
-| `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 4096). `--verbose` for per-record details. |
+| `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 0 = auto-bounded by `$MFT`'s logical size). `--verbose` for per-record details. **`--deep`** additionally runs a whole-volume runlist↔`$Bitmap` + double-allocation sweep — catches free-but-referenced / out-of-range / double-allocated clusters the plain check can't see (the v0.5 multi-extent / portability diagnostic). **Read-only.** |
+| `dump` | `<device> <path>` | Read-only deep dump of ONE file's unnamed `$DATA`: MFT record identity (base vs migrated/`$ATTRIBUTE_LIST`), `$DATA` header (resident vs non-resident, real/allocated/initialized sizes, lastVCN), the decoded runlist as an extent table with each extent's `$Bitmap` status (`ALLOCATED` / `FREE(!)` / `OUT_OF_RANGE(!)` / `OVERLAPS_RESERVED(!)`), and a final `runlist OK` / `runlist FAULTY` verdict. `--verbose` for per-cluster detail. The single-file companion to `verify --deep`; shares the exact same audit logic. **Read-only.** |
 | `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
 | `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `-T`/`--no-target-directory` merges a directory source's contents into an existing dest dir (instead of nesting). `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
 | `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N`: 0 (rewrite) / file size (append) / `0 < N ≤ size-bytes.count` (in-place mid-file patch). `--from-file <path>` streams from a host file. |
@@ -313,6 +314,152 @@ docker run --rm -v /tmp:/io --privileged debian:bookworm-slim bash -c '
 '
 ```
 
+### Diagnose multi-extent / portability faults (`dump` + `verify --deep`)
+
+These two commands are the **read-only diagnostics for the open WD-drive
+multi-extent `$DATA` investigation**: files whose unnamed `$DATA` spans multiple
+extents read byte-exact with `ntfsctl cat` but raise `Input/output error` in
+macOS's native NTFS driver. The leading hypothesis is an over-free that left
+clusters belonging to committed files marked FREE in `$Bitmap` (or reused by
+another file), which a spec-strict reader rejects. Both commands cross-check
+each file's runlist against `$Bitmap` and are **strictly read-only — safe to run
+on a live, mounted drive** (they open the device with the read-only initializer
+and call no mutating APIs).
+
+- **`dump <device> <path>`** inspects ONE suspect file in detail.
+- **`verify --deep <device>`** sweeps the WHOLE volume for the same fault classes.
+
+#### Inspect one failing file — `dump <path>`
+
+```bash
+diskutil unmount /dev/disk10s1
+# Point dump at the exact file the native driver chokes on.
+sudo ntfsctl dump /dev/disk10s1 "/Backups/big-fragmented.bin"
+diskutil mount /dev/disk10s1
+```
+
+Example output for a healthy multi-extent file (verdict `runlist OK`):
+
+```
+File:                     /Backups/big-fragmented.bin
+MFT record:               73
+  Base record:            yes
+  Migrated ($ATTR_LIST):  no
+$DATA:
+  Storage:                non-resident
+  realSize:               4980736 bytes (4.75 MiB)
+  allocatedSize:          4980736 bytes (4.75 MiB)
+  initializedSize:        4980736 bytes (4.75 MiB)
+  lastVCN:                1215
+
+Extents (3):
+  vcn_start    vcn_count    startLCN         bitmap status
+  ----------------------------------------------------------------------
+  0            500          262144           ALLOCATED 500
+  500          400          524288           ALLOCATED 400
+  900          316          131072           ALLOCATED 316
+
+Summary:
+  Clusters referenced:    1216
+  Free but referenced:    0
+  Out of range:           0
+
+runlist OK
+```
+
+Example output for the actual fault — a cluster the file still references but
+`$Bitmap` marks FREE (the over-free smoking gun). Per-extent status flags the
+bad run and `dump` exits non-zero:
+
+```
+File:                     /Backups/big-fragmented.bin
+MFT record:               73
+  Base record:            yes
+  Migrated ($ATTR_LIST):  no
+$DATA:
+  Storage:                non-resident
+  realSize:               4980736 bytes (4.75 MiB)
+  allocatedSize:          4980736 bytes (4.75 MiB)
+  initializedSize:        4980736 bytes (4.75 MiB)
+  lastVCN:                1215
+
+Extents (3):
+  vcn_start    vcn_count    startLCN         bitmap status
+  ----------------------------------------------------------------------
+  0            500          262144           ALLOCATED 500
+  500          400          524288           ALLOCATED 399  FREE(!) 1
+  900          316          131072           ALLOCATED 316
+
+Summary:
+  Clusters referenced:    1216
+  Free but referenced:    1
+  Out of range:           0
+
+runlist FAULTY — 1 anomaly(ies):
+  - extent VCN 500 LCN 524288+400: 1 cluster(s) FREE in $Bitmap but referenced
+```
+
+An `OUT_OF_RANGE(!)` status (and an `out of volume range` anomaly) appears the
+same way when a run points at an LCN `>=` the volume's cluster count — the other
+class of corruption a spec-strict reader rejects with an I/O error.
+
+#### Sweep the whole volume — `verify --deep`
+
+```bash
+diskutil unmount /dev/disk10s1
+sudo ntfsctl verify --deep /dev/disk10s1
+diskutil mount /dev/disk10s1
+```
+
+`--deep` appends a runlist/`$Bitmap` audit to the normal verify output, reporting
+the five counts (files checked, runlist clusters verified, free-but-referenced,
+out-of-range, double-allocated). Clean volume:
+
+```
+Boot sector:              OK  (NTFS)
+MFT sweep (records 0..255):
+  In use (total):         42
+    User (>=16):          26
+    Directories:          7
+  Free:                   214
+  Parse errors:           0
+Directory tree (from root):
+  Reachable user files:   26
+  Extension records:      0 (linked)
+  Orphans (base record in MFT, not in tree): 0
+  Leaked extensions (base record free): 0
+  Dangling ($I30 entry but MFT slot free): 0
+Deep runlist/$Bitmap audit:
+  Files checked:                26
+  Runlist clusters verified:    4096
+  Free-but-referenced clusters: 0
+  Out-of-range clusters:        0
+  Double-allocated clusters:    0
+  Unreadable records:           0
+
+Verify PASSED.
+```
+
+A volume hit by the over-free / aliasing bug — note the plain MFT sweep passes,
+but the deep audit catches what it cannot see, and the run exits non-zero:
+
+```
+Deep runlist/$Bitmap audit:
+  Files checked:                26
+  Runlist clusters verified:    4096
+  Free-but-referenced clusters: 1
+  Out-of-range clusters:        0
+  Double-allocated clusters:    2
+  Unreadable records:           0
+
+Verify FAILED — 0 parse, 0 orphan, 0 leaked-extension, 0 dangling, 0 enum errors — deep audit: 1 free-but-referenced, 0 out-of-range, 2 double-allocated cluster(s). Suggest running ntfsfix or chkdsk /f.
+```
+
+Add `--verbose` to list the offending record numbers and their per-record
+anomaly lines, then point `dump <path>` at each one for the extent-level detail.
+Workflow: `verify --deep` to find WHICH files are affected, `dump <path>` to see
+WHERE in each file's runlist the fault is.
+
 ### Reclaim orphaned MFT records left by older buggy builds
 
 If `verify` reports orphans (records in the MFT with IN_USE=1 but not reachable from any directory), you can clean them in-place without booting Windows or Linux. Common scenario: a previous failed `cp -r` against a pre-v0.3 build that hit the leaf-split silent-orphan bug.
@@ -439,6 +586,7 @@ Paste the error output. Specific failure modes:
 - **"MFT record magic is 'BAAD'"** → that record was previously marked corrupt by Windows. Not necessarily a problem for the volume overall.
 - **"USA sentinel mismatch"** → hardware fault or interrupted write. Run Windows `chkdsk /f` to recover.
 - **"attribute … extends past record's used region"** → likely a bug in our parser. Open an issue with the full output and the device's `info` output.
+- **`verify --deep` reports "free-but-referenced" / "out-of-range" / "double-allocated" cluster(s)** → the runlist↔`$Bitmap` audit found corruption the plain MFT sweep can't see (the v0.5 multi-extent / portability fault class). `free-but-referenced` = a cluster a file still references but `$Bitmap` marks FREE (over-free); `out-of-range` = a run points past the volume's last cluster; `double-allocated` = two files claim the same cluster. All three make spec-strict readers (macOS native driver, ntfs-3g, Windows) raise `Input/output error` on the affected file. Run `ntfsctl dump <device> <path>` on each affected file (use `verify --deep --verbose` to get the record numbers) for the extent-level detail, then repair with `chkdsk /f` (Windows) or `ntfsfix`. The audit is read-only — it diagnoses, it does not repair.
 
 ### Apple's driver remounts the volume between my commands
 
