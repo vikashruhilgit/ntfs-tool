@@ -407,7 +407,7 @@ This was first feared to be a "multi-extent `$DATA` portability blocker" bug in 
 2. **Driver-level content read.** `ntfsctl cat <device> bn.pdf | shasum` == the source sha (`45b9219026bb9b135c43fc213c9eabe16c0b9565`).
 3. **No-driver raw read.** `dd if=/dev/diskNs1 bs=512 skip=10081800 count=1056 | head -c 540566 | shasum` (RAW read straight off the block device, no NTFS driver involved at all) == the source sha.
 
-**Boundary math.** Failures correlate exactly with **LCN > 1,048,576 = 4 GB ÷ 4096-byte cluster**. Files whose data lives below 4 GB read fine in `livefiles`; provably-correct files above 4 GB throw EIO. For `bn.pdf` the sector number (`10,083,848`) fits in 32 bits, but the byte offset (`5.16e9`) overflows 32 bits — a 32-bit blockmap limitation in Apple's young `livefiles_ntfs`. Generalize the boundary as:
+**Boundary math.** Failures correlate exactly with **LCN > 1,048,576 = 4 GB ÷ 4096-byte cluster**. Files whose data lives below 4 GB read fine in `livefiles`; provably-correct files above 4 GB throw EIO. For `bn.pdf` the sector number (`10,081,800` = LCN 1,260,225 × 4096 ÷ 512) fits in 32 bits, but the byte offset (`5.16e9`) overflows 32 bits — a 32-bit blockmap limitation in Apple's young `livefiles_ntfs`. Generalize the boundary as:
 
 ```
 boundary LCN = 4 GiB / bytesPerCluster
