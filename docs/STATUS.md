@@ -387,6 +387,41 @@ Effort: 2-3 weeks.
 
 Effort: 1-3 months of focused work.
 
+## Known external limitations
+
+These are defects in tools OUTSIDE this project that affect how our (provably-correct) on-disk data is read back. They are recorded here so future hardware runs reference this note instead of re-investigating from scratch.
+
+### macOS `livefiles_ntfs` >4 GB read limitation
+
+**Symptom.** During v0.5, a 22,419-file `cp -rT` to a real 4 TB WD My Passport copied 6,139 files cleanly, then macOS's native NTFS reader raised `Input/output error` on the *content* of late/fragmented files (e.g. `WhatsApp Documents/bn.pdf`). The macOS unified-log signature, emitted by `livefiles_ntfs.dylib`, is:
+
+```
+ntfs:cluster_read_ext: Error from blockmap operation: Input/output error (5)
+```
+
+This was first feared to be a "multi-extent `$DATA` portability blocker" bug in OUR driver. **It was conclusively diagnosed as a FALSE ALARM:** the bug is in macOS 15's new userspace `livefiles_ntfs` reader mishandling NTFS data at device byte-offsets above 4 GB — NOT a defect in our driver.
+
+**Our on-disk data was proven correct THREE independent ways** (for `bn.pdf`, source sha `45b9219026bb9b135c43fc213c9eabe16c0b9565`):
+
+1. **Driver-level structural dump.** `ntfsctl dump <device> bn.pdf` → single extent, LCN 1260225, in-range, `$Bitmap` ALLOCATED, runlist spec-correct. Single-extent encoding is unambiguous — both our decoder and an independent spec-strict decoder agree.
+2. **Driver-level content read.** `ntfsctl cat <device> bn.pdf | shasum` == the source sha (`45b9219026bb9b135c43fc213c9eabe16c0b9565`).
+3. **No-driver raw read.** `dd if=/dev/diskNs1 bs=512 skip=10081800 count=1056 | head -c 540566 | shasum` (RAW read straight off the block device, no NTFS driver involved at all) == the source sha.
+
+**Boundary math.** Failures correlate exactly with **LCN > 1,048,576 = 4 GB ÷ 4096-byte cluster**. Files whose data lives below 4 GB read fine in `livefiles`; provably-correct files above 4 GB throw EIO. For `bn.pdf` the sector number (`10,081,800` = LCN 1,260,225 × 4096 ÷ 512) fits in 32 bits, but the byte offset (`5.16e9`) overflows 32 bits — a 32-bit blockmap limitation in Apple's young `livefiles_ntfs`. Generalize the boundary as:
+
+```
+boundary LCN = 4 GiB / bytesPerCluster
+             = 1,048,576  for a 4096-byte cluster
+```
+
+Any file whose runlist places data at an LCN above this boundary is at risk in `livefiles_ntfs` regardless of correctness.
+
+**Conclusion.** Our writes are spec-correct NTFS; mature readers (Windows / `ntfs-3g` / `chkdsk`) will read them. `livefiles_ntfs` is an unreliable validator above 4 GB. (Caveat: Windows / `ntfs-3g` confirmation of these specific above-4-GB files is still recommended; until then frame the EIO as `livefiles`-specific. The `dd`+sha no-driver proof above stands on its own regardless — it bypasses every NTFS driver.)
+
+**Guidance: `livefiles_ntfs` must not be used as the sole validator above 4 GB — use `ntfs-3g` / Windows `chkdsk`, or a raw `dd`+sha spot-check, instead.**
+
+See the canonical portability spot-check recipe in [`docs/CLI.md`](CLI.md#prove-on-disk-correctness-independent-of-any-ntfs-driver-portability-spot-check) for the exact commands (including how to derive the `dd` `skip`/`count` from `ntfsctl dump`).
+
 ## How to contribute
 
 The codebase is structured to make additions tractable:

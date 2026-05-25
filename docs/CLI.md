@@ -468,6 +468,71 @@ anomaly lines, then point `dump <path>` at each one for the extent-level detail.
 Workflow: `verify --deep` to find WHICH files are affected, `dump <path>` to see
 WHERE in each file's runlist the fault is.
 
+### Prove on-disk correctness independent of any NTFS driver (portability spot-check)
+
+This is the **canonical portability spot-check**: run it when `livefiles_ntfs`
+(macOS's native NTFS reader) reports `Input/output error` on a file's content —
+especially above 4 GB, where `livefiles_ntfs` has a known 32-bit blockmap
+limitation (see [`docs/STATUS.md` — macOS `livefiles_ntfs` >4 GB read
+limitation](STATUS.md#macos-livefiles_ntfs-4-gb-read-limitation)). The recipe
+proves our on-disk bytes are spec-correct in two layers: a driver-level layer
+(using `ntfsctl`) and a no-driver raw layer (using `dd`, bypassing every NTFS
+driver entirely). If the raw `dd`+sha layer matches the source, the data on disk
+is correct no matter what `livefiles_ntfs` reports.
+
+Take `bn.pdf` (source sha `45b9219026bb9b135c43fc213c9eabe16c0b9565`) as the
+worked example.
+
+#### Layer 1 — driver-level (via `ntfsctl`)
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# (a) Inspect the file's runlist + $Bitmap state. For bn.pdf this prints a
+#     single extent at LCN 1260225, in range, $Bitmap ALLOCATED, runlist OK.
+sudo ntfsctl dump /dev/disk10s1 "/WhatsApp Documents/bn.pdf"
+
+# (b) Whole-volume runlist <-> $Bitmap sweep (free-but-referenced / out-of-range
+#     / double-allocated). Confirms no structural fault across the volume.
+sudo ntfsctl verify --deep /dev/disk10s1
+
+# (c) Read the content through OUR driver and hash it. Compare to the source sha.
+sudo ntfsctl cat /dev/disk10s1 "/WhatsApp Documents/bn.pdf" | shasum
+# expect: 45b9219026bb9b135c43fc213c9eabe16c0b9565
+
+diskutil mount /dev/disk10s1
+```
+
+#### Layer 2 — no-driver raw read (via `dd`)
+
+This layer touches NO NTFS driver at all — it reads the physical clusters
+straight off the block device, so a match here proves the bytes are correct on
+disk regardless of `livefiles_ntfs` / `ntfsctl` / any driver.
+
+Derive the `dd` parameters from the `ntfsctl dump` output above:
+
+- **`skip` (first sector)** = `firstLCN × clusterSize ÷ 512`.
+  For `bn.pdf`: `1260225 × 4096 ÷ 512` is the extent's first 512-byte sector
+  — `10081800` in this run.
+- **`count` (sectors)** = `ceil(allocatedSize ÷ 512)` (the extent's whole
+  clusters in 512-byte sectors) — `1056` here.
+- **`head -c <realSize>`** trims the trailing partial-cluster slack down to the
+  file's exact byte length (`realSize`) — `540566` bytes here.
+
+```bash
+diskutil unmount /dev/disk10s1
+sudo dd if=/dev/disk10s1 bs=512 skip=10081800 count=1056 \
+  | head -c 540566 \
+  | shasum
+# expect: 45b9219026bb9b135c43fc213c9eabe16c0b9565
+diskutil mount /dev/disk10s1
+```
+
+If layer 2's hash equals the source sha, the on-disk data is byte-exact and any
+`livefiles_ntfs` EIO is a reader bug, not a write defect. (Recommended
+follow-up: confirm the same above-4-GB files with `ntfs-3g` / Windows `chkdsk`,
+the mature readers our writes target.)
+
 ### Reclaim orphaned MFT records left by older buggy builds
 
 If `verify` reports orphans (records in the MFT with IN_USE=1 but not reachable from any directory), you can clean them in-place without booting Windows or Linux. Common scenario: a previous failed `cp -r` against a pre-v0.3 build that hit the leaf-split silent-orphan bug.

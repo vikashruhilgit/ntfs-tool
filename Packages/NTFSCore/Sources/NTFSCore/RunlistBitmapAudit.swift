@@ -508,6 +508,16 @@ extension Volume {
                         RecordAnomalies(recordNumber: n, anomalies: recordAnomalies)
                     )
                 }
+            } catch let NTFSError.corruptOnDisk(desc) where desc.contains("magic 0x00000000") {
+                // Zeroed/uninitialized MFT slot (the allocated-but-never-used
+                // tail of $MFT). That's a FREE slot, NOT corruption, so it must
+                // NOT count as unreadable and must NOT bump filesChecked. The
+                // `defer { n &+= 1 }` above advances the loop, so an empty body
+                // is correct here — we simply skip this slot. Mirrors the plain
+                // MFT sweep in Verify.swift (the `magic 0x00000000` catch that
+                // increments freeCount): on a clean 4 TB volume the empty MFT
+                // tail (recnums past the last used record) must report 0
+                // unreadable, not N.
             } catch {
                 // Per-record failure: report, never abort the sweep.
                 unreadableRecords.append(n)
