@@ -378,4 +378,169 @@ final class RunlistBitmapAuditTests: XCTestCase {
             "a per-record anomaly should mention double-allocated: \(sweep.perRecordAnomalies)"
         )
     }
+
+    // MARK: - On-disk raw-record surgery (cases 5 & 6)
+
+    /// Byte offset of MFT record `recordNumber` for a fixture whose $MFT is
+    /// contiguous from `boot.mftCluster`. The records these tests touch are
+    /// freshly-created low user records (recnum ~16-20) that always live inside
+    /// the first $MFT extent, so the contiguous offset is exact. Mirrors
+    /// `MFT.mftRecordByteOffset`'s record-0 / first-extent fast path.
+    private func contiguousRecordByteOffset(
+        volume: Volume, recordNumber: UInt64
+    ) -> UInt64 {
+        volume.mftByteOffset &+ recordNumber &* UInt64(volume.mftRecordSizeBytes)
+    }
+
+    /// Overwrite MFT record `recordNumber` on disk with an all-zero record.
+    /// This synthesizes a zeroed/uninitialized slot whose magic is
+    /// `0x00000000`, exactly the shape of the allocated-but-never-used $MFT
+    /// tail on real hardware. `mft.record(at:)` will throw
+    /// `corruptOnDisk("...magic 0x00000000")` for it. Direct device write
+    /// (not `writeRawRecord`) because an all-zero record has no valid USA for
+    /// the reverse-fixup path.
+    private func zeroOutRecordOnDisk(
+        volume: Volume, recordNumber: UInt64
+    ) async throws {
+        let recordSize = Int(volume.mftRecordSizeBytes)
+        let offset = contiguousRecordByteOffset(volume: volume, recordNumber: recordNumber)
+        try await volume.device.write(offset: offset, bytes: Data(count: recordSize))
+    }
+
+    /// Stamp the on-disk magic of MFT record `recordNumber` to 'BAAD' (the
+    /// marker NTFS writes when it detects corruption). The record keeps its
+    /// valid USA, so `MFTRecord.parse` reaches the magic check and throws
+    /// `corruptOnDisk("MFT record magic is 'BAAD' ...")` — a GENUINE unreadable
+    /// record whose error string deliberately does NOT contain
+    /// "magic 0x00000000", so it is NOT mistaken for a zeroed tail slot.
+    private func stampBAADOnDisk(
+        volume: Volume, recordNumber: UInt64
+    ) async throws {
+        let recordSize = Int(volume.mftRecordSizeBytes)
+        let offset = contiguousRecordByteOffset(volume: volume, recordNumber: recordNumber)
+        var raw = try await volume.device.read(offset: offset, length: recordSize)
+        // 'BAAD' on disk = bytes 0x42 0x41 0x41 0x44 (LE u32 0x44414142).
+        raw[raw.startIndex + 0] = 0x42
+        raw[raw.startIndex + 1] = 0x41
+        raw[raw.startIndex + 2] = 0x41
+        raw[raw.startIndex + 3] = 0x44
+        try await volume.device.write(offset: offset, bytes: raw)
+    }
+
+    // MARK: - Case 5 (AC-7): zeroed MFT tail slot is skipped, not unreadable
+
+    /// A zeroed/uninitialized MFT slot inside the swept range must be treated
+    /// as a FREE/never-used slot (skipped), NOT counted as an unreadable
+    /// record. Proves the `magic 0x00000000` catch in
+    /// `auditAllDataRunlistsAgainstBitmap`. Hardware symptom this guards
+    /// against: a CLEAN 4 TB volume reporting "Unreadable records: 13" for the
+    /// empty $MFT tail (recnums 104179-104191).
+    func testZeroedMFTTailSlotIsSkippedNotUnreadable() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+
+        let zeroedRN: UInt64
+        do {
+            let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+            let volume = try await Volume(device: device)
+
+            // A real non-resident file so the sweep has genuine runlist content
+            // to verify in addition to the zeroed slot.
+            _ = try await createNonResidentFile(volume: volume, named: "with-tail.bin")
+
+            // Claim a fresh slot, then zero it on disk so it looks like the
+            // uninitialized $MFT tail. It is still within the MFT logical range
+            // (it was allocatable), so the sweep WILL visit it.
+            let mft = await volume.mft()
+            zeroedRN = try await mft.findFreeRecordNumber()
+            try await zeroOutRecordOnDisk(volume: volume, recordNumber: zeroedRN)
+
+            // Sanity: reading that slot now throws the zeroed-magic error.
+            do {
+                _ = try await mft.record(at: zeroedRN)
+                XCTFail("zeroed slot \(zeroedRN) should not parse")
+            } catch let NTFSError.corruptOnDisk(desc) {
+                XCTAssertTrue(
+                    desc.contains("magic 0x00000000"),
+                    "zeroed slot must throw the magic-0x00000000 error, got: \(desc)"
+                )
+            }
+        }
+
+        let volume = try await reopenReadOnly(path)
+        let sweep = try await volume.auditAllDataRunlistsAgainstBitmap()
+
+        // AC-7: the zeroed tail slot is SKIPPED, never counted unreadable.
+        XCTAssertTrue(
+            sweep.unreadableRecords.isEmpty,
+            "zeroed/uninitialized MFT slot must not be counted unreadable: \(sweep.unreadableRecords)"
+        )
+        XCTAssertFalse(
+            sweep.unreadableRecords.contains(zeroedRN),
+            "the zeroed slot \(zeroedRN) must not appear in unreadableRecords"
+        )
+        // With no other anomalies, the whole-volume audit is clean — which is
+        // exactly the verdict `verify --deep` now emits (deepFailed = !isClean).
+        XCTAssertTrue(
+            sweep.isClean,
+            "a clean volume with only a zeroed tail slot must audit clean: \(sweep.perRecordAnomalies)"
+        )
+        XCTAssertGreaterThan(sweep.filesChecked, 0)
+    }
+
+    // MARK: - Case 6 (AC-8): genuinely-unreadable record fails clean
+
+    /// A record with a valid FILE magic flipped to 'BAAD' genuinely fails to
+    /// parse with an error OTHER than the zeroed-slot `magic 0x00000000` case,
+    /// so it MUST land in `unreadableRecords` and force `isClean == false`.
+    ///
+    /// `Verify.swift`'s deep verdict is now `deepFailed = !audit.isClean`, so
+    /// asserting `isClean == false` here is equivalent to asserting the
+    /// `verify --deep` run fails: the two are tied together by construction
+    /// (AC-8). We assert via the audit because `Verify.run()` opens a device by
+    /// path and isn't unit-testable in this package.
+    func testGenuinelyUnreadableRecordFailsClean() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+
+        let badRN: UInt64
+        do {
+            let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+            let volume = try await Volume(device: device)
+
+            // Create a real file, then corrupt JUST its magic to 'BAAD'. The
+            // slot stays IN_USE-shaped on disk but parsing throws before the
+            // flags are read.
+            (badRN, _) = try await createNonResidentFile(volume: volume, named: "baad.bin")
+            try await stampBAADOnDisk(volume: volume, recordNumber: badRN)
+
+            // Sanity: it now throws a NON-zeroed-slot corruption error.
+            let mft = await volume.mft()
+            do {
+                _ = try await mft.record(at: badRN)
+                XCTFail("'BAAD' record \(badRN) should not parse")
+            } catch let NTFSError.corruptOnDisk(desc) {
+                XCTAssertTrue(desc.contains("BAAD"), "expected a BAAD error, got: \(desc)")
+                XCTAssertFalse(
+                    desc.contains("magic 0x00000000"),
+                    "BAAD must NOT look like a zeroed slot: \(desc)"
+                )
+            }
+        }
+
+        let volume = try await reopenReadOnly(path)
+        let sweep = try await volume.auditAllDataRunlistsAgainstBitmap()
+
+        // AC-8: a genuine unreadable record is recorded AND fails cleanliness.
+        XCTAssertTrue(
+            sweep.unreadableRecords.contains(badRN),
+            "the 'BAAD' record \(badRN) must appear in unreadableRecords: \(sweep.unreadableRecords)"
+        )
+        XCTAssertFalse(
+            sweep.isClean,
+            "a genuinely-unreadable record must fail the volume audit clean"
+        )
+        // Tie-in to Verify's verdict: deepFailed = !audit.isClean, so this
+        // false isClean is exactly the deep-verify FAIL path.
+    }
 }

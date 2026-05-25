@@ -64,9 +64,21 @@ public actor Volume {
         }
     }
 
+    /// Device byte offset of a cluster: LCN × bytesPerCluster, computed in 64-bit.
+    /// Centralizes the cluster→offset invariant so we never reintroduce a 32-bit
+    /// overflow (cf. macOS livefiles_ntfs's >4 GB blockmap bug).
+    public nonisolated func deviceByteOffset(forLCN lcn: UInt64) -> UInt64 {
+        Volume.deviceByteOffset(forLCN: lcn, bytesPerCluster: bytesPerCluster)
+    }
+
+    /// Pure arithmetic core — testable without constructing a Volume.
+    nonisolated static func deviceByteOffset(forLCN lcn: UInt64, bytesPerCluster: UInt32) -> UInt64 {
+        lcn &* UInt64(bytesPerCluster)
+    }
+
     /// Byte offset of the start of the MFT (record 0) on the volume.
     public nonisolated var mftByteOffset: UInt64 {
-        UInt64(boot.mftCluster) * UInt64(bytesPerCluster)
+        deviceByteOffset(forLCN: UInt64(boot.mftCluster))
     }
 
     public func mft() -> MFT {
@@ -209,7 +221,7 @@ public actor Volume {
                 let extentLen = Int(min(extent.clusterCount * clusterBytes, UInt64(remaining)))
                 if let startLCN = extent.startLCN {
                     let chunk = try await device.read(
-                        offset: startLCN * clusterBytes,
+                        offset: deviceByteOffset(forLCN: startLCN),
                         length: extentLen
                     )
                     bytes.append(chunk)
@@ -298,7 +310,7 @@ public actor Volume {
             for extent in extents where remaining > 0 {
                 let extentLen = Int(min(extent.clusterCount * clusterBytes, UInt64(remaining)))
                 if let startLCN = extent.startLCN {
-                    let chunk = try await device.read(offset: startLCN * clusterBytes, length: extentLen)
+                    let chunk = try await device.read(offset: deviceByteOffset(forLCN: startLCN), length: extentLen)
                     collected.append(chunk)
                 } else {
                     collected.append(Data(repeating: 0, count: extentLen))
@@ -383,7 +395,7 @@ public actor Volume {
         //    that as "free / never used"; verify() does the same).
         let zeroChunk = Data(repeating: 0, count: Int(clusterBytes))
         for c in 0..<clusterCount {
-            try await device.write(offset: (newLCN + c) * clusterBytes, bytes: zeroChunk)
+            try await device.write(offset: deviceByteOffset(forLCN: newLCN &+ c), bytes: zeroChunk)
         }
 
         // Now compute what the new sizes will be.
@@ -487,7 +499,7 @@ public actor Volume {
                 if cursor >= extentEnd { continue }
                 let inExtent = cursor - (extentEnd - extentBytes)
                 let writable = min(bytesToZero, extentBytes - inExtent)
-                let off = lcn * clusterBytes + inExtent
+                let off = deviceByteOffset(forLCN: lcn) + inExtent
                 let zeroes = Data(repeating: 0, count: Int(writable))
                 try await device.write(offset: off, bytes: zeroes)
                 cursor += writable
@@ -747,7 +759,7 @@ public actor Volume {
                 guard let startLCN = extent.startLCN else { continue }
                 let extentBytes = Int(min(extent.clusterCount * clusterBytes, UInt64(bytesRemaining.count)))
                 let chunk = bytesRemaining.prefix(extentBytes)
-                try await device.write(offset: startLCN * clusterBytes, bytes: Data(chunk))
+                try await device.write(offset: deviceByteOffset(forLCN: startLCN), bytes: Data(chunk))
                 bytesRemaining = bytesRemaining.dropFirst(extentBytes)
             }
         }
@@ -1086,7 +1098,7 @@ public actor Volume {
             usaCount: Int(try indxBytes.readU16LE(at: 6)),
             blockSize: Int(boot.bytesPerSector)
         )
-        try await device.write(offset: leafLCN * clusterBytes, bytes: indxOnDisk)
+        try await device.write(offset: deviceByteOffset(forLCN: leafLCN), bytes: indxOnDisk)
 
         // 3) Build new $INDEX_ROOT: empty entries list with LAST+HAS_SUBNODE→VCN 0.
         let newRootBody = buildLargeIndexEmptyRoot(
@@ -1318,7 +1330,7 @@ public actor Volume {
             usaCount: Int(try rightBlock.readU16LE(at: 6)),
             blockSize: sectorSize
         )
-        try await device.write(offset: newLCN * clusterBytes, bytes: rightOnDisk)
+        try await device.write(offset: deviceByteOffset(forLCN: newLCN), bytes: rightOnDisk)
 
         // 6. (v0.4 Phase 3(A)) If height-grow fired, write the new
         //    intermediate INDX blocks BEFORE committing the parent record.
@@ -1794,8 +1806,8 @@ public actor Volume {
             return ComputedSplit(
                 parentRecordBytes: newRecordBytes,
                 intermediates: [
-                    (byteOffset: leftInterLCN * clusterBytes, postFixupBytes: leftOnDisk),
-                    (byteOffset: rightInterLCN * clusterBytes, postFixupBytes: rightOnDisk)
+                    (byteOffset: deviceByteOffset(forLCN: leftInterLCN), postFixupBytes: leftOnDisk),
+                    (byteOffset: deviceByteOffset(forLCN: rightInterLCN), postFixupBytes: rightOnDisk)
                 ],
                 extraClustersAllocated: extraClusters
             )
@@ -1969,7 +1981,7 @@ public actor Volume {
                 guard let startLCN = extent.startLCN else {
                     throw NTFSError.corruptOnDisk(description: "vcnToByteOffsetInAllocation: sparse extent at VCN \(vcn)")
                 }
-                return (startLCN + clusterInExtent) * clusterBytes
+                return deviceByteOffset(forLCN: startLCN &+ clusterInExtent)
             }
             cumulative += extent.clusterCount
         }
@@ -2143,7 +2155,7 @@ public actor Volume {
                     usaCount: Int(try rightBlock.readU16LE(at: 6)),
                     blockSize: level.sectorSize
                 )
-                intermediateWrites.append((byteOffset: rightLCN * clusterBytes, postFixupBytes: rightOnDisk))
+                intermediateWrites.append((byteOffset: deviceByteOffset(forLCN: rightLCN), postFixupBytes: rightOnDisk))
 
                 // Setup for next iteration: the bisection median must be
                 // promoted to the LEVEL ABOVE this one. The "existing
@@ -2384,7 +2396,7 @@ public actor Volume {
                 var cluster: UInt64 = 0
                 while cluster < extent.clusterCount {
                     let lcn = startLCN + cluster
-                    let raw = try await device.read(offset: lcn * clusterBytes, length: blockSize)
+                    let raw = try await device.read(offset: deviceByteOffset(forLCN: lcn), length: blockSize)
                     let block = try IndexAllocationBlock.parse(raw, sectorSize: sectorSize)
                     for e in block.entries where !e.isLast {
                         refs.insert(e.fileReference)

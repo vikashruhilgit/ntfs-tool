@@ -188,11 +188,13 @@ struct Verify: AsyncParsableCommand {
         var deepFreeButReferenced: UInt64 = 0
         var deepOutOfRange: UInt64 = 0
         var deepDoubleAllocated: UInt64 = 0
+        var deepUnreadable = 0
         if deep {
             let audit = try await volume.auditAllDataRunlistsAgainstBitmap(maxRecords: maxRecords)
             deepFreeButReferenced = audit.freeButReferencedClusters
             deepOutOfRange = audit.outOfRangeClusters
             deepDoubleAllocated = audit.doubleAllocatedClusters
+            deepUnreadable = audit.unreadableRecords.count
             print("Deep runlist/$Bitmap audit:")
             print("  Files checked:                \(audit.filesChecked)")
             print("  Runlist clusters verified:    \(audit.runlistClustersVerified)")
@@ -213,18 +215,21 @@ struct Verify: AsyncParsableCommand {
                     }
                 }
             }
-            // Deep verdict: any free-but-referenced / out-of-range /
-            // double-allocated cluster is a corruption class the plain verify
-            // cannot see, so it fails the run on its own.
-            deepFailed = audit.freeButReferencedClusters > 0
-                || audit.outOfRangeClusters > 0
-                || audit.doubleAllocatedClusters > 0
+            // Deep verdict: drive it directly off the audit's own cleanliness
+            // rule so `verify --deep` and `VolumeRunlistAudit.isClean` can
+            // never diverge. `isClean` fails on any free-but-referenced /
+            // out-of-range / double-allocated cluster AND on any unreadable
+            // record. After the audit's `magic 0x00000000` skip excludes the
+            // zeroed/uninitialized $MFT tail, anything still in
+            // `unreadableRecords` is a genuine record we couldn't audit and
+            // cannot vouch for, so it correctly fails the run.
+            deepFailed = !audit.isClean
         }
 
         if plainFailed || deepFailed {
             var reason = "\(errorCount) parse, \(orphans.count) orphan, \(leakedExtensions.count) leaked-extension, \(dangling.count) dangling, \(unreachableEnumerationErrors.count) enum errors"
             if deepFailed {
-                reason += " — deep audit: \(deepFreeButReferenced) free-but-referenced, \(deepOutOfRange) out-of-range, \(deepDoubleAllocated) double-allocated cluster(s)"
+                reason += " — deep audit: \(deepFreeButReferenced) free-but-referenced, \(deepOutOfRange) out-of-range, \(deepDoubleAllocated) double-allocated cluster(s), \(deepUnreadable) unreadable record(s)"
             }
             print("\nVerify FAILED — \(reason). Suggest running ntfsfix or chkdsk /f.")
             throw ExitCode(1)
