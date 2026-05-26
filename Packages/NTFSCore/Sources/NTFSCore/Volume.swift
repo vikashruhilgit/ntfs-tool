@@ -1332,11 +1332,29 @@ public actor Volume {
             )
         }
 
+        let mft = self.mft()
+
+        // 6b. (v0.5 follow-up) If the directory's $INDEX_ALLOCATION / $BITMAP
+        //     have migrated into extension records, commit those rewritten
+        //     extension records BEFORE the base. Extension-first mirrors
+        //     `migrateAttributeOnOverflow`: if a crash lands between these
+        //     writes and the base commit, the extension describes the new
+        //     leaf cluster (already written above) while the base's
+        //     $INDEX_ROOT still reflects the pre-split tree — i.e. the new
+        //     leaf is allocated + described but simply not yet referenced.
+        //     On next mount the directory is internally consistent at its
+        //     pre-split shape; nothing the base points at is missing.
+        for extWrite in computed.extraRecordWrites {
+            try await mft.writeRawRecord(
+                at: extWrite.recordNumber,
+                postFixupBytes: extWrite.postFixupBytes
+            )
+        }
+
         // 7. Commit the precomputed parent MFT record (overflow already
         //    ruled out in step 3, possibly after a height-grow). This
         //    finalizes the split atomically from the tree-shape
         //    perspective.
-        let mft = self.mft()
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParentRecordBytes)
         // Self-check: re-read + re-parse + walk attributes. Any malformation
         // surfaces here with a precise location rather than as a later
@@ -1375,6 +1393,27 @@ public actor Volume {
         /// caller's primary leaf cluster). Caller must free on any
         /// failure between compute and parent-record commit.
         let extraClustersAllocated: [Extent]
+        /// v0.5 follow-up: extension MFT records that must be (re)written as
+        /// part of this split because the directory's `$INDEX_ALLOCATION` /
+        /// `$BITMAP` have migrated out of the base into an extension record.
+        /// Each entry: (recordNumber, post-USA-fixup bytes). The caller commits
+        /// these BEFORE the base record (extension-first transactional
+        /// discipline, mirroring `migrateAttributeOnOverflow`). Empty in the
+        /// common (un-migrated) case. No clusters are allocated for these —
+        /// they're in-place rewrites of already-allocated extension records.
+        let extraRecordWrites: [(recordNumber: UInt64, postFixupBytes: Data)]
+
+        init(
+            parentRecordBytes: Data,
+            intermediates: [(byteOffset: UInt64, postFixupBytes: Data)],
+            extraClustersAllocated: [Extent],
+            extraRecordWrites: [(recordNumber: UInt64, postFixupBytes: Data)] = []
+        ) {
+            self.parentRecordBytes = parentRecordBytes
+            self.intermediates = intermediates
+            self.extraClustersAllocated = extraClustersAllocated
+            self.extraRecordWrites = extraRecordWrites
+        }
     }
 
     /// Build the new MFT record bytes that would result from updating the
@@ -1558,16 +1597,17 @@ public actor Volume {
         //     record". In v0.3 this aborted the operation cleanly; in
         //     v0.4 Phase 3(A) we recover via $INDEX_ROOT height-grow.
         do {
-            let newRecordBytes = try rewriteParentForLeafSplit(
+            let rewrite = try await rewriteParentForLeafSplit(
                 parent: parent,
                 newRootBody: newRootBody,
                 newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
                 newBitmapAttrBytes: updatedBitmapAttrBytes
             )
             return ComputedSplit(
-                parentRecordBytes: newRecordBytes,
+                parentRecordBytes: rewrite.baseBytes,
                 intermediates: [],
-                extraClustersAllocated: []
+                extraClustersAllocated: [],
+                extraRecordWrites: rewrite.extensionWrites
             )
         } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
             // v0.5 Fix B Step 3: if the non-resident $INDEX_ALLOCATION
@@ -1593,16 +1633,17 @@ public actor Volume {
                 // the stale `parent` value would re-introduce the
                 // migrant and undo the migration.
                 let refreshedParent = try await mft.record(at: parentRecordNumber)
-                let newRecordBytes = try rewriteParentForLeafSplit(
+                let rewrite = try await rewriteParentForLeafSplit(
                     parent: refreshedParent,
                     newRootBody: newRootBody,
                     newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
                     newBitmapAttrBytes: updatedBitmapAttrBytes
                 )
                 return ComputedSplit(
-                    parentRecordBytes: newRecordBytes,
+                    parentRecordBytes: rewrite.baseBytes,
                     intermediates: [],
-                    extraClustersAllocated: []
+                    extraClustersAllocated: [],
+                    extraRecordWrites: rewrite.extensionWrites
                 )
             }
 
@@ -1784,7 +1825,7 @@ public actor Volume {
             )
 
             // Build the parent record bytes — should now fit (tiny root).
-            let newRecordBytes = try rewriteParentForLeafSplit(
+            let rewrite = try await rewriteParentForLeafSplit(
                 parent: parent,
                 newRootBody: newTinyRootBody,
                 newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
@@ -1792,12 +1833,13 @@ public actor Volume {
             )
 
             return ComputedSplit(
-                parentRecordBytes: newRecordBytes,
+                parentRecordBytes: rewrite.baseBytes,
                 intermediates: [
                     (byteOffset: leftInterLCN * clusterBytes, postFixupBytes: leftOnDisk),
                     (byteOffset: rightInterLCN * clusterBytes, postFixupBytes: rightOnDisk)
                 ],
-                extraClustersAllocated: extraClusters
+                extraClustersAllocated: extraClusters,
+                extraRecordWrites: rewrite.extensionWrites
             )
         } catch {
             // Any build/serialize failure → free both intermediates + rethrow.
@@ -2178,16 +2220,17 @@ public actor Volume {
             // Cascade stopped at some intermediate level. $INDEX_ROOT body
             // is UNCHANGED. Just rewrite parent record with updated
             // runlist + bitmap.
-            let newRecordBytes = try rewriteParentForLeafSplit(
+            let rewrite = try await rewriteParentForLeafSplit(
                 parent: parent,
                 newRootBody: rootBytes,  // unchanged
                 newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
                 newBitmapAttrBytes: updatedBitmapAttrBytes
             )
             return ComputedSplit(
-                parentRecordBytes: newRecordBytes,
+                parentRecordBytes: rewrite.baseBytes,
                 intermediates: intermediateWrites,
-                extraClustersAllocated: extraExtents
+                extraClustersAllocated: extraExtents,
+                extraRecordWrites: rewrite.extensionWrites
             )
         }
 
@@ -2211,16 +2254,17 @@ public actor Volume {
         )
 
         do {
-            let newRecordBytes = try rewriteParentForLeafSplit(
+            let rewrite = try await rewriteParentForLeafSplit(
                 parent: parent,
                 newRootBody: newRootBody,
                 newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
                 newBitmapAttrBytes: updatedBitmapAttrBytes
             )
             return ComputedSplit(
-                parentRecordBytes: newRecordBytes,
+                parentRecordBytes: rewrite.baseBytes,
                 intermediates: intermediateWrites,
-                extraClustersAllocated: extraExtents
+                extraClustersAllocated: extraExtents,
+                extraRecordWrites: rewrite.extensionWrites
             )
         } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
             // v0.5 Fix B Step 3: if the non-resident
@@ -2239,16 +2283,17 @@ public actor Volume {
                     overflowDescription: desc
                 )
                 let refreshedParent = try await self.mft().record(at: baseRN)
-                let newRecordBytes = try rewriteParentForLeafSplit(
+                let rewrite = try await rewriteParentForLeafSplit(
                     parent: refreshedParent,
                     newRootBody: newRootBody,
                     newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
                     newBitmapAttrBytes: updatedBitmapAttrBytes
                 )
                 return ComputedSplit(
-                    parentRecordBytes: newRecordBytes,
+                    parentRecordBytes: rewrite.baseBytes,
                     intermediates: intermediateWrites,
-                    extraClustersAllocated: extraExtents
+                    extraClustersAllocated: extraExtents,
+                    extraRecordWrites: rewrite.extensionWrites
                 )
             }
 
@@ -2280,7 +2325,20 @@ public actor Volume {
             return ComputedSplit(
                 parentRecordBytes: grown.parentRecordBytes,
                 intermediates: combined,
-                extraClustersAllocated: extraExtents + grown.extraClustersAllocated
+                extraClustersAllocated: extraExtents + grown.extraClustersAllocated,
+                // v0.5 follow-up — THE missing=36 corruption fix. The
+                // cascade→root-overflow→height-grow path previously dropped
+                // `grown.extraRecordWrites`. When $INDEX_ALLOCATION:$I30 has
+                // migrated into an extension record, `heightGrowIndexRoot`
+                // computes the grown runlist into that extension's bytes and
+                // returns it here. Dropping it committed a base $INDEX_ROOT
+                // pointing at fresh intermediate VCNs whose backing runlist
+                // extent was never persisted — the whole new subtree (one
+                // leaf + its promoted interior keys, ~one index block's worth
+                // of entries) was orphaned on re-read. Threading it through
+                // (extension-first, like every other split path) makes the
+                // post-split state self-consistent.
+                extraRecordWrites: grown.extraRecordWrites
             )
         }
     }
@@ -2674,21 +2732,46 @@ public actor Volume {
         )
     }
 
+    /// Result of `rewriteParentForLeafSplit`: the rewritten base record bytes
+    /// plus any extension records that also need rewriting because the
+    /// directory's `$INDEX_ALLOCATION` / `$BITMAP` have migrated out of the
+    /// base. In the common (un-migrated) case `extensionWrites` is empty.
+    private struct ParentRewrite {
+        let baseBytes: Data
+        let extensionWrites: [(recordNumber: UInt64, postFixupBytes: Data)]
+    }
+
     /// Rewrite the parent MFT record swapping $INDEX_ROOT body, $INDEX_ALLOCATION
     /// attribute, and $BITMAP attribute in one shot. The shared helper
     /// `rewriteEntireAttribute` operates on one attribute at a time; we apply
     /// it sequentially.
+    ///
+    /// v0.5 follow-up — post-migration routing: once a directory's
+    /// `$INDEX_ALLOCATION:$I30` (and `$BITMAP:$I30`) have migrated into an
+    /// extension MFT record (the `$ATTRIBUTE_LIST` machinery that lifts the
+    /// ~350-file in-base cap), those attributes are NO LONGER in the base
+    /// record's byte stream. The pre-fix code rewrote them against
+    /// `parent.bytes` unconditionally and threw
+    /// `corruptOnDisk: target type 0xA0 ... not found` on the very first
+    /// post-migration leaf split. We now detect that case via the base's
+    /// `$ATTRIBUTE_LIST` and route Steps B/C to whichever record (base or
+    /// extension) actually holds the attribute, returning the rewritten
+    /// extension bytes for the caller to commit FIRST (extension-first
+    /// transactional discipline).
+    ///
+    /// `$INDEX_ROOT` (Step A) is always resident in the base, so it never
+    /// routes to an extension.
     private func rewriteParentForLeafSplit(
         parent: MFTRecord,
         newRootBody: Data,
         newIndexAllocAttrBytes: Data,
         newBitmapAttrBytes: Data
-    ) throws -> Data {
+    ) async throws -> ParentRewrite {
         // `usedSize` here follows the header-field convention: byte offset AFTER
         // the end marker (i.e., end-marker-offset + 4). Both `rewriteResident
         // Attribute` and `rewriteEntireAttribute` expect that form.
 
-        // Step A: replace $INDEX_ROOT body.
+        // Step A: replace $INDEX_ROOT body. Always resident, always in base.
         var bytes = try rewriteResidentAttribute(
             in: parent.bytes,
             firstAttributeOffset: Int(parent.firstAttributeOffset),
@@ -2701,32 +2784,197 @@ public actor Volume {
         var usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
         MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
 
-        // Step B: replace $INDEX_ALLOCATION attribute.
-        bytes = try rewriteEntireAttribute(
-            in: bytes,
+        // Does the base record itself still hold $INDEX_ALLOCATION:$I30? If the
+        // attribute has migrated, the base instead carries a $ATTRIBUTE_LIST
+        // and the migrant lives in an extension record.
+        let baseScan = try AttributeMigration.scanAttributes(
+            in: parent.bytes,
             firstAttributeOffset: Int(parent.firstAttributeOffset),
-            usedSize: usedSize,
-            recordSize: Int(parent.allocatedSize),
-            replacingType: AttributeType.indexAllocation.rawValue,
+            usedSize: Int(parent.usedSize)
+        )
+        let indexAllocInBase = baseScan.contains {
+            $0.type == AttributeType.indexAllocation.rawValue && $0.name == "$I30"
+        }
+
+        if indexAllocInBase {
+            // Common (un-migrated) path — Steps B & C rewrite in the base
+            // record, exactly as before.
+
+            // Step B: replace $INDEX_ALLOCATION attribute.
+            bytes = try rewriteEntireAttribute(
+                in: bytes,
+                firstAttributeOffset: Int(parent.firstAttributeOffset),
+                usedSize: usedSize,
+                recordSize: Int(parent.allocatedSize),
+                replacingType: AttributeType.indexAllocation.rawValue,
+                attributeName: "$I30",
+                replacementBytes: newIndexAllocAttrBytes
+            )
+            usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
+            MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+
+            // Step C: replace $BITMAP attribute.
+            bytes = try rewriteEntireAttribute(
+                in: bytes,
+                firstAttributeOffset: Int(parent.firstAttributeOffset),
+                usedSize: usedSize,
+                recordSize: Int(parent.allocatedSize),
+                replacingType: 0xB0,
+                attributeName: "$I30",
+                replacementBytes: newBitmapAttrBytes
+            )
+            usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
+            MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+            return ParentRewrite(baseBytes: bytes, extensionWrites: [])
+        }
+
+        // Post-migration path — $INDEX_ALLOCATION:$I30 (and $BITMAP:$I30) live
+        // in extension records. Route each rewrite to the record that holds it.
+        // We compute the rewritten extension bytes WITHOUT touching disk; the
+        // caller commits them before the base record.
+        var extensionWrites: [(recordNumber: UInt64, postFixupBytes: Data)] = []
+
+        let iaExt = try await rewriteMigratedAttributeInExtension(
+            baseRecordNumber: UInt64(parent.mftRecordNumber),
+            attributeType: AttributeType.indexAllocation.rawValue,
             attributeName: "$I30",
             replacementBytes: newIndexAllocAttrBytes
         )
-        usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
-
-        // Step C: replace $BITMAP attribute.
-        bytes = try rewriteEntireAttribute(
-            in: bytes,
-            firstAttributeOffset: Int(parent.firstAttributeOffset),
-            usedSize: usedSize,
-            recordSize: Int(parent.allocatedSize),
-            replacingType: 0xB0,
+        let bmExt = try await rewriteMigratedAttributeInExtension(
+            baseRecordNumber: UInt64(parent.mftRecordNumber),
+            attributeType: 0xB0,
             attributeName: "$I30",
             replacementBytes: newBitmapAttrBytes
         )
-        usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
-        return bytes
+
+        // $INDEX_ALLOCATION and $BITMAP commonly share one extension record
+        // (the migration moves $INDEX_ALLOCATION; $BITMAP migrates with it or
+        // stays in the base). If both landed in the SAME extension record we
+        // must apply BOTH edits to the same buffer, then emit one write — two
+        // separate writes of the same record would have the second clobber the
+        // first.
+        if let ia = iaExt, let bm = bmExt, ia.recordNumber == bm.recordNumber {
+            // Re-apply the bitmap rewrite on top of the already-IA-rewritten
+            // extension bytes so both edits land.
+            let merged = try rewriteEntireAttributeWithHeaderUpdate(
+                in: ia.postFixupBytes,
+                recordSize: ia.postFixupBytes.count,
+                replacingType: 0xB0,
+                attributeName: "$I30",
+                replacementBytes: newBitmapAttrBytes
+            )
+            extensionWrites.append((recordNumber: ia.recordNumber, postFixupBytes: merged))
+        } else {
+            if let ia = iaExt { extensionWrites.append(ia) }
+            if let bm = bmExt { extensionWrites.append(bm) }
+        }
+
+        // If $BITMAP stayed resident in the base (only $INDEX_ALLOCATION
+        // migrated), rewrite it there too.
+        if bmExt == nil {
+            let bitmapInBase = baseScan.contains {
+                $0.type == 0xB0 && $0.name == "$I30"
+            }
+            if bitmapInBase {
+                bytes = try rewriteEntireAttribute(
+                    in: bytes,
+                    firstAttributeOffset: Int(parent.firstAttributeOffset),
+                    usedSize: usedSize,
+                    recordSize: Int(parent.allocatedSize),
+                    replacingType: 0xB0,
+                    attributeName: "$I30",
+                    replacementBytes: newBitmapAttrBytes
+                )
+                usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
+                MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+            }
+        }
+
+        guard iaExt != nil else {
+            throw NTFSError.corruptOnDisk(
+                description: "rewriteParentForLeafSplit: base \(parent.mftRecordNumber) has neither $INDEX_ALLOCATION:$I30 nor a $ATTRIBUTE_LIST entry locating it"
+            )
+        }
+        return ParentRewrite(baseBytes: bytes, extensionWrites: extensionWrites)
+    }
+
+    /// Locate the extension MFT record holding a migrated attribute
+    /// (`attributeType`/`attributeName`) via the base record's
+    /// `$ATTRIBUTE_LIST`, rewrite that attribute in the extension's byte
+    /// stream, and return the extension's (recordNumber, post-fix-up bytes).
+    /// Returns nil if no `$ATTRIBUTE_LIST` entry names this attribute in an
+    /// extension (i.e. it isn't migrated). Pure compute: reads the extension
+    /// record but writes NOTHING — the caller commits the returned bytes.
+    private func rewriteMigratedAttributeInExtension(
+        baseRecordNumber: UInt64,
+        attributeType: UInt32,
+        attributeName: String,
+        replacementBytes: Data
+    ) async throws -> (recordNumber: UInt64, postFixupBytes: Data)? {
+        let mft = self.mft()
+        let base = try await mft.record(at: baseRecordNumber)
+        let baseAttrs = try base.attributes()
+        guard let attrListAttr = baseAttrs.first(where: {
+            $0.rawType == AttributeType.attributeList.rawValue
+        }) else {
+            return nil
+        }
+        let entries = try await attributeListEntries(of: attrListAttr)
+        // Find the entry for this (type, name) that points at an EXTENSION
+        // record (recordNumber != base). A migrated attribute has exactly one
+        // such entry (v0.5 scope: single-extent migrant, lowest_vcn 0).
+        guard let entry = entries.first(where: {
+            $0.attributeType == attributeType
+                && $0.name == attributeName
+                && $0.recordNumber != baseRecordNumber
+        }) else {
+            return nil
+        }
+        let extRN = entry.recordNumber
+        let extRec = try await mft.record(at: extRN)
+        // Defence in depth: stale $ATTRIBUTE_LIST pointer at a recycled slot.
+        guard extRec.sequenceNumber == entry.sequenceNumber else {
+            throw NTFSError.corruptOnDisk(
+                description: "rewriteMigratedAttributeInExtension: ATTR_LIST entry recnum \(extRN) seq \(entry.sequenceNumber) != record seq \(extRec.sequenceNumber) (base \(baseRecordNumber))"
+            )
+        }
+        let rewritten = try rewriteEntireAttributeWithHeaderUpdate(
+            in: extRec.bytes,
+            recordSize: extRec.bytes.count,
+            replacingType: attributeType,
+            attributeName: attributeName,
+            replacementBytes: replacementBytes
+        )
+        return (recordNumber: extRN, postFixupBytes: rewritten)
+    }
+
+    /// Thin convenience over `rewriteEntireAttribute` that also recomputes and
+    /// writes the record's `usedSize` header field (offset 24). The record's
+    /// `firstAttributeOffset` is read from its header (offset 20) and its
+    /// current `usedSize` from offset 24 — so this works on any post-fix-up
+    /// MFT record bytes (base or extension) without the caller threading those
+    /// values through.
+    private func rewriteEntireAttributeWithHeaderUpdate(
+        in recordBytes: Data,
+        recordSize: Int,
+        replacingType: UInt32,
+        attributeName: String,
+        replacementBytes: Data
+    ) throws -> Data {
+        let firstAttrOffset = Int(try recordBytes.readU16LE(at: 20))
+        let usedSize = Int(try recordBytes.readU32LE(at: 24))
+        var out = try rewriteEntireAttribute(
+            in: recordBytes,
+            firstAttributeOffset: firstAttrOffset,
+            usedSize: usedSize,
+            recordSize: recordSize,
+            replacingType: replacingType,
+            attributeName: attributeName,
+            replacementBytes: replacementBytes
+        )
+        let newUsed = (locateEndMarker(in: out, fromOffset: firstAttrOffset) ?? 0) + 4
+        MFTRecord.writeU32LE(into: &out, at: 24, value: UInt32(newUsed))
+        return out
     }
 
     /// Build a $INDEX_ROOT body for an empty LARGE_INDEX directory (no real
