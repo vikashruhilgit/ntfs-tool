@@ -38,6 +38,61 @@ public actor Volume {
     private var _bulkInsertLastCacheHits: Int = 0
     private var _bulkInsertLastDirtyLeavesFlushed: Int = 0
 
+    #if DEBUG
+    /// v0.5 Bug B test-only fault-injection seam. NEVER set in release
+    /// builds — the entire field is `#if DEBUG` gated so production code
+    /// can't even reference it. Used by `CreateFileAtomicityTests` to
+    /// force a throw at a specific phase of `createFile`'s commit
+    /// sequence and observe that the post-throw on-disk state remains
+    /// internally consistent (no `$I30`-to-free-slot dangling entries).
+    ///
+    /// Tests set this BEFORE calling `createFile` and clear it after.
+    /// The hook fires at most once, then auto-clears, so a single test
+    /// can interleave a failing create with a follow-up clean create.
+    public enum CreateFileFaultPoint: Sendable, Equatable {
+        /// Throw immediately after the new MFT record has been durably
+        /// written but BEFORE `insertIntoParentI30` has touched any
+        /// parent-side byte. Tests that the catch path correctly
+        /// reclaims the MFT slot — the volume is left with neither the
+        /// `$I30` entry nor an in-use MFT record. This is the safe
+        /// abort window — the rollback should yield a fully-clean
+        /// volume (no orphan, no dangling).
+        case afterMFTWriteBeforeI30Commit
+        /// Throw AFTER the parent `$I30` write has hit disk but BEFORE
+        /// `createFile` returns. This is the dangerous abort window
+        /// the v0.5 hardware run exposed: under the previous discipline
+        /// the catch in `createFile` would `reclaimOrphanedMFTRecord`,
+        /// freeing the MFT slot while leaving the parent's `$I30`
+        /// pointing at it → "dangling" entry. Under the corrected
+        /// discipline the MFT slot is RETAINED (status: orphan-base,
+        /// recoverable via `ntfsctl reclaim-orphans`), and `$I30`
+        /// stays pointing at a real in-use record.
+        case afterI30CommitBeforeReturn
+    }
+    private var _createFileFaultHook: CreateFileFaultPoint?
+    public func _setCreateFileFaultHook(_ point: CreateFileFaultPoint?) {
+        _createFileFaultHook = point
+    }
+    /// Internal: clear the fault hook if it currently equals `point`,
+    /// returning true on a successful consume. The split between
+    /// "is this our point?" and "clear unconditionally" is critical:
+    /// a `.afterI30CommitBeforeReturn` hook must remain set while
+    /// `createFile` evaluates the earlier `.afterMFTWriteBeforeI30Commit`
+    /// branch — an unconditional consume would clear it and the later
+    /// branch would never see it.
+    ///
+    /// Single-shot semantics are preserved end-to-end: the hook fires
+    /// at most once because the matching branch clears the field, and
+    /// non-matching branches leave it untouched for the next branch.
+    private func _takeCreateFileFaultHook(if point: CreateFileFaultPoint) -> Bool {
+        if _createFileFaultHook == point {
+            _createFileFaultHook = nil
+            return true
+        }
+        return false
+    }
+    #endif
+
     public init(device: any BlockDevice) async throws {
         self.device = device
 
@@ -834,7 +889,41 @@ public actor Volume {
         let parent = try await mft.record(at: parentRecordNumber)
         let parentRef = (UInt64(parent.sequenceNumber) << 48) | (parentRecordNumber & 0x0000_FFFF_FFFF_FFFF)
 
-        // 1) Write the new MFT record first so we know the slot is durably ours.
+        // v0.5 Bug B (i30 ↔ MFT atomicity): mirror `migrateAttributeOnOverflow`'s
+        // compute-first / commit-secondary-first / reclaim-on-throw discipline.
+        //
+        //   compute-first:
+        //     Both the new MFT record bytes AND the $I30 entry body are
+        //     computed in memory before any disk mutation, so anything that
+        //     would overflow / mis-validate fails before we touch the volume.
+        //   commit ordering:
+        //     1) write the new MFT record (slot becomes IN_USE on disk)
+        //     2) commit the $I30 entry under the parent
+        //   reclaim-on-throw — POLICY DEPENDS ON WHERE THE THROW LANDS:
+        //     • Throw BEFORE step (2) commits any parent-side byte:
+        //         → reclaim the MFT slot. Post-abort state: neither
+        //           record nor $I30 entry exists. Clean rollback.
+        //     • Throw AFTER step (2) has committed any parent-side byte
+        //       (resident $INDEX_ROOT rewrite, LARGE_INDEX leaf write,
+        //       leaf-split intermediate write, etc.) — i.e. an entry
+        //       referencing `recordNumber` is durably on disk somewhere
+        //       in the parent's $I30 tree:
+        //         → KEEP the MFT slot IN_USE. Reclaiming it now would
+        //           leave the $I30 entry pointing at a free slot — the
+        //           "dangling" failure mode v0.5 hardware exposed
+        //           (post-mortem: `verify --deep` reported 2 dangling
+        //           $I30 entries). Surfacing the failure as an "orphan
+        //           base record" (in-use MFT, unreachable from tree) is
+        //           strictly safer: `ntfsctl reclaim-orphans` cleans it
+        //           up, AND the $I30 entry isn't dangling because the
+        //           record it points at is genuinely in-use.
+        //
+        // Equivalently: the post-abort state is one of
+        //   (record absent, $I30 absent)       — clean rollback
+        //   (record present, $I30 absent)      — orphan base
+        //   (record present, $I30 present)     — success
+        // and the (record absent, $I30 present) dangling state is now
+        // structurally unreachable from any throw inside this function.
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -844,12 +933,54 @@ public actor Volume {
             fileName: name,
             parentReference: parentRef
         )
-        let recordBytes = try builder.build()
-        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: recordBytes)
+        // Compute step: build the record bytes in memory. Builder is pure;
+        // any failure here (impossible for current inputs but defensive)
+        // lets us reclaim the MFT slot before any disk mutation.
+        let recordBytes: Data
+        do {
+            recordBytes = try builder.build()
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: recordNumber)
+            throw error
+        }
 
-        // 2) Insert into parent's $I30. If this fails (overflow / LARGE_INDEX
-        //    rejection), roll back the MFT write by zeroing IN_USE on the
-        //    new record so we don't leave an orphan.
+        // 1) Commit the new MFT record. This makes `recordNumber` IN_USE
+        //    on disk. From here until a successful return OR a clean
+        //    pre-I30 rollback, the slot is durably ours.
+        do {
+            try await mft.writeRawRecord(at: recordNumber, postFixupBytes: recordBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: recordNumber)
+            throw error
+        }
+
+        #if DEBUG
+        // Fault-injection point A: throw between MFT write and $I30 commit.
+        // The catch below MUST clean up — i.e. reclaim the MFT slot — so
+        // the volume returns to a fully-clean state (no orphan, no $I30).
+        //
+        // Use `_takeCreateFileFaultHook(if:)` so a `.afterI30CommitBeforeReturn`
+        // hook is NOT cleared by this earlier check (it must remain set
+        // for point B below to observe).
+        if _takeCreateFileFaultHook(if: .afterMFTWriteBeforeI30Commit) {
+            try? await reclaimOrphanedMFTRecord(at: recordNumber)
+            throw NTFSError.ioFailure(description: "createFile fault-injection: afterMFTWriteBeforeI30Commit")
+        }
+        #endif
+
+        // 2) Commit the $I30 entry. Track whether ANY parent-side byte
+        //    has been written so the catch below can choose the correct
+        //    reclamation policy (see big comment above).
+        //
+        //    `insertIntoParentI30(i30Committed:)` is the v0.5 Bug B
+        //    extension of the original entrypoint: it sets the inout
+        //    flag to `true` immediately before each on-disk write that
+        //    could leave a durable trace of the new entry in the
+        //    parent's $I30 tree (resident $INDEX_ROOT rewrite,
+        //    LARGE_INDEX leaf rewrite, leaf-split LEFT/RIGHT/parent
+        //    writes). If any of those writes succeed, the flag is
+        //    `true` and we will NOT free the MFT slot on throw.
+        var i30Committed = false
         do {
             try await insertIntoParentI30(
                 parentRecordNumber: parentRecordNumber,
@@ -857,13 +988,40 @@ public actor Volume {
                 childSequence: newSequence,
                 childFileName: name,
                 isDirectory: isDirectory,
-                nowFiletime: MFTRecordBuilder.windowsFiletimeNow()
+                nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
+                i30Committed: &i30Committed
             )
         } catch {
-            // Roll back the orphan record so the volume stays consistent.
-            try? await reclaimOrphanedMFTRecord(at: recordNumber)
+            if i30Committed {
+                // Post-commit failure: the $I30 entry (or part of the
+                // split machinery referencing the new record) is
+                // durable on disk. Reclaiming the MFT slot here would
+                // create a dangling $I30 entry. Leave it as an orphan
+                // base record and surface the error — `ntfsctl
+                // reclaim-orphans` handles cleanup; importantly, the
+                // $I30 entry still refers to an in-use MFT slot, so
+                // `verify --deep` won't report dangling.
+            } else {
+                // Pre-commit failure: nothing parent-side hit disk;
+                // the orphan record is the only trace. Reclaim it.
+                try? await reclaimOrphanedMFTRecord(at: recordNumber)
+            }
             throw error
         }
+
+        #if DEBUG
+        // Fault-injection point B: throw AFTER $I30 commit succeeded
+        // but BEFORE we return. Under the corrected discipline above,
+        // i30Committed is true at this point (the successful return
+        // path of `insertIntoParentI30` only happens after it set the
+        // flag), so the catch in the test's caller will observe an
+        // orphan base record — NOT a dangling $I30 entry. The test
+        // asserts that post-abort `verify --deep`-equivalent audit
+        // reports zero dangling entries.
+        if _takeCreateFileFaultHook(if: .afterI30CommitBeforeReturn) {
+            throw NTFSError.ioFailure(description: "createFile fault-injection: afterI30CommitBeforeReturn")
+        }
+        #endif
 
         return recordNumber
     }
@@ -872,13 +1030,23 @@ public actor Volume {
     /// $INDEX_ROOT:$I30. Pure resident-only path: rejects LARGE_INDEX dirs
     /// and rejects when the rewritten attribute doesn't fit in the parent
     /// record's slack space.
+    ///
+    /// v0.5 Bug B atomicity contract: `i30Committed` is set to `true`
+    /// IMMEDIATELY before each on-disk write that could leave a durable
+    /// reference to the new entry in the parent's $I30 tree (resident
+    /// $INDEX_ROOT rewrite, LARGE_INDEX leaf rewrite, split intermediate
+    /// writes, or split's final parent rewrite). On throw with the flag
+    /// set, the caller must NOT free the child's MFT slot — doing so
+    /// would create a dangling $I30 entry. See the big block comment in
+    /// `createFile` for the post-abort state matrix.
     private func insertIntoParentI30(
         parentRecordNumber: UInt64,
         childRecordNumber: UInt64,
         childSequence: UInt16,
         childFileName: String,
         isDirectory: Bool,
-        nowFiletime: UInt64
+        nowFiletime: UInt64,
+        i30Committed: inout Bool
     ) async throws {
         let mft = self.mft()
         let parent = try await mft.record(at: parentRecordNumber)
@@ -917,6 +1085,18 @@ public actor Volume {
                 isDirectory: isDirectory,
                 nowFiletime: nowFiletime
             )
+            // v0.5 Bug B: `IndexAllocationWriter.insert` reads, descends,
+            // and writes the leaf in one call — we cannot interpose a
+            // commit barrier between its descent and its write. Mark the
+            // commit flag conservatively BEFORE the call so any throw
+            // from within it is treated as post-commit. The cost: a
+            // pre-write throw (e.g. parse error on existing $I30 bytes)
+            // produces an orphan MFT record rather than a clean rollback;
+            // `ntfsctl reclaim-orphans` handles that case. The benefit:
+            // the hard "no dangling $I30 entry" invariant holds even if
+            // the leaf write succeeded and a later step in this function
+            // throws.
+            i30Committed = true
             let outcome = try await IndexAllocationWriter.insert(
                 rootBody: rootBytes,
                 allocationExtents: allocExtents,
@@ -934,6 +1114,7 @@ public actor Volume {
                 return
             case let .leafFull(leafVCN, leafByteOffset, _, _, _, merged):
                 // T1.2: split the full leaf, promote the median into $INDEX_ROOT.
+                // `i30Committed` already true from the pre-call set above.
                 try await splitLeafAndPromote(
                     parentRecordNumber: parentRecordNumber,
                     leafVCN: leafVCN,
@@ -1004,6 +1185,13 @@ public actor Volume {
             }
             var updatedBytes = newParentBytes
             MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+            // v0.5 Bug B: mark the $I30 entry as durable IMMEDIATELY
+            // before the on-disk parent rewrite. Any throw from
+            // `writeRawRecord` itself or anything later in this branch
+            // must NOT cause `createFile` to free the child's MFT slot,
+            // because the rewritten parent bytes — which DO contain
+            // the new child entry — may have partially hit disk.
+            i30Committed = true
             try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: updatedBytes)
         } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
             // v0.5 Fix B Step 3: predicate widened to catch both
@@ -1023,14 +1211,19 @@ public actor Volume {
             // $INDEX_ROOT to an empty interior root.
             try await promoteDirectoryToLargeIndex(parentRecordNumber: parentRecordNumber)
             // Re-call ourselves; this time root.isLargeIndex == true so the
-            // first branch (LARGE_INDEX leaf insert) runs.
+            // first branch (LARGE_INDEX leaf insert) runs. The recursive
+            // call threads the same `i30Committed` flag so the LARGE_INDEX
+            // commit barrier inside it (set before
+            // `IndexAllocationWriter.insert`) is observable to
+            // `createFile`'s catch.
             try await insertIntoParentI30(
                 parentRecordNumber: parentRecordNumber,
                 childRecordNumber: childRecordNumber,
                 childSequence: childSequence,
                 childFileName: childFileName,
                 isDirectory: isDirectory,
-                nowFiletime: nowFiletime
+                nowFiletime: nowFiletime,
+                i30Committed: &i30Committed
             )
         }
     }
@@ -5411,13 +5604,26 @@ public actor Volume {
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: finalBytes)
 
         // 3. Insert new $I30 entry under the target parent.
+        //
+        // v0.5 Bug B: rename's atomicity contract is explicitly OUT OF
+        // SCOPE for this subtask (see the leaf-split-migration job brief
+        // risk table — rename/delete mutation atomicity audits are
+        // deferred). The flag is threaded for signature compatibility
+        // only; rename's existing rollback discipline (above) is
+        // unchanged. AUDIT-TODO(rename-i30-atomicity): rename should
+        // get the same compute-first/commit-secondary-first treatment
+        // as createFile — currently a throw between the source-side
+        // $I30 remove and the target-side $I30 insert could leave the
+        // file unreachable from both directories.
+        var _renameI30Dummy = false
         try await insertIntoParentI30(
             parentRecordNumber: targetParentRN,
             childRecordNumber: recordNumber,
             childSequence: record.sequenceNumber,
             childFileName: newName,
             isDirectory: record.isDirectory,
-            nowFiletime: MFTRecordBuilder.windowsFiletimeNow()
+            nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
+            i30Committed: &_renameI30Dummy
         )
     }
 
