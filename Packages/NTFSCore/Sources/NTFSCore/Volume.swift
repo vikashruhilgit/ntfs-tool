@@ -1837,7 +1837,12 @@ public actor Volume {
             )
 
             // Build the parent record bytes — should now fit (tiny root).
-            let rewrite = try await rewriteParentForLeafSplit(
+            // v0.5 Bug A: use the migrating wrapper. This site is inside
+            // `heightGrowIndexRoot` and its only enclosing catch is a
+            // generic `freeClusters; rethrow` — NOT an
+            // `isOverflowDescription` catch. Without the wrapper a $IA
+            // overflow here escaped uncaught and aborted the cp.
+            let rewrite = try await rewriteParentForLeafSplitMigrating(
                 parent: parent,
                 newRootBody: newTinyRootBody,
                 newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
@@ -2232,7 +2237,12 @@ public actor Volume {
             // Cascade stopped at some intermediate level. $INDEX_ROOT body
             // is UNCHANGED. Just rewrite parent record with updated
             // runlist + bitmap.
-            let rewrite = try await rewriteParentForLeafSplit(
+            // v0.5 Bug A: use the migrating wrapper. This site is
+            // structurally OUTSIDE the do/catch immediately below
+            // (which only covers the cascade-exhausted-then-root-rewrite
+            // path). A $IA-runlist-growth-triggered overflow here used
+            // to escape uncaught.
+            let rewrite = try await rewriteParentForLeafSplitMigrating(
                 parent: parent,
                 newRootBody: rootBytes,  // unchanged
                 newIndexAllocAttrBytes: updatedIndexAllocAttrBytes,
@@ -2773,6 +2783,75 @@ public actor Volume {
     ///
     /// `$INDEX_ROOT` (Step A) is always resident in the base, so it never
     /// routes to an extension.
+    ///
+    /// v0.5 Bug A wrapper: `rewriteParentForLeafSplitMigrating` catches a
+    /// `$INDEX_ALLOCATION`-typed overflow from `rewriteParentForLeafSplit`,
+    /// migrates the attribute to an extension record via
+    /// `migrateIndexAllocationOnOverflow`, re-reads the refreshed parent,
+    /// and retries the rewrite once. Used by the two leaf-split call sites
+    /// that are NOT enclosed by an existing `isOverflowDescription` catch:
+    ///
+    ///   - inside `heightGrowIndexRoot` (call site near line 1840). Only
+    ///     enclosing catch is a generic `freeClusters; rethrow`, NOT an
+    ///     `isOverflowDescription` catch. Without this wrapper, a `$IA`
+    ///     overflow there escaped uncaught and aborted the cp — the exact
+    ///     hardware symptom on 2026-05-27 (WhatsApp Images recnum 2998:
+    ///     `Migrated ($ATTR_LIST): no` despite a type-0xA0 overflow).
+    ///
+    ///   - in `promoteThroughInteriorChain`'s `!cascadeExhaustedChain`
+    ///     early-return branch (call site near line 2235). Structurally
+    ///     OUTSIDE the do/catch immediately below at the cascade-exhausted
+    ///     site (which only covers the cascade-exhausted-then-root-rewrite
+    ///     overflow at lines 2269 and 2298).
+    ///
+    /// Mirrors the inlined pattern at the cascade-exhausted catch (2281–
+    /// 2310): single migration call, single refresh via
+    /// `mft.record(at:)`, single retry. Non-`$IA`-typed overflows rethrow
+    /// — `$INDEX_ROOT` / `$BITMAP` overflows on these paths are
+    /// structurally rare and not recoverable via the same discipline.
+    ///
+    /// The four call sites already inside the `isOverflowDescription`
+    /// catches at the cascade migration block continue to call the raw
+    /// `rewriteParentForLeafSplit` directly — no behavioral change there.
+    private func rewriteParentForLeafSplitMigrating(
+        parent: MFTRecord,
+        newRootBody: Data,
+        newIndexAllocAttrBytes: Data,
+        newBitmapAttrBytes: Data
+    ) async throws -> ParentRewrite {
+        do {
+            return try await rewriteParentForLeafSplit(
+                parent: parent,
+                newRootBody: newRootBody,
+                newIndexAllocAttrBytes: newIndexAllocAttrBytes,
+                newBitmapAttrBytes: newBitmapAttrBytes
+            )
+        } catch NTFSError.unsupportedFeature(let desc) where isOverflowDescription(desc) {
+            // Discriminate by overflowing attribute type. Only $IA
+            // overflow is recoverable via `migrateIndexAllocationOnOverflow`.
+            // $INDEX_ROOT (0x90) is always resident and cannot migrate;
+            // $BITMAP (0xB0)-only migration is deferred. Rethrow others
+            // unchanged so callers see the same failure shape they saw
+            // before this wrapper existed.
+            let overflowType = overflowingAttributeType(from: desc)
+            guard overflowType == AttributeType.indexAllocation.rawValue else {
+                throw NTFSError.unsupportedFeature(description: desc)
+            }
+            let baseRN = UInt64(parent.mftRecordNumber)
+            try await migrateIndexAllocationOnOverflow(
+                baseRecordNumber: baseRN,
+                overflowDescription: desc
+            )
+            let refreshedParent = try await self.mft().record(at: baseRN)
+            return try await rewriteParentForLeafSplit(
+                parent: refreshedParent,
+                newRootBody: newRootBody,
+                newIndexAllocAttrBytes: newIndexAllocAttrBytes,
+                newBitmapAttrBytes: newBitmapAttrBytes
+            )
+        }
+    }
+
     private func rewriteParentForLeafSplit(
         parent: MFTRecord,
         newRootBody: Data,
