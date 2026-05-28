@@ -109,8 +109,38 @@ public enum AttributeMigration {
         guard let migrantIndex = scan.firstIndex(where: { entry in
             entry.type == migratingType && entry.name == migratingName
         }) else {
+            // The migrant isn't in the base. Two cases:
+            //   1. Base already carries a $ATTRIBUTE_LIST → migrant has already
+            //      been migrated to an extension record in a prior pass. The
+            //      caller (leaf-split / file-grow) overflowed AGAIN, this time
+            //      because the EXTENSION record itself filled up — i.e. the
+            //      attribute now needs MULTI-EXTENSION coverage (a second
+            //      extension record + a second $ATTRIBUTE_LIST entry at a
+            //      higher lowest_vcn). Not yet implemented; this is the genuine
+            //      next structural ceiling (v0.7). Throw a clean,
+            //      user-actionable `unsupportedFeature` — NOT `corruptOnDisk`,
+            //      which would scare users into running chkdsk on a perfectly
+            //      consistent volume.
+            //   2. Base has no $ATTRIBUTE_LIST and no migrant either → genuinely
+            //      unexpected (caller invoked migration on the wrong record, or
+            //      real corruption). Keep `corruptOnDisk` for this branch so
+            //      it remains visible.
+            let hasAttributeList = scan.contains(where: {
+                $0.type == AttributeType.attributeList.rawValue
+            })
+            let typeHex = String(migratingType, radix: 16, uppercase: true)
+            if hasAttributeList {
+                throw NTFSError.unsupportedFeature(
+                    description: """
+                        This directory (or file) has grown beyond what this version supports in a single MFT extension record. \
+                        Attribute type 0x\(typeHex) name '\(migratingName)' is already migrated to an extension, and that extension's runlist now overflows too — a second extension record (multi-extension $ATTRIBUTE_LIST) is required. \
+                        Workaround until v0.7: split the data across multiple subdirectories so no single directory accumulates this many entries / fragments. \
+                        Tracking: v0.7 multi-extension $INDEX_ALLOCATION (see docs/STATUS.md).
+                        """
+                )
+            }
             throw NTFSError.corruptOnDisk(
-                description: "AttributeMigration: base record has no attribute type 0x\(String(migratingType, radix: 16)) name '\(migratingName)' to migrate"
+                description: "AttributeMigration: base record has no attribute type 0x\(typeHex) name '\(migratingName)' to migrate, and no $ATTRIBUTE_LIST to redirect via — likely a programmer error (migration invoked on the wrong record) or real on-disk corruption."
             )
         }
         let migrant = scan[migrantIndex]
