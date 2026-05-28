@@ -2,11 +2,14 @@
 
 Read/write NTFS on Apple Silicon Macs from the command line. MIT-licensed.
 
-`ntfsctl` is a single-binary CLI that reads, writes, copies, renames, and deletes files on NTFS volumes — no Apple Developer subscription, no SIP changes, no FSKit entitlement. It operates on raw block devices, so it works regardless of whether macOS has the drive mounted.
+`ntfsctl` is a single-binary CLI that reads, writes, copies, renames, deletes, **formats**, and audits NTFS volumes — no Apple Developer subscription, no SIP changes, no FSKit entitlement, no third-party drivers (no `macFUSE`, no `ntfs-3g`, no Linux VM, no Windows). It operates on raw block devices, so it works regardless of whether macOS has the drive mounted.
 
 ```bash
 # Find your NTFS drive:
 sudo ntfsctl scan
+
+# Format from scratch — pure-Swift NTFS quick-format, no external tools needed:
+sudo ntfsctl mkntfs --label "MyDrive" --yes /dev/disk10s1
 
 # List a directory by path:
 sudo ntfsctl list --long /dev/disk10s1 /Photos
@@ -17,6 +20,9 @@ sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg > out.jpg
 # Recursively copy a host directory tree onto NTFS, with progress:
 sudo ntfsctl cp -r --progress ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone
 
+# Re-run the same copy without nesting (merges into existing dest):
+sudo ntfsctl cp -rT --progress ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone
+
 # Pull a directory back to the host:
 sudo ntfsctl cp -r --from-volume /Backups /dev/disk10s1 ~/restored/
 
@@ -25,24 +31,29 @@ sudo ntfsctl mv /dev/disk10s1 /draft.txt /Archive/final.txt
 
 # Recursive delete (force flag required for safety):
 sudo ntfsctl rm -r --force /dev/disk10s1 /Backups/MyPhone
+
+# Validate the on-disk shape (file-level deep dump, volume-wide audit):
+sudo ntfsctl dump /dev/disk10s1 /Photos/vacation.jpg       # decodes runlist, $Bitmap cross-check
+sudo ntfsctl verify --deep /dev/disk10s1                    # whole-volume runlist ↔ $Bitmap audit
 ```
 
-There's also an [`NTFSCore`](Packages/NTFSCore) Swift library (embed in any project — 102 unit tests, no FSKit dependency) and an FSKit System Extension + SwiftUI menu-bar app (code complete, mount UX needs Apple Developer entitlement or SIP-off to validate against real hardware — see [`docs/STATUS.md`](docs/STATUS.md)).
+There's also an [`NTFSCore`](Packages/NTFSCore) Swift library (embed in any project — **210 unit tests**, no FSKit dependency) and an FSKit System Extension + SwiftUI menu-bar app (code complete, mount UX needs Apple Developer entitlement or SIP-off to validate against real hardware — see [`docs/STATUS.md`](docs/STATUS.md)).
 
-Built for macOS 15.4+ (Sequoia) on Apple Silicon. Swift 6.0+ / Xcode 16.3+ to build from source; a prebuilt binary is on the [Releases tab](https://github.com/vikashruhilgit/ntfs-tool/releases) (when v0.2.0 ships — see [`docs/READY-TO-USE-PLAN.md`](docs/READY-TO-USE-PLAN.md) for what's left).
+Built for macOS 15.4+ (Sequoia) on Apple Silicon. Swift 6.0+ / Xcode 16.3+ to build from source.
 
-## Quick start — CLI
+## What's new — v0.5 → v0.6 highlights
 
-### Install (prebuilt binary, no Xcode needed)
+- **🔁 Pure-Swift NTFS formatter** (`ntfsctl mkntfs`). Equivalent to `mkntfs -Q`, output mountable by macOS / Linux `ntfs-3g` / Windows. **The project is now self-sufficient for the full test loop on macOS** — no Homebrew, no `macFUSE`, no Linux VM, no Windows required for reformat.
+- **📈 Large-directory capacity lifted to "free clusters + MFT slots".** v0.4 `$INDEX_ROOT` multi-level split + v0.5 `$ATTRIBUTE_LIST` migration (`$INDEX_ALLOCATION` and `$DATA` overflow → extension MFT records + base `$ATTRIBUTE_LIST`) + next-fit allocator to cut fragmentation. The original ~50-file LARGE_INDEX cap is gone; the ~350-file `$DATA` cap is gone; the ~6,139-file post-migration leaf-split cap is gone.
+- **🔬 Built-in diagnostics.** `ntfsctl dump <path>` decodes any file's `$DATA` runlist and cross-checks each cluster against `$Bitmap`. `ntfsctl verify --deep` does the same audit volume-wide (free-but-referenced, out-of-range, double-allocated). These are what we use to validate hardware runs.
+- **🔁 cp gained `-T` / merge mode** so re-running the same copy doesn't accidentally nest. Plus a preflight line that prints the resolved destination + conflict policy before any bytes move.
+- **♻️ Every code path is `$ATTRIBUTE_LIST`-aware.** `delete`, `truncate`, `verify`, `reclaim-orphans`, FSKit `getAttributes`, the cp leaf-split path — all migrated files behave correctly through the full lifecycle (create / read / modify / delete / reclaim).
+- **🛡️ Independent spec-conformance assertions.** Hardened against the "writer and reader share the same bug" trap — multi-extent `$DATA`, boot sector, `$UpCase`, `$AttrDef` are byte-checked against hand-decoded references, not just round-tripped through our own decoder.
+- **🧪 87 → 210 unit tests** across this arc.
 
-Once v0.2.0 is published on the [Releases page](https://github.com/vikashruhilgit/ntfs-tool/releases):
+Full per-PR changelog: [`CHANGELOG.md`](CHANGELOG.md). Detailed state: [`docs/STATUS.md`](docs/STATUS.md).
 
-```bash
-TAG=v0.2.0
-curl -L "https://github.com/vikashruhilgit/ntfs-tool/releases/download/${TAG}/ntfsctl-${TAG}-macos-arm64.tar.gz" | tar xz
-sudo mv "ntfsctl-${TAG}-macos-arm64" /usr/local/bin/ntfsctl
-ntfsctl --version
-```
+## Quick start
 
 ### Build from source
 
@@ -51,7 +62,10 @@ cd Tools/ntfsctl
 swift build --configuration release
 # Binary at .build/release/ntfsctl
 ln -s "$(pwd)/.build/release/ntfsctl" /usr/local/bin/ntfsctl
+ntfsctl --version
 ```
+
+(No Xcode needed for `ntfsctl` or `NTFSCore`. The FSKit extension + menu-bar app need Xcode 16.3+.)
 
 ### The mount/unmount dance
 
@@ -70,10 +84,24 @@ The drive stays plugged in throughout — only the filesystem mount is dropped.
 - **Volume marked dirty before writes, clean after** — if `ntfsctl` is interrupted (Ctrl+C, kernel panic, unplug), Windows sees the dirty bit on next mount and `chkdsk` auto-runs. Without this, you'd silently inherit a corrupt filesystem that Windows trusts.
 - **`fcntl(F_FULLFSYNC)` before clearing the dirty bit** — guarantees data hits physical media before the dirty bit is cleared. Survives fast unplugs.
 - **Exclusive `flock()` on the device** — two concurrent `ntfsctl` processes on the same device fail-fast instead of corrupting the bitmap.
-- **`rm -r /` rejected** — a one-typo full-volume wipe is impossible by design. Recursive deletes require `--force` (or `--dry-run` to preview).
+- **Compute-first transactional writes** — every multi-attribute mutation (leaf split, migration, file create, file delete) builds the new state in memory first, then commits, then reclaims allocations on any throw. `verify --deep` catches any rollback gap volume-wide.
+- **`$ATTRIBUTE_LIST` sequence-number cross-check on read** — a stale `$ATTRIBUTE_LIST` entry pointing at a recycled extension MFT slot throws `corruptOnDisk` at read time rather than silently returning another file's bytes.
+- **`mkntfs` requires `--yes`** — destructive operation refuses to run without explicit acknowledgement and always prints device path + size + label first.
+- **`reclaim-orphans` never frees a legitimate extension record** — a structural precondition guarantees a v0.5-migration extension record (holding a live file's migrated `$DATA` / `$INDEX_ALLOCATION`) can't reach the reclaim set; only confirmed-base-free leaked extensions are reclaimable.
+- **`rm -r /` rejected** — a one-typo full-volume wipe is impossible by design. Recursive deletes require `--force`.
 - **Bare arguments are always paths, never MFT record numbers** — a file literally named "38" no longer silently targets MFT record 38. Pass `--recnum` to opt into the legacy numeric form.
 
 Full CLI walkthrough: [`docs/CLI.md`](docs/CLI.md).
+
+## Subcommand reference (16 total)
+
+| Group | Subcommands |
+|---|---|
+| **Read** | `info`, `scan`, `list`, `cat`, `verify` (+ `--deep`), `dump` |
+| **Write** | `create`, `write`, `truncate`, `cp` (+ `-T`/`-r`/`--from-volume`/`--progress`/`--dry-run`/`-n`), `rm`, `mv`, `delete` |
+| **Volume admin** | `mkntfs`, `setdirty`, `reclaim-orphans` |
+
+Detail + examples: [`docs/CLI.md`](docs/CLI.md).
 
 ## Quick start — library
 
@@ -92,6 +120,9 @@ try await volume.beginWriteSession()
 let recnum = try await volume.createFile(named: "new.txt", inDirectory: 5)
 try await volume.write(at: recnum, offset: 0, bytes: Data("hi".utf8))
 try await volume.endWriteSession()
+
+// Format from scratch (mkntfs equivalent)
+try await Mkntfs.format(device: device, label: "MyDrive")
 ```
 
 ## Quick start — FSKit extension
@@ -102,15 +133,14 @@ The FSKit extension is code-complete but Apple's runtime requires either SIP-off
 
 ```
 ntfs-tool/
-├── Packages/NTFSCore/     Swift library (pure NTFS read/write, 102 tests)
+├── Packages/NTFSCore/     Swift library — pure NTFS read/write/format, 210 tests
 ├── Extensions/NTFSFileSystem/  FSKit System Extension
 ├── Apps/NTFSMountManager/      SwiftUI menu-bar app
-├── Tools/ntfsctl/         Command-line tool (13 subcommands)
+├── Tools/ntfsctl/         Command-line tool (16 subcommands)
 ├── docs/
 │   ├── CLI.md             ntfsctl walkthrough
-│   ├── STATUS.md          What's done, what's pending
-│   ├── READY-TO-USE-PLAN.md  Path to v0.2.0 release
-│   └── AUDIT-REPORT.md    Red-team safety audit
+│   └── STATUS.md          What's done, what's pending, what's next
+├── CHANGELOG.md           Per-PR changes
 └── CLAUDE.md              Architecture + conventions
 ```
 
@@ -119,7 +149,7 @@ ntfs-tool/
 ```bash
 # NTFSCore (no Xcode needed)
 cd Packages/NTFSCore && swift build && swift test
-# → 102 tests pass
+# → 210 tests pass
 
 # ntfsctl CLI (no Xcode needed)
 cd Tools/ntfsctl && swift build --configuration release
@@ -134,12 +164,13 @@ xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager build
 
 | Layer | Status |
 |---|---|
-| `ntfsctl` read commands (info, scan, list, cat, verify) | Production-ready |
-| `ntfsctl` write commands (cp, write, rm, mv, create, delete, truncate) | Usable for most workflows; one known cap (LARGE_INDEX leaf split, see [`docs/STATUS.md`](docs/STATUS.md)) blocks copying > ~50 files into a single fresh directory |
-| NTFSCore library | Production-ready (102/102 tests, real 4 TB Windows drive validated) |
-| FSKit extension build | Builds clean in CI |
+| `ntfsctl` read commands (`info`, `scan`, `list`, `cat`, `verify`, `dump`) | Production-ready |
+| `ntfsctl` write commands (`cp`, `write`, `rm`, `mv`, `create`, `delete`, `truncate`) | Production-ready for typical workflows; large-directory cp validated to 6,000+ files; **next structural ceiling is multi-extension `$INDEX_ALLOCATION` for very large dirs (>~15k entries), tracked in [`docs/STATUS.md`](docs/STATUS.md)** |
+| `ntfsctl` volume admin (`mkntfs`, `reclaim-orphans`, `setdirty`) | Production-ready |
+| `NTFSCore` library | Production-ready (210/210 tests, real 4 TB Windows drive validated) |
+| FSKit extension build | Builds clean |
 | FSKit mount in Finder | Needs SIP-off / entitlement to validate |
-| Windows `chkdsk /f` clean | Needs your test on a Windows machine |
+| Windows `chkdsk /f` clean | Pending — manual user step on a Windows machine |
 
 Full breakdown: [`docs/STATUS.md`](docs/STATUS.md).
 
@@ -147,8 +178,8 @@ Full breakdown: [`docs/STATUS.md`](docs/STATUS.md).
 
 [MIT](LICENSE). Use it however you like.
 
-The NTFS implementation is a clean-room Swift port from publicly-documented on-disk format specs — no GPL code incorporated.
+The NTFS implementation is a clean-room Swift port from publicly-documented on-disk format specs — no GPL code incorporated. The `$UpCase` table is derived from Unicode case mappings via Swift's `String.uppercased()`; the `$AttrDef` table is derived from the public NTFS 3.1 spec.
 
 ## Contributing
 
-Architecture notes + conventions in [`CLAUDE.md`](CLAUDE.md). For substantive work, file an issue first to align on approach — particularly for the engineering follow-ups documented in [`docs/STATUS.md`](docs/STATUS.md) (LARGE_INDEX leaf split, `$LogFile` journaling, MFT `$BITMAP` allocator).
+Architecture notes + conventions in [`CLAUDE.md`](CLAUDE.md). For substantive work, file an issue first to align on approach. Active engineering follow-ups are documented in [`docs/STATUS.md`](docs/STATUS.md) — most notably: multi-extension `$INDEX_ALLOCATION` (the next structural cap), CI workflow repair (broken since PR #29, currently merging on local-test signal only), and the `rename`/`delete` extension-record-awareness audit (an `AUDIT-TODO` marker in v0.5.2).
