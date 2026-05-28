@@ -371,12 +371,79 @@ final class MultiExtensionIndexAllocationTests: XCTestCase {
         // distinct read-path issue tracked by Subtask #4 / AC-6.a.
     }
 
-    // MARK: - AC-5: mergeMultiExtensionAttribute unit contract (XCTSkip pre-Subtask-#4)
+    // MARK: - AC-5: mergeMultiExtensionAttribute unit contract
 
-    /// AC-5 unit test. The helper `Volume.mergeMultiExtensionAttribute(...)`
-    /// is introduced in Subtask #4. Skipped until then.
-    func testMergeMultiExtensionAttribute_unitContract() throws {
-        try XCTSkipIf(true, "AC-5 helper Volume.mergeMultiExtensionAttribute(...) not yet implemented (Subtask #4).")
+    /// AC-5 unit test. Direct exercise of `Volume.mergeMultiExtensionAttribute`
+    /// with synthetic `Attribute` values — independent of the on-disk migration
+    /// path. Two `Attribute` values with the same `(rawType=0xA0, name="$I30")`
+    /// and disjoint VCN ranges `[0..15]` and `[16..23]` must merge into a
+    /// single `Attribute` with the union extent list, contiguous coverage,
+    /// and `header` preserved from the first match.
+    func testMergeMultiExtensionAttribute_unitContract() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        // Synthetic Attribute construction. The helper consumes only
+        // `header.rawType`, `header.name`, and `value`; nothing else.
+        let headerA = AttributeHeader(
+            rawType: AttributeType.indexAllocation.rawValue, length: 96,
+            nonResident: true, nameLength: 4, nameOffset: 64, flags: 0,
+            attributeID: 5, name: "$I30"
+        )
+        let headerB = AttributeHeader(
+            rawType: AttributeType.indexAllocation.rawValue, length: 96,
+            nonResident: true, nameLength: 4, nameOffset: 64, flags: 0,
+            attributeID: 7, name: "$I30"
+        )
+        let extentsA: [Extent] = [Extent(startLCN: 1000, clusterCount: 16)]
+        let extentsB: [Extent] = [Extent(startLCN: 2000, clusterCount: 8)]
+        let valueA = AttributeValue.nonResident(
+            startingVCN: 0, lastVCN: 15,
+            dataRunsOffset: 64, compressionUnit: 0,
+            allocatedSize: 16 * 4096, realSize: 16 * 4096, initializedSize: 16 * 4096,
+            extents: extentsA
+        )
+        let valueB = AttributeValue.nonResident(
+            startingVCN: 16, lastVCN: 23,
+            dataRunsOffset: 64, compressionUnit: 0,
+            allocatedSize: 24 * 4096, realSize: 24 * 4096, initializedSize: 24 * 4096,
+            extents: extentsB
+        )
+        let attrA = Attribute(header: headerA, value: valueA)
+        let attrB = Attribute(header: headerB, value: valueB)
+
+        // Out-of-order input — helper must sort by startingVCN.
+        let merged = try await volume.mergeMultiExtensionAttribute(
+            in: [attrB, attrA],
+            rawType: AttributeType.indexAllocation.rawValue,
+            name: "$I30"
+        )
+        let m = try XCTUnwrap(merged, "merge must return a value when matches exist")
+
+        guard case let .nonResident(
+            startVCN, lastVCN, _, _, _, _, _, extents
+        ) = m.value else {
+            return XCTFail("merged attribute must be non-resident; got \(m.value)")
+        }
+        XCTAssertEqual(startVCN, 0, "merged startingVCN should be the head (lowest)")
+        XCTAssertEqual(lastVCN, 23, "merged lastVCN should be the tail (highest)")
+        XCTAssertEqual(extents.count, 2, "merged extent list should be the union of inputs")
+        XCTAssertEqual(extents[0].startLCN, 1000, "extents must be in VCN order: head first")
+        XCTAssertEqual(extents[1].startLCN, 2000, "extents must be in VCN order: tail second")
+
+        // Single match short-circuit
+        let single = try await volume.mergeMultiExtensionAttribute(
+            in: [attrA], rawType: AttributeType.indexAllocation.rawValue, name: "$I30"
+        )
+        XCTAssertEqual(single, attrA, "single-match input must return the lone attribute unchanged")
+
+        // No match short-circuit
+        let none = try await volume.mergeMultiExtensionAttribute(
+            in: [attrA], rawType: AttributeType.data.rawValue, name: ""
+        )
+        XCTAssertNil(none, "no-match input must return nil")
     }
 
     // MARK: - AC-6.a: write past one extension, reopen, every name enumerates

@@ -236,12 +236,167 @@ public actor Volume {
         name: String?
     ) async throws -> Attribute? {
         let all = try await allAttributesOf(recordNumber: recordNumber)
-        return all.first { a in
-            guard a.rawType == type.rawValue else { return false }
-            if let n = name { return a.nameOrEmpty == n }
-            return true
-        }
+        // v0.7 AC-5: when a non-resident attribute is split across multiple
+        // $ATTRIBUTE_LIST entries (multi-extension shape), `all` contains TWO
+        // `Attribute` values with the same (rawType, name) but disjoint VCN
+        // ranges. Returning `.first` here is the v0.6 silent half-read bug —
+        // route through the merge helper to synthesize a single Attribute
+        // covering every VCN. For single-instance attributes
+        // (e.g. $STANDARD_INFORMATION) the helper short-circuits and returns
+        // the lone match unchanged.
+        return try mergeMultiExtensionAttribute(
+            in: all,
+            rawType: type.rawValue,
+            name: name ?? ""
+        )
     }
+
+    /// v0.7 AC-5: the canonical merge seam for multi-extension
+    /// `$ATTRIBUTE_LIST` shapes. Gathers every `Attribute` in `attrs`
+    /// matching `(rawType, name)`, sorts them by `startingVCN`, and
+    /// synthesizes a single `Attribute` whose `.nonResident` value carries
+    /// the extents concatenated in VCN-ascending order.
+    ///
+    /// Required because v0.7's multi-extension $ATTRIBUTE_LIST write path
+    /// (`migrateIndexAllocationOnOverflow` second migration) produces N>1
+    /// `Attribute` values for the same `(type, name)` pair across the base +
+    /// extension records. Pre-v0.7 callsites that just did
+    /// `attrs.first(where: ...)` silently picked the VCN-0 attribute and
+    /// missed every entry living in the suffix extension — the documented
+    /// "19 of 416 names missing" half-read.
+    ///
+    /// Concatenation rules:
+    ///   * All matched attributes must be `.nonResident`. Multi-extension is
+    ///     only meaningful for non-resident attributes (resident attributes
+    ///     don't get an entry-per-extension shape).
+    ///   * Each next attribute's `startingVCN` must equal `prev.lastVCN + 1`
+    ///     (NTFS contiguity invariant). Violation throws `corruptOnDisk` —
+    ///     this indicates either a write-path bug or external corruption.
+    ///   * Per the ntfs3 / ntfs-3g convention enforced by
+    ///     `serializeMultiExtentNonResidentAttribute`, every extent carries
+    ///     identical `allocatedSize` / `realSize` / `initializedSize` (the
+    ///     full attribute size); the merge preserves them verbatim from the
+    ///     first (lowest-VCN) match.
+    ///   * For type/name pairs that are always single-instance (e.g.
+    ///     `$STANDARD_INFORMATION`, `$INDEX_ROOT`, resident $DATA) this is a
+    ///     no-op: with one match the synthesized result is byte-identical to
+    ///     the lone input.
+    ///
+    /// Returns `nil` if no attribute matches `(rawType, name)`.
+    internal func mergeMultiExtensionAttribute(
+        in attrs: [Attribute],
+        rawType: UInt32,
+        name: String
+    ) throws -> Attribute? {
+        let matches = attrs
+            .filter { $0.rawType == rawType && $0.nameOrEmpty == name }
+            .sorted { lhs, rhs in
+                let lvcn: UInt64 = {
+                    if case let .nonResident(s, _, _, _, _, _, _, _) = lhs.value { return s }
+                    return 0
+                }()
+                let rvcn: UInt64 = {
+                    if case let .nonResident(s, _, _, _, _, _, _, _) = rhs.value { return s }
+                    return 0
+                }()
+                return lvcn < rvcn
+            }
+        guard let first = matches.first else { return nil }
+        if matches.count == 1 { return first }
+
+        // Multi-match: every entry MUST be non-resident.
+        var mergedExtents: [Extent] = []
+        var headStartingVCN: UInt64 = 0
+        var tailLastVCN: UInt64 = 0
+        var dataRunsOffset: UInt16 = 0
+        var compressionUnit: UInt8 = 0
+        var allocatedSize: UInt64 = 0
+        var realSize: UInt64 = 0
+        var initializedSize: UInt64 = 0
+        var expectedNextVCN: UInt64 = 0
+
+        for (idx, match) in matches.enumerated() {
+            guard case let .nonResident(
+                startingVCN, lastVCN, dro, cu, allocSize, rSize, iSize, extents
+            ) = match.value else {
+                throw NTFSError.corruptOnDisk(
+                    description: "mergeMultiExtensionAttribute: matched attribute (rawType=0x\(String(rawType, radix: 16, uppercase: true)), name=\"\(name)\") at index \(idx) is unexpectedly resident — multi-extension shape requires non-resident extents on every entry"
+                )
+            }
+            if idx == 0 {
+                headStartingVCN = startingVCN
+                dataRunsOffset = dro
+                compressionUnit = cu
+                // Per the ntfs3 / ntfs-3g convention, every extent of a
+                // multi-extent attribute carries the FULL attribute size on
+                // every entry. Use the first (lowest-VCN) entry's values.
+                allocatedSize = allocSize
+                realSize = rSize
+                initializedSize = iSize
+                expectedNextVCN = startingVCN
+            } else {
+                // Contiguity check: each subsequent extent must start exactly
+                // where the previous one ended. NTFS write paths guarantee
+                // this; a violation is either a write-path bug or external
+                // corruption.
+                guard startingVCN == expectedNextVCN else {
+                    throw NTFSError.corruptOnDisk(
+                        description: "mergeMultiExtensionAttribute: (rawType=0x\(String(rawType, radix: 16, uppercase: true)), name=\"\(name)\") extent \(idx) startingVCN \(startingVCN) does not match expected \(expectedNextVCN) (prev lastVCN+1)"
+                    )
+                }
+            }
+            mergedExtents.append(contentsOf: extents)
+            tailLastVCN = lastVCN
+            expectedNextVCN = lastVCN &+ 1
+        }
+
+        let mergedValue = AttributeValue.nonResident(
+            startingVCN: headStartingVCN,
+            lastVCN: tailLastVCN,
+            dataRunsOffset: dataRunsOffset,
+            compressionUnit: compressionUnit,
+            allocatedSize: allocatedSize,
+            realSize: realSize,
+            initializedSize: initializedSize,
+            extents: mergedExtents
+        )
+        return Attribute(header: first.header, value: mergedValue)
+    }
+
+    // MARK: - v0.7 AC-5: `allAttributesOf` callsite audit
+    //
+    // After v0.7's multi-extension $ATTRIBUTE_LIST write path landed
+    // (Subtasks #2/#3, PR a9dd93e), `allAttributesOf` may return MULTIPLE
+    // Attribute values for the same (rawType, name) when a non-resident
+    // attribute is spread across two or more extension records. Every
+    // callsite that consumes a non-resident attribute via
+    // `attrs.first(where: { type == ... && name == ... })` is at risk of
+    // the silent half-read bug.
+    //
+    // The canonical fix is `mergeMultiExtensionAttribute(in:rawType:name:)`
+    // above; the 12 production callsites below were audited verbatim:
+    //
+    //  | # | file:line                                  | attr read              | verdict                                    |
+    //  |---|--------------------------------------------|------------------------|--------------------------------------------|
+    //  | 1 | Volume.swift `resolveAttribute`            | any                    | ROUTE THROUGH merge (canonical seam)       |
+    //  | 2 | Volume.swift `insertIntoParentI30`         | $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge                        |
+    //  | 3 | Volume.swift `promoteDirectoryToLargeIndex`| $INDEX_ROOT only       | SAFE BY CONSTRUCTION (resident $INDEX_ROOT — pre-promotion, no $INDEX_ALLOCATION exists yet) |
+    //  | 4 | Volume.swift `computeParentRecordBytesForSplit` | $INDEX_ROOT (resident) + uses attrID lookup | ROUTE THROUGH merge for $INDEX_ALLOCATION reads in helpers (`findIndexAllocationAttributeID` uses attrID which is shared across extents — `.first` works for ID; routing is still safe) |
+    //  | 5 | Volume.swift `collectAllFileRefsInLargeIndex` | $INDEX_ALLOCATION:$I30 extents | ROUTE THROUGH merge                  |
+    //  | 6 | Volume.swift `verifyParentRecord`          | $INDEX_ROOT only (spot-check) | SAFE BY CONSTRUCTION (resident $INDEX_ROOT lives in base) |
+    //  | 7 | Volume.swift `removeFromParentI30`         | $INDEX_ROOT + $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge for $INDEX_ALLOCATION |
+    //  | 8 | Volume.swift `refreshParentSizeHint` (~4249)| $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge                       |
+    //  | 9 | Volume.swift `enumerate` (via `readIndexAllocation`) | $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge (canonical bug site) |
+    //  |10 | Extensions/NTFSFileSystem NTFSItem.swift:164 | unnamed $DATA size hints | SAFE BY CONSTRUCTION (size fields are identical across all extents per the ntfs3/ntfs-3g convention; `.first` is sufficient when only realSize/allocatedSize are consumed) |
+    //  |11 | RunlistBitmapAudit.swift `auditDataRunlistAgainstBitmap` (:240) | unnamed $DATA extents | ROUTE THROUGH merge |
+    //  |12 | RunlistBitmapAudit.swift `resolveDataExtents` (:592) | unnamed $DATA extents | ROUTE THROUGH merge |
+    //
+    // "ROUTE THROUGH merge" = the .first(where:) was replaced with a call
+    // to `mergeMultiExtensionAttribute(in: attrs, rawType:, name:)`.
+    // "SAFE BY CONSTRUCTION" = the callsite reads only attribute families
+    // that NEVER multi-extend in the v0.7 shape (resident attributes,
+    // base-record-resident system info, or size-only consumers of fields
+    // that are identical across extents).
 
     /// MFT record number of the $Bitmap system file. Always 6 on every NTFS
     /// volume — this is part of the NTFS spec, not a per-volume value.
@@ -1085,9 +1240,13 @@ public actor Volume {
             // LARGE_INDEX path: descend the B-tree to find the right leaf and
             // insert there. The MFT record / $INDEX_ROOT is unchanged; the
             // mutation happens entirely inside an INDX block in $INDEX_ALLOCATION.
-            guard let allocAttr = attrs.first(where: {
-                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-            }) else {
+            // v0.7 AC-5: route through the merge so a multi-extension $INDEX_ALLOCATION
+            // surfaces as a single Attribute carrying every VCN's extents.
+            guard let allocAttr = try mergeMultiExtensionAttribute(
+                in: attrs,
+                rawType: AttributeType.indexAllocation.rawValue,
+                name: "$I30"
+            ) else {
                 throw NTFSError.corruptOnDisk(
                     description: "LARGE_INDEX parent \(parentRecordNumber) is missing $INDEX_ALLOCATION:$I30"
                 )
@@ -2663,8 +2822,15 @@ public actor Volume {
             refs.insert(e.fileReference)
         }
         // Collect from $INDEX_ALLOCATION leaves if LARGE_INDEX.
+        // v0.7 AC-5: route through the merge to follow every extension's
+        // VCN range (multi-extension $INDEX_ALLOCATION would otherwise return
+        // only the VCN-0 extension and silently miss files in later extents).
         if root.isLargeIndex,
-           let allocAttr = attrs.first(where: { $0.type == .indexAllocation && $0.nameOrEmpty == "$I30" }),
+           let allocAttr = try mergeMultiExtensionAttribute(
+               in: attrs,
+               rawType: AttributeType.indexAllocation.rawValue,
+               name: "$I30"
+           ),
            case let .nonResident(_, _, _, _, _, _, _, extents) = allocAttr.value {
             let clusterBytes = UInt64(bytesPerCluster)
             let blockSize = Int(indexRecordSizeBytes)
@@ -3538,9 +3704,13 @@ public actor Volume {
         let root = try IndexRoot.parse(rootBytes)
         if root.isLargeIndex {
             // LARGE_INDEX path: find the entry in some leaf INDX block and rewrite that block.
-            guard let allocAttr = attrs.first(where: {
-                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-            }) else { return }  // no $INDEX_ALLOCATION — nothing to remove
+            // v0.7 AC-5: route through the merge so removal sweeps every VCN
+            // range when $INDEX_ALLOCATION is multi-extension.
+            guard let allocAttr = try mergeMultiExtensionAttribute(
+                in: attrs,
+                rawType: AttributeType.indexAllocation.rawValue,
+                name: "$I30"
+            ) else { return }  // no $INDEX_ALLOCATION — nothing to remove
             guard case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
                 return
             }
@@ -4255,9 +4425,13 @@ public actor Volume {
         if root.isLargeIndex {
             // T1.3: LARGE_INDEX path. Walk the leaves via IndexAllocationWriter,
             // find the entry by name, rewrite its keyBytes with bumped sizes.
-            guard let allocAttr = parentAttrs.first(where: {
-                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-            }), case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
+            // v0.7 AC-5: route through the merge so the size-hint update walks
+            // every VCN range when $INDEX_ALLOCATION is multi-extension.
+            guard let allocAttr = try mergeMultiExtensionAttribute(
+                in: parentAttrs,
+                rawType: AttributeType.indexAllocation.rawValue,
+                name: "$I30"
+            ), case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
                 return
             }
             // Build the new $FILE_NAME body with bumped sizes — same length
@@ -6334,9 +6508,14 @@ public actor Volume {
         directoryRecord: UInt64,
         seenReferences: inout Set<UInt64>
     ) async throws -> [DirectoryEntry] {
-        guard let allocAttr = attributes.first(where: {
-            $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-        }) else {
+        // v0.7 AC-5: route through the merge so directory enumeration walks
+        // every VCN range when $INDEX_ALLOCATION is multi-extension — pre-fix
+        // this was the canonical "19 of 416 names missing" half-read bug site.
+        guard let allocAttr = try mergeMultiExtensionAttribute(
+            in: attributes,
+            rawType: AttributeType.indexAllocation.rawValue,
+            name: "$I30"
+        ) else {
             // LARGE_INDEX flag set but no $INDEX_ALLOCATION present in
             // directory record \(directoryRecord) — treat as a fixture quirk;
             // the entries we already have from $INDEX_ROOT are still valid.
