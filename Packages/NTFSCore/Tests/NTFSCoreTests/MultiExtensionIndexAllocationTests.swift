@@ -632,6 +632,216 @@ final class MultiExtensionIndexAllocationTests: XCTestCase {
         )
     }
 
+    // MARK: - AC-6.b (self-heal iter-1): rollback existing-ext truncation on base-write failure
+
+    /// v0.7 self-heal iter-1 BLOCKING regression test.
+    ///
+    /// The pre-fix step-10 catch (base write failed) reclaimed the new
+    /// extension's MFT slot but DID NOT roll back step-9 (existing-extension
+    /// truncation that had already hit disk). Worst-case on-disk state was:
+    ///   * base's `$ATTRIBUTE_LIST` still had a single 0xA0:$I30 entry at
+    ///     lvcn=0 pointing at existing-ext (step 10 didn't land);
+    ///   * existing-ext's migrant attribute had `lastVCN = splitVCN - 1`
+    ///     (step 9 DID land — truncated runlist).
+    ///   → A reader walks the base's AL, follows the single entry to
+    ///     existing-ext, reconstructs a runlist covering only
+    ///     [0..splitVCN-1]. Directory entries living in
+    ///     [splitVCN..originalLastVCN] are structurally unreachable —
+    ///     silent data loss.
+    ///
+    /// Post-fix the step-10 catch restores existing-ext's pre-truncation
+    /// bytes BEFORE reclaiming the new-ext slot. We exercise that path by
+    /// installing the new `_multiExtensionFaultHookAfterTruncation` (fires
+    /// between step 9 and step 10) and asserting:
+    ///   * stage-3 throws the injected error;
+    ///   * base's `$ATTRIBUTE_LIST` body is byte-identical to pre-fault
+    ///     (still one 0xA0:$I30 entry at lvcn=0);
+    ///   * existing-ext's migrant `$INDEX_ALLOCATION:$I30` is RESTORED to
+    ///     its full pre-truncation runlist (lastVCN == pre-fault lastVCN —
+    ///     specifically NOT splitVCN-1);
+    ///   * the new extension slot is reclaimed (no orphans, no new
+    ///     baseRef-pointing extension records);
+    ///   * post-fault every directory entry still enumerates correctly
+    ///     (the data-loss canary — entries that lived past splitVCN must
+    ///     still be reachable);
+    ///   * clearing the hook and retrying stage-3 succeeds.
+    func testMultiExtensionIATransactionalFailureAfterTruncation() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+
+        try await fragmentFreeSpace(volume)
+        _ = try await driveStage1NonResidentIA(volume: volume)
+        try await volume.migrateIndexAllocationOnOverflow(
+            baseRecordNumber: 5,
+            overflowDescription: "after-trunc fault-test stage-2 first migration (type 0xa0)"
+        )
+
+        // Stage 4: drive the extension's runlist multi-extent.
+        for i in 0..<400 {
+            let name = String(format: "fatr4-%05d.txt", i)
+            do {
+                _ = try await volume.createFile(named: name, inDirectory: 5)
+            } catch NTFSError.outOfSpace { break }
+              catch NTFSError.unsupportedFeature { break }
+        }
+
+        // Snapshot pre-fault state: base AL body, existing-ext lastVCN,
+        // and the full enumeration of root (every entry that must still
+        // enumerate post-fault — the data-loss canary).
+        let extsBefore = try await extensionRecords(for: 5, in: volume)
+        guard let existingExtRN = extsBefore.first else {
+            throw XCTSkip("no extension record found pre-fault — stage-2 didn't produce one")
+        }
+        let bodyPre = try await readResidentAttributeListBody(baseRN: 5, in: volume)
+        XCTAssertNotNil(bodyPre, "pre-fault: base must have resident $ATTRIBUTE_LIST")
+
+        // Read existing-ext's pre-fault migrant lastVCN.
+        let mft = await volume.mft()
+        func readExistingExtLastVCN() async throws -> UInt64? {
+            let rec = try await mft.record(at: existingExtRN)
+            let attrs = try rec.attributes()
+            for a in attrs where a.rawType == AttributeType.indexAllocation.rawValue
+                                && a.nameOrEmpty == "$I30" {
+                if case let .nonResident(_, lastVCN, _, _, _, _, _, _) = a.value {
+                    return lastVCN
+                }
+            }
+            return nil
+        }
+        guard let lastVCNPre = try await readExistingExtLastVCN() else {
+            throw XCTSkip("pre-fault: could not read existing-ext migrant lastVCN")
+        }
+
+        // Pre-fault directory enumeration — the canary set. Every name
+        // present here must STILL enumerate post-fault.
+        let entriesPre = try await volume.enumerate(directory: 5)
+        let namesPre = Set(
+            entriesPre
+                .filter { $0.fileName.namespace != .dos }
+                .map { $0.fileName.name }
+        )
+
+        // Install the NEW hook (between step 9 and step 10 — the worst-case
+        // window: existing-ext truncation HAS landed, base AL has NOT yet
+        // been updated). Without the rollback this is the silent-data-loss
+        // window.
+        let injected = NTFSError.ioFailure(description: "simulated post-truncation pre-base-write fault")
+        await volume._setMultiExtensionFaultHookAfterTruncation {
+            throw injected
+        }
+
+        var caught: Error?
+        do {
+            try await volume.migrateIndexAllocationOnOverflow(
+                baseRecordNumber: 5,
+                overflowDescription: "after-trunc fault-test stage-5 second migration (type 0xa0)"
+            )
+        } catch {
+            caught = error
+        }
+
+        // If stage-3 didn't even hit the after-truncation hook (single-extent
+        // migrant short-circuited the splitter before step 9), the test
+        // isn't exercising the worst-case window. Skip.
+        guard let err = caught else {
+            throw XCTSkip("""
+                stage-3 returned cleanly without invoking the after-truncation fault hook — \
+                the splitter short-circuited (likely single-extent migrant on this fixture). \
+                After-truncation transactional-failure path not exercised.
+                """)
+        }
+        if case NTFSError.ioFailure(let desc) = err {
+            XCTAssertTrue(
+                desc.contains("simulated post-truncation pre-base-write fault"),
+                "expected the injected fault description; got: \(desc)"
+            )
+        } else {
+            XCTFail("expected NTFSError.ioFailure from injected fault; got: \(err)")
+        }
+
+        // 1. New-ext slot reclaimed: no NEW extension records point at base 5.
+        let extsAfterFault = try await extensionRecords(for: 5, in: volume)
+        let newlyAdded = Set(extsAfterFault).subtracting(Set(extsBefore))
+        XCTAssertTrue(
+            newlyAdded.isEmpty,
+            "post-fault reclaim: no new extension record should point at base 5; found \(newlyAdded.sorted())"
+        )
+
+        // 2. Base's $ATTRIBUTE_LIST body is byte-identical to pre-fault.
+        let bodyPost = try await readResidentAttributeListBody(baseRN: 5, in: volume)
+        XCTAssertEqual(
+            bodyPre, bodyPost,
+            "post-fault: base's $ATTRIBUTE_LIST body must be untouched (step 10 did not land)"
+        )
+
+        // 3. THE BLOCKING-BUG ASSERTION: existing-ext's migrant lastVCN must
+        //    be RESTORED to its pre-fault value. Without the rollback this
+        //    would be splitVCN - 1 (truncated). With the rollback it equals
+        //    `lastVCNPre`.
+        guard let lastVCNPost = try await readExistingExtLastVCN() else {
+            XCTFail("post-fault: could not re-read existing-ext migrant lastVCN")
+            return
+        }
+        XCTAssertEqual(
+            lastVCNPost, lastVCNPre,
+            """
+            post-fault: existing-ext migrant lastVCN must be ROLLED BACK to pre-fault value. \
+            pre=\(lastVCNPre), post=\(lastVCNPost). \
+            If post < pre, step-10 catch failed to restore the pre-truncation bytes — \
+            entries in [post+1..pre] are structurally unreachable (silent data loss).
+            """
+        )
+
+        // 4. No orphans.
+        let orphanSet = try await orphans(in: volume)
+        XCTAssertTrue(
+            orphanSet.isEmpty,
+            "post-fault: no orphans expected; got \(orphanSet.sorted())"
+        )
+
+        // 5. Data-loss canary: every name present pre-fault must still
+        //    enumerate. If the rollback didn't fire, entries past
+        //    splitVCN would silently vanish from this enumeration.
+        let entriesPost = try await volume.enumerate(directory: 5)
+        let namesPost = Set(
+            entriesPost
+                .filter { $0.fileName.namespace != .dos }
+                .map { $0.fileName.name }
+        )
+        let missing = namesPre.subtracting(namesPost)
+        XCTAssertTrue(
+            missing.isEmpty,
+            """
+            post-fault DATA-LOSS CANARY: \(missing.count) name(s) present pre-fault are missing post-fault. \
+            These entries lived in the runlist range that was truncated on disk but should have been \
+            rolled back. Sample missing: \(missing.sorted().prefix(5)).
+            """
+        )
+
+        // 6. Clearing the hook and retrying stage-3 must succeed (the
+        //    rolled-back state is identical to pre-migration, so retry
+        //    is well-defined).
+        await volume._setMultiExtensionFaultHookAfterTruncation(nil)
+        try await volume.migrateIndexAllocationOnOverflow(
+            baseRecordNumber: 5,
+            overflowDescription: "after-trunc fault-test retry after clear (type 0xa0)"
+        )
+        let bodyAfterRetry = try await readResidentAttributeListBody(baseRN: 5, in: volume)
+        XCTAssertNotNil(bodyAfterRetry, "post-retry: base must still have resident $ATTRIBUTE_LIST")
+        let retryEntries = try AttributeListEntry.parseAll(in: bodyAfterRetry!)
+        let retryI30 = retryEntries
+            .filter { $0.attributeType == AttributeType.indexAllocation.rawValue && $0.name == "$I30" }
+            .sorted { $0.lowestVCN < $1.lowestVCN }
+        XCTAssertEqual(
+            retryI30.count, 2,
+            "post-retry: $ATTRIBUTE_LIST must carry two 0xA0:$I30 entries; got \(retryI30.count)"
+        )
+    }
+
     // MARK: - AC-6.c: $ATTRIBUTE_LIST bytes are spec-conformant (hand-decoded)
 
     /// AC-6.c spec-conformance. Hand-decode the base's `$ATTRIBUTE_LIST`

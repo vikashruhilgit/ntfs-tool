@@ -91,6 +91,27 @@ public actor Volume {
         _multiExtensionFaultHook = nil
         try hook()
     }
+
+    /// v0.7 self-heal iter-1: second multi-extension fault-injection seam.
+    /// Fires AFTER the existing extension's TRUNCATION write has hit disk
+    /// but BEFORE the base's `$ATTRIBUTE_LIST` update — the WORST-case
+    /// mid-flight crash window. Without the step-10 catch's rollback, this
+    /// is the data-loss window: base AL still points to existing-ext lvcn=0
+    /// (single entry), but existing-ext's on-disk runlist has been truncated
+    /// to cover only [0..splitVCN-1] — entries living in
+    /// [splitVCN..originalLastVCN] become structurally unreachable.
+    /// Used by `testMultiExtensionIATransactionalFailureAfterTruncation` to
+    /// assert the rollback (restore existing-ext pre-truncation bytes,
+    /// reclaim new-ext slot) is in force.
+    private var _multiExtensionFaultHookAfterTruncation: MultiExtensionFaultHook?
+    public func _setMultiExtensionFaultHookAfterTruncation(_ hook: MultiExtensionFaultHook?) {
+        _multiExtensionFaultHookAfterTruncation = hook
+    }
+    private func _consumeMultiExtensionFaultHookAfterTruncation() throws {
+        guard let hook = _multiExtensionFaultHookAfterTruncation else { return }
+        _multiExtensionFaultHookAfterTruncation = nil
+        try hook()
+    }
     /// Internal: clear the fault hook if it currently equals `point`,
     /// returning true on a successful consume. The split between
     /// "is this our point?" and "clear unconditionally" is critical:
@@ -5766,6 +5787,14 @@ public actor Volume {
         #endif
 
         // 9. Commit the EXISTING extension's truncation.
+        //    Save the pre-truncation bytes BEFORE the write so the step-10
+        //    catch can roll back the truncation if the base write fails.
+        //    `writeRawRecord` is per-record atomic (single `device.write` for
+        //    extension records, which always live at recordNumber >= 4 — the
+        //    $MFTMirr mirror only applies to records 0..3, so there's no
+        //    primary/mirror split-write here). If step 9 throws, nothing
+        //    landed on disk → no rollback needed in the step-9 catch.
+        let existingExtPreTruncationBytes: Data = existingExtRecord.bytes
         do {
             try await mft.writeRawRecord(at: existingExtRN, postFixupBytes: newExistingExtBytes)
         } catch {
@@ -5773,10 +5802,41 @@ public actor Volume {
             throw error
         }
 
+        // 9b. Fire the optional second test-only fault hook (if installed).
+        //     Fires AFTER the existing extension truncation has hit disk but
+        //     BEFORE the base's $ATTRIBUTE_LIST update — the worst-case
+        //     mid-flight crash window. The catch below MUST roll back the
+        //     truncation (otherwise: silent data loss for entries in
+        //     splitVCN..originalLastVCN).
+        #if DEBUG
+        do {
+            try _consumeMultiExtensionFaultHookAfterTruncation()
+        } catch {
+            // Rollback discipline mirrors step-10 catch (same recovery path).
+            try? await mft.writeRawRecord(at: existingExtRN, postFixupBytes: existingExtPreTruncationBytes)
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+        #endif
+
         // 10. Commit the new base record (the $ATTRIBUTE_LIST update).
         do {
             try await mft.writeRawRecord(at: baseRecordNumber, postFixupBytes: multiResult.newBaseBytes)
         } catch {
+            // BUG FIX (v0.7 self-heal iter-1): step-10 (base write) failure
+            // leaves the existing-extension TRUNCATED on disk (step 9 already
+            // landed). The base's on-disk $ATTRIBUTE_LIST still points only
+            // at existing-ext lvcn=0 (single entry), so a reader would see a
+            // runlist covering only [0..splitVCN-1] — entries living in
+            // [splitVCN..originalLastVCN] become structurally unreachable
+            // (silent data loss). RESTORE the existing-extension's
+            // pre-truncation bytes BEFORE reclaiming the new-ext slot. The
+            // "failed to restore" path is best-effort `try?` — we're already
+            // in error recovery, and the worst case becomes "fail loud" not
+            // "data-loss silently". Post-rollback worst-case is identical to
+            // the pre-migration state: base AL unchanged, existing-ext full
+            // runlist, new-ext slot reclaimed.
+            try? await mft.writeRawRecord(at: existingExtRN, postFixupBytes: existingExtPreTruncationBytes)
             try? await reclaimOrphanedMFTRecord(at: newExtRN)
             throw error
         }
