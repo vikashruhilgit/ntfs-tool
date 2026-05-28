@@ -382,10 +382,15 @@ final class AttributeListMigrationTests: XCTestCase {
         let recordBytes = try builder.build()
 
         // (1) Pure-builder discrimination: the migration builder rejects a
-        //     base record lacking the requested migrant with a clean
-        //     `corruptOnDisk`. The generalized builder names the missing
-        //     type/name in its guard (the wrapper requests type 0xA0 / "$I30").
-        //     This proves we won't silently no-op or mis-migrate.
+        //     base record lacking the requested migrant. The MFTRecordBuilder
+        //     above produces a record with $STANDARD_INFORMATION + $FILE_NAME
+        //     only — NO $INDEX_ALLOCATION and NO $ATTRIBUTE_LIST — which is
+        //     the "genuinely unexpected" branch of the precondition guard
+        //     (programmer-error / real corruption). Stays as `corruptOnDisk`.
+        //     Distinct from the "already migrated to extension" branch, which
+        //     is the user-facing multi-extension-$INDEX_ALLOCATION case and
+        //     throws a clean `unsupportedFeature` — covered separately by
+        //     `testMigrationOfAlreadyMigratedAttributeThrowsUnsupported`.
         var threwExpected = false
         do {
             _ = try AttributeMigration.buildIndexAllocationMigration(
@@ -398,12 +403,13 @@ final class AttributeListMigrationTests: XCTestCase {
                 sectorSize: sectorSize
             )
         } catch NTFSError.corruptOnDisk(let desc) where
-            desc.contains("no attribute type 0xa0 name '$I30' to migrate") {
+            desc.contains("no attribute type 0xA0 name '$I30' to migrate")
+            && desc.contains("no $ATTRIBUTE_LIST to redirect via") {
             threwExpected = true
         } catch {
-            XCTFail("expected corruptOnDisk naming the missing 0xa0/'$I30' migrant; got \(error)")
+            XCTFail("expected corruptOnDisk naming the missing 0xA0/'$I30' migrant AND the absent $ATTRIBUTE_LIST; got \(error)")
         }
-        XCTAssertTrue(threwExpected, "migration builder must refuse records without $INDEX_ALLOCATION:$I30")
+        XCTAssertTrue(threwExpected, "migration builder must refuse records without $INDEX_ALLOCATION:$I30 OR $ATTRIBUTE_LIST as a real corruption signal")
 
         // (2) Discrimination-guard format: synthesize the overflow throw's
         //     ", type 0xHEX" suffix for each non-$INDEX_ALLOCATION type
@@ -439,7 +445,119 @@ final class AttributeListMigrationTests: XCTestCase {
         )
     }
 
+    /// v0.7 cap surfaced on the 2026-05-28 clean-baseline hardware run at
+    /// file 7,997 (`$INDEX_ALLOCATION` migrated to an extension record, then
+    /// the extension record's runlist itself overflowed). The pre-fix throw
+    /// was the misleading `corruptOnDisk(... "no attribute type 0xa0 ... to
+    /// migrate")` which scared users into running chkdsk on a perfectly
+    /// consistent volume. Post-fix: a clean `unsupportedFeature` naming the
+    /// workaround (split the directory) and the tracking version (v0.7).
+    ///
+    /// This synthesizes the smallest input that reproduces the branch:
+    /// a record whose attribute stream contains a `$ATTRIBUTE_LIST` but
+    /// NO `$INDEX_ALLOCATION:$I30` migrant — exactly the post-first-migration
+    /// state that `migrateIndexAllocationOnOverflow` is invoked against
+    /// when the second extension overflows.
+    func testAlreadyMigratedAttributeThrowsUnsupportedNotCorrupt() throws {
+        let recordSize = 1024
+        let sectorSize = 512
+
+        let bytes = Self.makeSyntheticBaseRecordWithAttributeListNoMigrant(
+            recordSize: recordSize
+        )
+
+        var threwUnsupported = false
+        var observed: Error?
+        do {
+            _ = try AttributeMigration.buildIndexAllocationMigration(
+                baseRecordBytes: bytes,
+                baseRN: 42,
+                baseSeq: 7,
+                extRN: 99,
+                extSeq: 1,
+                recordSize: recordSize,
+                sectorSize: sectorSize
+            )
+        } catch NTFSError.unsupportedFeature(let desc) {
+            threwUnsupported = true
+            // The user-facing message must:
+            //  - name the structural cause (multi-extension)
+            //  - give a concrete workaround (split into subdirectories)
+            //  - reference the tracking version so users know it's named
+            XCTAssertTrue(
+                desc.contains("multi-extension"),
+                "message must mention multi-extension growth: \(desc)"
+            )
+            XCTAssertTrue(
+                desc.lowercased().contains("split"),
+                "message must mention the split-into-subdirectories workaround: \(desc)"
+            )
+            XCTAssertTrue(
+                desc.contains("v0.7"),
+                "message must reference the v0.7 tracking item: \(desc)"
+            )
+            // Explicitly NOT the corruptOnDisk vocabulary that scares users
+            // into chkdsk on a healthy volume.
+            XCTAssertFalse(
+                desc.lowercased().contains("corrupt"),
+                "user-facing message must not use 'corrupt' wording: \(desc)"
+            )
+        } catch {
+            observed = error
+        }
+        XCTAssertTrue(
+            threwUnsupported,
+            "expected NTFSError.unsupportedFeature with multi-extension hint; got: \(observed.map { "\($0)" } ?? "no throw")"
+        )
+    }
+
     // MARK: - helpers
+
+    /// Build a minimal MFT record whose attribute stream contains a single
+    /// resident $ATTRIBUTE_LIST (24-byte header, empty body) followed by
+    /// the 0xFFFFFFFF end marker. NOT a complete NTFS record (no USA
+    /// fixup, no $STANDARD_INFORMATION, etc.) — sufficient ONLY for
+    /// `AttributeMigration.scanAttributes`, which walks raw attribute
+    /// headers from `firstAttributeOffset` and only inspects the type
+    /// nibble. Used by `testAlreadyMigratedAttributeThrowsUnsupportedNotCorrupt`
+    /// to exercise the "$ATTRIBUTE_LIST present but migrant absent" branch
+    /// of buildAttributeMigration without standing up a real fixture
+    /// volume + driving the leaf-split twice.
+    private static func makeSyntheticBaseRecordWithAttributeListNoMigrant(recordSize: Int) -> Data {
+        var data = Data(count: recordSize)
+        // Header fields scanAttributes consults:
+        //   firstAttributeOffset (u16) at byte 20
+        //   usedSize             (u32) at byte 24
+        let firstAttrOffset: UInt16 = 64
+        let attrLength: UInt32 = 24     // 16-byte common header + 8-byte resident extension
+        let usedSize: UInt32 = UInt32(firstAttrOffset) + attrLength + 4   // attr + end marker
+        MFTRecord.writeU16LE(into: &data, at: 20, value: firstAttrOffset)
+        MFTRecord.writeU32LE(into: &data, at: 24, value: usedSize)
+
+        // Attribute stream at offset 64: $ATTRIBUTE_LIST resident, empty body.
+        //   Common header (16 bytes):
+        //     type(4)=0x20, length(4)=24, nonRes(1)=0, nameLen(1)=0,
+        //     nameOff(2)=0, flags(2)=0, attrID(2)=0
+        //   Resident extension (8 bytes):
+        //     valueLen(4)=0, valueOff(2)=24, indexedFlag(1)=0, pad(1)=0
+        let attrAt = Int(firstAttrOffset)
+        MFTRecord.writeU32LE(into: &data, at: attrAt + 0,  value: 0x20)         // type = $ATTRIBUTE_LIST
+        MFTRecord.writeU32LE(into: &data, at: attrAt + 4,  value: attrLength)   // length = 24
+        data[data.startIndex + attrAt + 8]  = 0                                  // nonResident = 0 (resident)
+        data[data.startIndex + attrAt + 9]  = 0                                  // nameLength
+        MFTRecord.writeU16LE(into: &data, at: attrAt + 10, value: 0)             // nameOffset
+        MFTRecord.writeU16LE(into: &data, at: attrAt + 12, value: 0)             // flags
+        MFTRecord.writeU16LE(into: &data, at: attrAt + 14, value: 0)             // attrID
+        MFTRecord.writeU32LE(into: &data, at: attrAt + 16, value: 0)             // valueLength = 0
+        MFTRecord.writeU16LE(into: &data, at: attrAt + 20, value: 24)            // valueOffset = 24
+        data[data.startIndex + attrAt + 22] = 0                                  // indexedFlag
+        data[data.startIndex + attrAt + 23] = 0                                  // pad
+
+        // End marker
+        MFTRecord.writeU32LE(into: &data, at: attrAt + Int(attrLength), value: 0xFFFF_FFFF)
+
+        return data
+    }
 
     private func countInUseRecords(mft: MFT, maxRN: UInt64 = 512) async throws -> Int {
         var count = 0
