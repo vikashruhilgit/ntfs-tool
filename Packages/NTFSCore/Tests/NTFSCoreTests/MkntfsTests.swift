@@ -133,3 +133,40 @@ final class MkntfsTests: XCTestCase {
         XCTAssertLessThan(geom.bitmapStartLCN + geom.bitmapClusterCount, geom.bootBackupStartLCN)
     }
 }
+
+/// AC-9 — safety: format must throw if the underlying device is opened
+/// read-only (rather than silently no-op'ing).
+final class MkntfsSafetyTests: XCTestCase {
+
+    func testFormatRefusesReadOnlyDevice() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+        let path = tmpDir.appendingPathComponent("mkntfs-readonly-\(UUID().uuidString).img").path
+        FileManager.default.createFile(atPath: path, contents: nil)
+        let h = FileHandle(forWritingAtPath: path)!
+        try h.truncate(atOffset: 256 * 1024 * 1024)
+        try h.close()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        // Open READ-ONLY.
+        let roDevice = try FileHandleBlockDevice(openingFileAt: path)
+        let size = try await roDevice.size()
+        XCTAssertGreaterThan(size, 0, "size() must work on read-only handles")
+
+        // formatNTFS must surface readOnlyDevice on first write.
+        do {
+            try await Volume.formatNTFS(device: roDevice, deviceSizeBytes: size, label: "RO")
+            XCTFail("formatNTFS should have thrown on read-only device")
+        } catch NTFSError.readOnlyDevice {
+            // expected
+        } catch {
+            XCTFail("expected readOnlyDevice, got \(error)")
+        }
+    }
+
+    func testGeometryRejectsTinyDevice() {
+        // 4 MiB — well below the 16 MiB minimum.
+        XCTAssertThrowsError(
+            try Mkntfs.planGeometry(deviceSizeBytes: 4 * 1024 * 1024, options: Mkntfs.Options())
+        )
+    }
+}

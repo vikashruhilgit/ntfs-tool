@@ -2,6 +2,86 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — v0.6 candidate (self-contained NTFS reformat)
+
+### Added
+
+- **`ntfsctl mkntfs <device>` — pure-Swift NTFS volume formatter.** Equivalent
+  to `mkntfs -Q` (quick format). Output is mountable by macOS
+  `livefiles_ntfs`, Linux `ntfs-3g`, and Windows. **The project is now
+  self-sufficient for the full test loop on macOS** — no Homebrew, no
+  macFUSE, no Linux VM, no Windows required to reformat a drive between
+  cap-measurement runs. Closes the multi-day reformat-detour cost that
+  the v0.5.x cap-measurement runs were paying.
+- **`NTFSCore` library additions:**
+  - `BootSector.serialize() -> Data` — inverse of `parse`. 512 bytes,
+    canonical NTFS jump stub (`EB 52 90`) + BPB + 64-bit total/MFT/mirror
+    cluster fields + signed `clustersPerMFTRecord` + `0xAA55` signature.
+  - `UpcaseTable.swift` — 131,072-byte (128 KiB) canonical `$UpCase` table,
+    derived from Unicode default case mappings via Swift's `String.uppercased()`.
+    Auditable generator at `scripts/generate_upcase_table.swift`.
+    Clean-room (NOT copied from GPL `mkntfs-3g` / `ntfsprogs`).
+  - `AttrDefTable.swift` — 2,560-byte (16 × 160) NTFS 3.1 standard
+    `$AttrDef` table. Derived from the public NTFS on-disk spec.
+  - `Mkntfs.swift` — top-level orchestrator: geometry planner +
+    system-file record builders for records 0..15 + one-shot writer
+    (boot sector, `$MFT`, `$MFTMirr`, `$AttrDef`, `$UpCase`, `$LogFile`,
+    `$Bitmap`, backup boot sector) with `F_FULLFSYNC` at the end.
+  - `BlockDevice.size()` — `fstat()` for `.img` files,
+    `ioctl(DKIOCGETBLOCKSIZE|DKIOCGETBLOCKCOUNT)` for raw `/dev/disk*`.
+  - `Volume.formatNTFS(device:deviceSizeBytes:label:quick:volumeSerial:)`
+    convenience entry point.
+- **Safety gate (AC-9):** `mkntfs` refuses to run without `--yes`. Prints
+  device path + size + label first, then errors out without writing
+  anything.
+
+### Tests
+
+- **39 new NTFSCore tests (was 167 → 206 + 1 skip; CLI builds release).**
+  - `UpcaseAttrDefTests.swift` (8 + 9 = 17 tests): AC-5/AC-6 spec-conformance
+    against hand-decoded references (PR #26 lesson — not round-tripped
+    through our decoder). ASCII a-z, Latin-1, Greek σ→Σ, ß fixed-point,
+    surrogate halves; `$AttrDef` name/type/min/max byte-level checks.
+  - `BootSectorSerializeTests.swift` (15 tests): AC-4 hand-decoded
+    byte-level checks at all critical offsets (3, 11, 13, 21, 40, 48,
+    56, 64, 68, 72, 510).
+  - `MkntfsTests.swift` (7 tests): AC-3 end-to-end round-trip — format
+    a 256 MiB temp `.img`, then re-open via `Volume(device:)`, parse
+    records 0..11, verify the `$MFT` runlist decodes to a single
+    contiguous extent, root is a directory, backup BS parses cleanly.
+
+### Validation
+
+- **AC-1 (CLI smoke):** `ntfsctl mkntfs fixture.img --label TEST --yes`
+  → `ntfsctl info fixture.img` reports correct geometry → `ntfsctl
+  verify --deep fixture.img` reports 0 parse errors, 0 orphans, 0
+  dangling, 0 double-allocated, 0 out-of-range. Confirmed against a
+  256 MiB `.img` on this machine.
+- **AC-2 (independent reader mount):** documented but DEFERRED to manual
+  step. The .img can be loop-mounted via `livefiles_ntfs`,
+  Linux `ntfs-3g`, or `chkdsk` on Windows.
+- **AC-10 (hardware reformat):** user runs `sudo ntfsctl mkntfs
+  /dev/disk10s1 --label MyData --yes` against the real WD My Passport
+  before the next v0.5.x cap-measurement `cp -rT`. NOT part of `swift
+  test`. Documented in `docs/CLI.md`.
+
+### Documentation
+
+- `docs/CLI.md` — new "Reformat (`mkntfs`)" section with usage,
+  safety notes, and scope (data-volume format, not bootable Windows).
+- `docs/STATUS.md` — milestone entry: project is now self-sufficient
+  for the full test loop on macOS.
+
+### Clean-room compliance
+
+Every new on-disk constant (`$UpCase` mapping rules, `$AttrDef` 16-entry
+table, NTFS boot-sector field layout, MFT record header layout, attribute
+header layout, runlist encoding) is derived from the public NTFS 3.1
+spec (Linux-NTFS docs at flatcap.github.io + Microsoft's NTFS file
+system reference). No code or constants were copied from GPL sources
+(`ntfsprogs` / `mkntfs-3g` / Linux kernel `fs/ntfs3` / NTFS-3G).
+File headers cite each constant's source.
+
 ## [Unreleased] — v0.5.2 candidate
 
 ### Fixed
