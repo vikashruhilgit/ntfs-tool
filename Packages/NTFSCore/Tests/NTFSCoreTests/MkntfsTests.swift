@@ -64,6 +64,26 @@ final class MkntfsTests: XCTestCase {
             let attrs = try rec.attributes()
             XCTAssertGreaterThanOrEqual(attrs.count, 3, "record \(rn) attribute count")
         }
+
+        // Deep verifier sweep — same audit `verify --deep` runs from the
+        // CLI. Cross-checks every in-use base record's $DATA runlist
+        // against the volume $Bitmap and detects free-but-referenced /
+        // out-of-range / double-allocated clusters. This is the
+        // regression guard for the v0.6 self-heal fixes (see Mkntfs.swift):
+        //   - $BadClus:$Bad realSize == volume bytes (was 0)
+        //   - $MFT:$BITMAP covers full MFT region (was clamped to 8 B
+        //     resident, which would silently corrupt the MFT once any
+        //     allocation past record 64 happened).
+        // A shallow attrs-count check would not catch either.
+        let audit = try await volume.auditAllDataRunlistsAgainstBitmap(maxRecords: 0)
+        XCTAssertTrue(
+            audit.isClean,
+            "deep audit must be clean — freeButReferenced=\(audit.freeButReferencedClusters), outOfRange=\(audit.outOfRangeClusters), doubleAllocated=\(audit.doubleAllocatedClusters), unreadable=\(audit.unreadableRecords.count); per-record anomalies: \(audit.perRecordAnomalies.prefix(5))"
+        )
+        XCTAssertEqual(audit.freeButReferencedClusters, 0, "no referenced cluster should be marked free in $Bitmap")
+        XCTAssertEqual(audit.outOfRangeClusters, 0, "no referenced cluster should be out of volume range")
+        XCTAssertEqual(audit.doubleAllocatedClusters, 0, "no cluster should be claimed by two distinct files")
+        XCTAssertTrue(audit.unreadableRecords.isEmpty, "every in-use record must be auditable: \(audit.unreadableRecords)")
     }
 
     func testFormatProducesValidMFTDataRunlist() async throws {

@@ -88,6 +88,13 @@ public enum Mkntfs {
         public let bootBackupSectorLBA: UInt64         // device offset = last sector
         public let bitmapStartLCN: UInt64
         public let bitmapClusterCount: UInt64
+        // $MFT:$BITMAP region — must cover the full MFT region (one bit
+        // per MFT record across the entire $MFT $DATA allocation), not
+        // just the initial system-file records. Held non-resident in a
+        // dedicated cluster region so it can grow past the resident
+        // attribute budget of a 1024 B MFT record.
+        public let mftBitmapStartLCN: UInt64
+        public let mftBitmapClusterCount: UInt64
         public let volumeSerial: UInt64
 
         public var totalClusterBytes: UInt64 { UInt64(bytesPerCluster) * totalClusters }
@@ -163,6 +170,14 @@ public enum Mkntfs {
         let mftMirrorClusters: UInt64 = 1  // mirrors first 4 MFT records = 4 KiB
         let mftMirrorStart = nextLCN
         nextLCN += mftMirrorClusters
+        // $MFT $BITMAP region — sized to cover the full $MFT region (one
+        // bit per MFT record). For an initial 16 MiB MFT @ 1024 B/record
+        // this is 16384 records → 2048 bytes; rounded up to one cluster.
+        let mftRecordsRepresented = (mftClusters * clusterBytes) / UInt64(options.mftRecordSize)
+        let mftBitmapByteCount = (mftRecordsRepresented + 7) / 8
+        let mftBitmapClusters = max(UInt64(1), (mftBitmapByteCount + clusterBytes - 1) / clusterBytes)
+        let mftBitmapStart = nextLCN
+        nextLCN += mftBitmapClusters
         // $LogFile: mkntfs -Q caps at 64 MiB; min size matches mkntfs's
         // table — for our 256 MiB tests, 1 MiB is plenty and matches the
         // brief's "match mkntfs-3g -Q's default" guidance for tiny images.
@@ -220,6 +235,8 @@ public enum Mkntfs {
             bootBackupSectorLBA: backupBsLBA,
             bitmapStartLCN: bitmapStart,
             bitmapClusterCount: bitmapClusters,
+            mftBitmapStartLCN: mftBitmapStart,
+            mftBitmapClusterCount: mftBitmapClusters,
             volumeSerial: serial
         )
     }
@@ -279,6 +296,7 @@ public enum Mkntfs {
         // --- 5. System-file data streams.
         let logFile = makeLogFile(size: Int(geom.logFileSize))
         let bitmap = makeVolumeBitmap(geom: geom)
+        let mftBitmap = makeMFTBitmap(geom: geom)
 
         // --- 6. Write everything. Order: sector 0, MFT region, mirror,
         // attrdef, upcase, logfile, bitmap, backup boot.
@@ -306,6 +324,11 @@ public enum Mkntfs {
         try await device.write(
             offset: UInt64(geom.bytesPerCluster) * geom.bitmapStartLCN,
             bytes: bitmap
+        )
+        // $MFT $BITMAP data — non-resident, in its dedicated cluster region.
+        try await device.write(
+            offset: UInt64(geom.bytesPerCluster) * geom.mftBitmapStartLCN,
+            bytes: mftBitmap
         )
         // Backup boot sector — at the LAST SECTOR of the volume.
         try await device.write(
@@ -339,7 +362,7 @@ public enum Mkntfs {
                 recordNumber: recordNumber,
                 fileName: fileName,
                 isDirectory: isDirectory,
-                parentReference: packMFTReference(rn: 5, seq: 5),  // root parent
+                parentReference: packMFTReference(rn: 5, seq: 1),  // root parent
                 extraAttributes: extraAttributes,
                 now: now
             )
@@ -356,12 +379,20 @@ public enum Mkntfs {
             extents: [Extent(startLCN: geom.mftStartLCN, clusterCount: geom.mftClusterCount)],
             typeOverride: AttributeType.data.rawValue
         )
-        let mftBitmapBytes = makeMFTBitmap(geom: geom)
-        let mftBitmapAttr = serializeResidentAttribute(
-            type: AttributeType.bitmap.rawValue,
-            attrID: 4,
-            attrName: nil,
-            body: mftBitmapBytes
+        // $MFT $BITMAP — non-resident, covering the full MFT region.
+        // realSize is the exact number of bytes needed to hold one bit
+        // per MFT record across the entire $MFT $DATA allocation;
+        // allocatedSize is the cluster-aligned reservation. See
+        // makeMFTBitmap for why this MUST NOT be a resident 8-byte stub.
+        let mftRecordsRepresented = (geom.mftClusterCount * UInt64(geom.bytesPerCluster)) / UInt64(geom.mftRecordSize)
+        let mftBitmapRealSize: UInt64 = (mftRecordsRepresented + 7) / 8
+        let mftBitmapAllocSize: UInt64 = geom.mftBitmapClusterCount * UInt64(geom.bytesPerCluster)
+        let mftBitmapAttr = serializeNonResidentDataAttribute(
+            attrID: 4, flags: 0, attrName: nil,
+            realSize: mftBitmapRealSize,
+            allocatedSize: mftBitmapAllocSize,
+            extents: [Extent(startLCN: geom.mftBitmapStartLCN, clusterCount: geom.mftBitmapClusterCount)],
+            typeOverride: AttributeType.bitmap.rawValue
         )
         out[0] = try sysRecord(
             recordNumber: 0,
@@ -439,7 +470,7 @@ public enum Mkntfs {
             recordNumber: 5,
             fileName: ".",
             isDirectory: true,
-            parentReference: packMFTReference(rn: 5, seq: 5),  // root's parent is itself
+            parentReference: packMFTReference(rn: 5, seq: 1),  // root's parent is itself
             extraAttributes: [rootIndexRoot],
             now: now
         )
@@ -478,10 +509,17 @@ public enum Mkntfs {
             attrID: 3, attrName: nil, body: Data()
         )
         // Sparse $DATA:$Bad covering the entire volume.
+        // Canonical NTFS sparse "no known bad clusters": realSize and
+        // allocatedSize are the full volume byte length so the stream
+        // logically spans every cluster, while the runlist is a single
+        // sparse extent (no physical allocation). chkdsk treats a zero-
+        // size $Bad as malformed; the volume-size encoding matches
+        // mkntfs/Windows output.
+        let volumeBytes = geom.totalClusters * UInt64(geom.bytesPerCluster)
         let badClusBad = serializeNonResidentDataAttribute(
             attrID: 4, flags: 0, attrName: "$Bad",
-            realSize: 0,
-            allocatedSize: 0,
+            realSize: volumeBytes,
+            allocatedSize: volumeBytes,
             extents: [Extent(startLCN: nil, clusterCount: geom.totalClusters)],
             typeOverride: AttributeType.data.rawValue
         )
@@ -565,9 +603,14 @@ public enum Mkntfs {
         MFTRecord.writeU16LE(into: &data, at: 4,  value: usaOffset)
         MFTRecord.writeU16LE(into: &data, at: 6,  value: usaCount)
         MFTRecord.writeU64LE(into: &data, at: 8,  value: 0)
-        // System files use sequence number == recordNumber when nonzero, or 1 for record 0.
-        // Standard NTFS convention: sysfiles 1..N use seq = recordNumber; record 0 uses 1.
-        let seq: UInt16 = recordNumber == 0 ? 1 : UInt16(recordNumber)
+        // Canonical NTFS (mkntfs / Windows): every system-file MFT record
+        // (records 0..15) ships with sequence number 1. The previous
+        // "seq = recordNumber" convention was wrong and produced
+        // references like 5:5 for root that diverge from on-disk output
+        // from real mkntfs/Windows. References that point at system
+        // files (root's self-parent, $I30 entries naming sysfiles) must
+        // be packed with seq=1 to round-trip cleanly.
+        let seq: UInt16 = 1
         MFTRecord.writeU16LE(into: &data, at: 16, value: seq)
         MFTRecord.writeU16LE(into: &data, at: 18, value: 1)
         MFTRecord.writeU16LE(into: &data, at: 20, value: firstAttrOffset)
@@ -843,22 +886,34 @@ public enum Mkntfs {
         Data(repeating: 0xFF, count: size)
     }
 
-    /// $MFT $BITMAP: 1 bit per MFT record. Set bits 0..15 (system file
-    /// records in use), rest zero. Sized to cover the whole MFT region.
+    /// $MFT $BITMAP: 1 bit per MFT record. Bits 0..15 set (system files
+    /// in use), rest zero. Sized to cover the entire MFT region (one bit
+    /// per record across the whole $MFT $DATA allocation), padded to the
+    /// reserved bitmap cluster region. Stored non-resident — see Fix #2
+    /// in the v0.6 self-heal patch: a resident 8-byte bitmap silently
+    /// truncates to 64 records, after which any allocation past record
+    /// 64 reads zero bits past the truncation and hands out an in-use
+    /// slot, corrupting the on-disk MFT.
     static func makeMFTBitmap(geom: Geometry) -> Data {
         let bytesPerCluster = Int(geom.bytesPerCluster)
-        let totalRecords = Int(geom.mftClusterCount) * bytesPerCluster / Int(geom.mftRecordSize)
-        let bitmapBytes = (totalRecords + 7) / 8
-        // Resident size limit — MFTRecord can only hold ~700 bytes of
-        // resident attribute body. Use a smaller bitmap (cover at least
-        // the first 16 records). The full MFT bitmap is typically held
-        // as a $BITMAP attribute in $MFT, but for small initial volumes
-        // a resident bitmap covering 16-128 records is acceptable.
-        let bm = min(bitmapBytes, 8)   // 8 bytes = 64 records of coverage
-        var d = Data(count: bm)
-        // Set bits 0..15.
-        d[0] = 0xFF
-        d[1] = 0xFF
+        let mftRegionBytes = Int(geom.mftClusterCount) * bytesPerCluster
+        let mftRecordsRepresented = mftRegionBytes / Int(geom.mftRecordSize)
+        let bitmapBytes = (mftRecordsRepresented + 7) / 8
+        // Defensive check: the allocated bitmap region must be large
+        // enough to hold one bit per MFT record. planGeometry sizes the
+        // reserved cluster region by the same formula so this should
+        // always hold, but a precondition here surfaces any drift early
+        // rather than silently corrupting on-disk.
+        let regionBytes = Int(geom.mftBitmapClusterCount) * bytesPerCluster
+        precondition(
+            regionBytes >= bitmapBytes,
+            "mkntfs: MFT bitmap region (\(regionBytes) B) smaller than required (\(bitmapBytes) B)"
+        )
+        // Allocate full cluster-aligned region; mark records 0..15 (the
+        // system files we just built) in-use, leave the rest zero.
+        var d = Data(count: regionBytes)
+        if d.count >= 1 { d[0] = 0xFF }
+        if d.count >= 2 { d[1] = 0xFF }
         return d
     }
 
