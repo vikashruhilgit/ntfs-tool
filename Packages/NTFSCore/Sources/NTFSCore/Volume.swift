@@ -73,6 +73,24 @@ public actor Volume {
     public func _setCreateFileFaultHook(_ point: CreateFileFaultPoint?) {
         _createFileFaultHook = point
     }
+
+    /// v0.7 multi-extension `$ATTRIBUTE_LIST` test-only fault-injection seam.
+    /// When set, fires once after the new extension MFT record is written
+    /// (but before the existing extension's truncation and the base's
+    /// `$ATTRIBUTE_LIST` update). Used by
+    /// `testMultiExtensionIATransactionalFailure` to assert the catch path
+    /// reclaims the new extension slot — no orphans, no dangling
+    /// `$ATTRIBUTE_LIST` pointers.
+    public typealias MultiExtensionFaultHook = @Sendable () throws -> Void
+    private var _multiExtensionFaultHook: MultiExtensionFaultHook?
+    public func _setMultiExtensionFaultHook(_ hook: MultiExtensionFaultHook?) {
+        _multiExtensionFaultHook = hook
+    }
+    private func _consumeMultiExtensionFaultHook() throws {
+        guard let hook = _multiExtensionFaultHook else { return }
+        _multiExtensionFaultHook = nil
+        try hook()
+    }
     /// Internal: clear the fault hook if it currently equals `point`,
     /// returning true on a successful consume. The split between
     /// "is this our point?" and "clear unconditionally" is critical:
@@ -5216,6 +5234,42 @@ public actor Volume {
         let baseRecordBytes = baseRecord.bytes
         let baseSeq = baseRecord.sequenceNumber
 
+        // v0.7 — multi-extension routing. If the base already carries a
+        // `$ATTRIBUTE_LIST` and the migrant `(type, name)` is NOT in the
+        // base's own attribute stream, this is a second-or-later migration:
+        // the attribute has previously been migrated to an extension record
+        // and that extension's own runlist has now overflowed too. Route
+        // to the multi-extension path which allocates an ADDITIONAL
+        // extension slot, splits the existing extension's runlist at an
+        // extent boundary, and appends an entry to the resident
+        // `$ATTRIBUTE_LIST` naming the new extension at `lowestVCN=splitVCN`.
+        //
+        // The `newAttributeBytes` path is the `$DATA` overflow case and
+        // is NOT yet wired to multi-extension (file `$DATA` runlists going
+        // multi-extension is a separate ceiling; v0.7 scope is
+        // `$INDEX_ALLOCATION:$I30` only).
+        if newAttributeBytes == nil {
+            let baseScan = try AttributeMigration.scanAttributes(
+                in: baseRecordBytes,
+                firstAttributeOffset: Int(baseRecord.firstAttributeOffset),
+                usedSize: Int(baseRecord.usedSize)
+            )
+            let hasAttributeList = baseScan.contains {
+                $0.type == AttributeType.attributeList.rawValue
+            }
+            let migrantInBase = baseScan.contains {
+                $0.type == migratingType && $0.name == migratingName
+            }
+            if hasAttributeList && !migrantInBase {
+                try await migrateMultiExtensionOnOverflow(
+                    baseRecordNumber: baseRecordNumber,
+                    migratingType: migratingType,
+                    migratingName: migratingName
+                )
+                return
+            }
+        }
+
         // 2. Allocate a fresh extension MFT record. From here until the
         //    final base commit, any throw must free this slot.
         let extRN = try await allocateMFTRecord()
@@ -5277,6 +5331,333 @@ public actor Volume {
 
         // Drop any cached parses of the migrated base so callers re-read.
         invalidateMFTCaches()
+    }
+
+    /// v0.7 multi-extension `$ATTRIBUTE_LIST` worker. Called when the
+    /// migrant `(migratingType, migratingName)` is already migrated to one
+    /// or more extension records and the LAST such extension's own runlist
+    /// has overflowed its MFT record. Splits the overflowing extension's
+    /// runlist at an extent boundary and adds a SECOND (or Nth) extension
+    /// record + a matching `$ATTRIBUTE_LIST` entry on the base.
+    ///
+    /// Compute-first transactional, mirroring `migrateAttributeOnOverflow`:
+    ///   1. Locate the overflowing existing extension via the resident
+    ///      `$ATTRIBUTE_LIST` on the base (the entry with the highest
+    ///      `lowestVCN` is the latest one).
+    ///   2. Read its current `(type, name)` attribute (sizes, attrID, extents).
+    ///   3. Compute the split point: smallest suffix-extent-count such that
+    ///      the surviving-prefix encoded runlist `<= 50% of (recordSize - overhead)`.
+    ///      Split at an extent boundary only.
+    ///   4. Build the prefix attribute (existing extension, truncated runlist)
+    ///      and the suffix attribute (new extension, starting at splitVCN).
+    ///   5. Allocate a new MFT slot.
+    ///   6. Use `AttributeMigration.buildAdditionalExtensionForAttribute` to
+    ///      compute the new base bytes (with the additional `$ATTRIBUTE_LIST`
+    ///      entry) and the new extension bytes.
+    ///   7. Commit in transactional order: new extension first → existing
+    ///      extension (prefix-truncated) → base. Any throw between alloc
+    ///      and the final base commit reclaims the new MFT slot.
+    ///
+    /// If the existing extension's runlist already fits well within its
+    /// record (no useful split available — e.g. <= 1 extent, or the entire
+    /// runlist is below the 50% budget), this function returns cleanly
+    /// without doing anything. The leaf-split caller may retry the rewrite
+    /// and succeed organically if its overflow was a transient artifact of
+    /// the rewrite path, OR will fail again with the genuine
+    /// `unsupportedFeature` (e.g. non-resident `$ATTRIBUTE_LIST` is needed,
+    /// not multi-extension).
+    private func migrateMultiExtensionOnOverflow(
+        baseRecordNumber: UInt64,
+        migratingType: UInt32,
+        migratingName: String
+    ) async throws {
+        let mft = self.mft()
+        let recordSize = Int(mftRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        let clusterBytes = UInt64(bytesPerCluster)
+
+        // 1. Re-read the base, walk its $ATTRIBUTE_LIST, find the latest
+        //    extension hosting this migrant family. "Latest" = the entry
+        //    whose lowestVCN is the maximum — that extension covers the
+        //    tail of the migrant's VCN space and is the one whose runlist
+        //    is overflowing.
+        let baseRecord = try await mft.record(at: baseRecordNumber)
+        let baseSeq = baseRecord.sequenceNumber
+        guard let attrListAttr = try baseRecord.attributes().first(where: {
+            $0.rawType == AttributeType.attributeList.rawValue
+        }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: base \(baseRecordNumber) has no $ATTRIBUTE_LIST"
+            )
+        }
+        let entries = try await attributeListEntries(of: attrListAttr)
+        let migrantEntries = entries
+            .filter { $0.attributeType == migratingType && $0.name == migratingName }
+            .sorted { $0.lowestVCN < $1.lowestVCN }
+        guard let lastEntry = migrantEntries.last else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: base \(baseRecordNumber) $ATTRIBUTE_LIST has no entry for type 0x\(String(migratingType, radix: 16, uppercase: true)) name '\(migratingName)'"
+            )
+        }
+        let existingExtRN = lastEntry.recordNumber
+        guard existingExtRN != baseRecordNumber else {
+            // The migrant is "in the base" per $ATTRIBUTE_LIST — but the
+            // caller's branch detected it wasn't in the base's attribute
+            // stream. Programmer error / inconsistency.
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: $ATTRIBUTE_LIST claims migrant is in base \(baseRecordNumber) but base scan found it absent"
+            )
+        }
+        let existingExtRecord = try await mft.record(at: existingExtRN)
+        guard existingExtRecord.sequenceNumber == lastEntry.sequenceNumber else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: extension \(existingExtRN) seq \(existingExtRecord.sequenceNumber) != $ATTRIBUTE_LIST entry seq \(lastEntry.sequenceNumber)"
+            )
+        }
+
+        // 2. Locate the migrant attribute inside the existing extension.
+        let existingExtAttrs = try existingExtRecord.attributes()
+        guard let migrantAttr = existingExtAttrs.first(where: {
+            $0.rawType == migratingType && $0.nameOrEmpty == migratingName
+        }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: extension \(existingExtRN) does not carry the expected migrant type 0x\(String(migratingType, radix: 16, uppercase: true)) name '\(migratingName)'"
+            )
+        }
+        guard case let .nonResident(
+            startingVCN, lastVCN, _, _,
+            allocatedSizeBytes, realSizeBytes, initSizeBytes,
+            extents
+        ) = migrantAttr.value else {
+            throw NTFSError.unsupportedFeature(
+                description: "migrateMultiExtensionOnOverflow: migrant in extension \(existingExtRN) is not non-resident — multi-extension only applies to non-resident attributes"
+            )
+        }
+        let migrantAttributeID = migrantAttr.header.attributeID
+
+        // 3. Compute the split point. Measurement-driven: walk extents from
+        //    the END, peeling off suffix extents until the surviving prefix's
+        //    encoded runlist <= 50% of the per-record attribute budget.
+        //    "Attribute budget" = recordSize minus the per-record overhead
+        //    (MFT header + first-attribute offset + this attribute's header
+        //    + non-resident extension + UTF-16 name + end marker). The 50%
+        //    threshold leaves headroom so the prefix can grow on subsequent
+        //    leaf splits without immediately re-splitting (oscillation
+        //    avoidance).
+        let firstAttrOffset = Int(existingExtRecord.firstAttributeOffset)
+        let nameByteCount = migratingName.utf16.count * 2
+        // Per-attribute fixed overhead: 16 (common header) + 48 (non-resident
+        // ext) + name + 8-byte align + end marker.
+        let perAttrOverhead = 16 + 48 + nameByteCount + 7 /* align */ + 4 /* end marker */
+        let attributeBudget = recordSize - firstAttrOffset - perAttrOverhead
+        let runlistBudget = max(64, attributeBudget / 2)
+
+        guard extents.count >= 2 else {
+            // Can't split a single-extent runlist at an extent boundary.
+            // The "overflow" must be coming from something else (e.g. an
+            // extension record with no slack, but a single-extent runlist
+            // is already as small as the encoding gets). Return cleanly —
+            // the leaf-split caller will surface the underlying overflow
+            // separately if it's still a problem.
+            return
+        }
+
+        // Greedy from the END: keep the largest prefix that fits within
+        // `runlistBudget`. We iterate prefix length k = extents.count-1
+        // down to 1 (need at least 1 extent in the prefix AND at least 1
+        // in the suffix) and pick the largest k whose encoded prefix fits.
+        var chosenK: Int = 0
+        for k in (1..<extents.count).reversed() {
+            let prefixCandidate = Array(extents.prefix(k))
+            let encoded = encodeRunlist(extents: prefixCandidate)
+            if encoded.count <= runlistBudget {
+                chosenK = k
+                break
+            }
+        }
+        guard chosenK > 0, chosenK < extents.count else {
+            // Even one-extent prefix is over budget. That's a single-extent
+            // overflow scenario the multi-extension shape can't fix (the
+            // one prefix extent is already too large to encode). Return
+            // cleanly and let the caller surface the underlying issue.
+            return
+        }
+        let prefixExtents = Array(extents.prefix(chosenK))
+        let suffixExtents = Array(extents.suffix(from: chosenK))
+
+        // 4. Compute the split VCN. The prefix covers VCNs
+        //    [startingVCN .. startingVCN + prefixClusterTotal - 1]; the new
+        //    extension's lowestVCN is the next VCN after that.
+        let prefixClusterTotal = prefixExtents.reduce(UInt64(0)) { $0 + $1.clusterCount }
+        let suffixClusterTotal = suffixExtents.reduce(UInt64(0)) { $0 + $1.clusterCount }
+        let prefixLastVCN = startingVCN + prefixClusterTotal - 1
+        let splitVCN = prefixLastVCN + 1
+        // Sanity: lastVCN claimed by the existing attribute equals the sum.
+        _ = lastVCN
+        _ = suffixClusterTotal
+
+        // 5. Build the prefix and suffix attribute byte blobs. Multi-extent
+        //    NTFS attributes carry the FULL allocatedSize / realSize /
+        //    initializedSize on every extent (ntfs3 + ntfs-3g convention) —
+        //    we preserve whatever the existing attribute claimed.
+        let prefixAttrBytes = serializeMultiExtentNonResidentAttribute(
+            type: migratingType,
+            name: migratingName,
+            attrID: migrantAttributeID,
+            flags: migrantAttr.header.flags,
+            startingVCN: startingVCN,
+            lastVCN: prefixLastVCN,
+            allocatedSize: allocatedSizeBytes,
+            realSize: realSizeBytes,
+            initializedSize: initSizeBytes,
+            extents: prefixExtents
+        )
+        let suffixAttrBytes = serializeMultiExtentNonResidentAttribute(
+            type: migratingType,
+            name: migratingName,
+            attrID: migrantAttributeID,
+            flags: migrantAttr.header.flags,
+            startingVCN: splitVCN,
+            lastVCN: lastVCN,
+            allocatedSize: allocatedSizeBytes,
+            realSize: realSizeBytes,
+            initializedSize: initSizeBytes,
+            extents: suffixExtents
+        )
+
+        // 6. Allocate a new MFT slot. From here, any throw must reclaim it.
+        let newExtRN = try await allocateMFTRecord()
+        var newExtSeq: UInt16 = 1
+        if let existing = try? await mft.record(at: newExtRN) {
+            newExtSeq = existing.sequenceNumber &+ 1
+            if newExtSeq == 0 { newExtSeq = 1 }
+        }
+
+        // 7. Pure compute: new base + new extension bytes.
+        let multiResult: AttributeMigration.AdditionalExtensionResult
+        let newExistingExtBytes: Data
+        do {
+            multiResult = try AttributeMigration.buildAdditionalExtensionForAttribute(
+                baseRecordBytes: baseRecord.bytes,
+                baseRN: baseRecordNumber,
+                baseSeq: baseSeq,
+                migratingType: migratingType,
+                migratingName: migratingName,
+                migrantAttributeID: migrantAttributeID,
+                newExtRN: newExtRN,
+                newExtSeq: newExtSeq,
+                splitVCN: splitVCN,
+                suffixAttributeBytes: suffixAttrBytes,
+                recordSize: recordSize,
+                sectorSize: sectorSize
+            )
+            // Splice the prefix attribute back into the existing extension's
+            // record (replacing its current (type, name) attribute).
+            newExistingExtBytes = try rewriteEntireAttributeWithHeaderUpdate(
+                in: existingExtRecord.bytes,
+                recordSize: existingExtRecord.bytes.count,
+                replacingType: migratingType,
+                attributeName: migratingName,
+                replacementBytes: prefixAttrBytes
+            )
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        // 8. Commit the NEW extension record first. Transactional order:
+        //    extension-first, then existing-extension truncation, then base
+        //    (the order that minimizes inconsistency on partial failure —
+        //    same discipline as `migrateAttributeOnOverflow`).
+        do {
+            try await mft.writeRawRecord(at: newExtRN, postFixupBytes: multiResult.newExtensionBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        // 8b. Fire the optional test-only fault hook (if installed). Mirrors
+        //     the createFile hook discipline: fires AFTER the new extension
+        //     write hit disk but BEFORE the existing extension and base are
+        //     touched. The catch must reclaim the new slot — no orphans, no
+        //     dangling pointers.
+        _ = clusterBytes
+        #if DEBUG
+        do {
+            try _consumeMultiExtensionFaultHook()
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+        #endif
+
+        // 9. Commit the EXISTING extension's truncation.
+        do {
+            try await mft.writeRawRecord(at: existingExtRN, postFixupBytes: newExistingExtBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        // 10. Commit the new base record (the $ATTRIBUTE_LIST update).
+        do {
+            try await mft.writeRawRecord(at: baseRecordNumber, postFixupBytes: multiResult.newBaseBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        invalidateMFTCaches()
+    }
+
+    /// Generic non-resident attribute serializer for the multi-extension
+    /// `$INDEX_ALLOCATION` (and any future) split path. Like
+    /// `serializeIndexAllocationAttribute`, but takes the attribute `type`,
+    /// `name`, `attrID`, `startingVCN`, `lastVCN`, and the explicit size
+    /// triple. Multi-extent attributes duplicate `allocatedSize`/`realSize`/
+    /// `initializedSize` across every extent (ntfs3 + ntfs-3g convention).
+    private func serializeMultiExtentNonResidentAttribute(
+        type: UInt32,
+        name: String,
+        attrID: UInt16,
+        flags: UInt16,
+        startingVCN: UInt64,
+        lastVCN: UInt64,
+        allocatedSize: UInt64,
+        realSize: UInt64,
+        initializedSize: UInt64,
+        extents: [Extent]
+    ) -> Data {
+        let nameUTF16 = Array(name.utf16)
+        let nameByteCount = nameUTF16.count * 2
+        let runlist = encodeRunlist(extents: extents)
+        let runlistOffset = 64 + nameByteCount
+        let rawLen = runlistOffset + runlist.count
+        let alignedLen = ((rawLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: type)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 1                           // non-resident
+        data[data.startIndex + 9] = UInt8(nameUTF16.count)
+        MFTRecord.writeU16LE(into: &data, at: 10, value: 64)    // name offset (after non-resident extension)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: flags)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        MFTRecord.writeU64LE(into: &data, at: 16, value: startingVCN)
+        MFTRecord.writeU64LE(into: &data, at: 24, value: lastVCN)
+        MFTRecord.writeU16LE(into: &data, at: 32, value: UInt16(runlistOffset))
+        data[data.startIndex + 34] = 0                           // compression unit
+        // 35..39 reserved zeros
+        MFTRecord.writeU64LE(into: &data, at: 40, value: allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: realSize)
+        MFTRecord.writeU64LE(into: &data, at: 56, value: initializedSize)
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[data.startIndex + 64 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[data.startIndex + 64 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        for (i, byte) in runlist.enumerated() {
+            data[data.startIndex + runlistOffset + i] = byte
+        }
+        return data
     }
 
     /// Roll back an MFT record allocation by flipping IN_USE off. Used both
