@@ -786,4 +786,116 @@ final class MultiExtensionIndexAllocationTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - AC-7: verify --deep returns clean on multi-extension shape
+
+    /// AC-7 positive assertion: once a directory has migrated to the
+    /// multi-extension `$INDEX_ALLOCATION:$I30` shape (base + two extension
+    /// records, two 0xA0:$I30 `$ATTRIBUTE_LIST` entries at disjoint VCN
+    /// ranges), `verify --deep`'s canonical audit
+    /// (`Volume.auditAllDataRunlistsAgainstBitmap`) must return CLEAN — no
+    /// free-but-referenced, no out-of-range, no double-allocated clusters,
+    /// no unreadable records.
+    ///
+    /// The audit is for `$DATA` runlists (not `$INDEX_ALLOCATION`); the
+    /// AC-7 evidence is that a volume which carries the multi-extension
+    /// `$INDEX_ALLOCATION` shape doesn't trip ANY of the audit's failure
+    /// categories. (The multi-extension `$INDEX_ALLOCATION` attribute
+    /// itself is read by the audit only indirectly: `auditDataRunlistAgainstBitmap`
+    /// routes through `mergeMultiExtensionAttribute` so any `$DATA`
+    /// attribute that ever migrates would also be walked correctly; the
+    /// directory-side `$INDEX_ALLOCATION` audit is out of scope here.)
+    ///
+    /// As a strong supplementary check, this test also re-reads the two
+    /// extensions' migrant `$INDEX_ALLOCATION:$I30` runlists directly and
+    /// confirms their cluster counts are disjoint by VCN range — proving
+    /// "no double-counting" by construction (the on-disk shape itself
+    /// places each VCN in exactly one extension).
+    func testMultiExtensionVerifyDeepClean() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+
+        let driven = try await driveToMultiExtension(volume: volume)
+        guard driven.didSplit else {
+            throw XCTSkip("""
+                Could not produce multi-extension shape on this fixture \
+                (single-extent migrant; the splitter requires >=2 extents). \
+                AC-7 evidence requires the multi-extension shape to assert against.
+                """)
+        }
+
+        // Reopen so the audit sweeps on-disk state, not an in-memory cache.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+
+        // --- (1) AC-7 core assertion: `verify --deep` audit is clean. ---
+        let sweep = try await reopen.auditAllDataRunlistsAgainstBitmap()
+        XCTAssertTrue(
+            sweep.isClean,
+            """
+            verify --deep audit must be clean on multi-extension shape; got \
+            freeButReferenced=\(sweep.freeButReferencedClusters), \
+            outOfRange=\(sweep.outOfRangeClusters), \
+            doubleAllocated=\(sweep.doubleAllocatedClusters), \
+            unreadable=\(sweep.unreadableRecords.count), \
+            perRecordAnomalies=\(sweep.perRecordAnomalies.count)
+            """
+        )
+        XCTAssertEqual(
+            sweep.doubleAllocatedClusters, 0,
+            "no double-counting allowed: doubleAllocatedClusters must be 0"
+        )
+
+        // --- (2) Supplementary: cluster counts across the two extensions
+        // are disjoint by VCN range (no double-counting by construction). ---
+        let mft = await reopen.mft()
+        let baseAttrs = try await reopen.allAttributesOf(recordNumber: 5)
+        let i30Attrs = baseAttrs.filter {
+            $0.rawType == AttributeType.indexAllocation.rawValue && $0.nameOrEmpty == "$I30"
+        }
+        // The post-merge allAttributesOf returns one $INDEX_ALLOCATION:$I30
+        // per extension (it does NOT merge — merging is done by
+        // mergeMultiExtensionAttribute, which `auditDataRunlistAgainstBitmap`
+        // calls). So we should see exactly two entries here matching the
+        // $ATTRIBUTE_LIST shape.
+        XCTAssertEqual(
+            i30Attrs.count, 2,
+            "post-reopen: allAttributesOf must surface both extensions' $INDEX_ALLOCATION:$I30 attributes"
+        )
+
+        // Sum each extension's clusterCount independently.
+        var perExtensionClusters: [UInt64] = []
+        var allExtents: [(startVCN: UInt64, lastVCN: UInt64)] = []
+        for attr in i30Attrs {
+            guard case let .nonResident(startingVCN, lastVCN, _, _, _, _, _, extents) = attr.value else {
+                XCTFail("post-reopen: migrant $INDEX_ALLOCATION:$I30 is unexpectedly resident")
+                continue
+            }
+            let total = extents.reduce(UInt64(0)) { $0 + $1.clusterCount }
+            perExtensionClusters.append(total)
+            allExtents.append((startingVCN, lastVCN))
+        }
+        XCTAssertGreaterThan(
+            perExtensionClusters.reduce(0, +), 0,
+            "supplementary check: total clusters across both extensions must be > 0"
+        )
+
+        // Disjoint VCN coverage: sort by startVCN; each next.start == prev.last + 1.
+        let sorted = allExtents.sorted { $0.startVCN < $1.startVCN }
+        XCTAssertEqual(sorted[0].startVCN, 0, "first extension must cover startVCN 0")
+        XCTAssertEqual(
+            sorted[1].startVCN, sorted[0].lastVCN + 1,
+            """
+            VCN ranges must be disjoint and contiguous (no double-counting): \
+            ext0=[\(sorted[0].startVCN)..\(sorted[0].lastVCN)], \
+            ext1=[\(sorted[1].startVCN)..\(sorted[1].lastVCN)]
+            """
+        )
+
+        // Suppress "unused" warning on the `mft` binding (kept for clarity).
+        _ = mft
+    }
 }
