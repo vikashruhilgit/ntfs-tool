@@ -136,6 +136,17 @@ public actor FileHandleBlockDevice: BlockDevice {
         return data
     }
 
+    /// Chunk size for raw-device writes. macOS's BSD block layer caps a
+    /// single `write(2)` to `MAXPHYS` (~1 MiB on stock macOS); larger
+    /// `write()` calls to `/dev/diskN` return `EINVAL`. The mkntfs path
+    /// (v0.6) builds large initial regions (e.g. a multi-GiB `$MFT` zone
+    /// on 4 TB volumes) as one `Data` and writes them via this function,
+    /// so we chunk every write through a safe-for-macOS-raw-device
+    /// granularity. Regular files (`.img` fixtures) handle larger writes
+    /// fine, but chunking is harmless there — uniform behaviour, one
+    /// place to keep correct.
+    static let writeChunkSize: Int = 1 * 1024 * 1024   // 1 MiB
+
     public func write(offset: UInt64, bytes: Data) async throws {
         guard isWritable else { throw NTFSError.readOnlyDevice }
         if bytes.isEmpty { return }
@@ -144,10 +155,26 @@ public actor FileHandleBlockDevice: BlockDevice {
         } catch {
             throw NTFSError.ioFailure(description: "seek to offset \(offset) for write failed: \(error)")
         }
-        do {
-            try handle.write(contentsOf: bytes)
-        } catch {
-            throw NTFSError.ioFailure(description: "write at offset \(offset) length \(bytes.count) failed: \(error)")
+        let chunkSize = Self.writeChunkSize
+        let total = bytes.count
+        var written = 0
+        while written < total {
+            let remaining = total - written
+            let thisChunk = min(chunkSize, remaining)
+            let lo = bytes.index(bytes.startIndex, offsetBy: written)
+            let hi = bytes.index(lo, offsetBy: thisChunk)
+            // Data(...) copy ensures the slice is contiguous; FileHandle's
+            // write(contentsOf:) accepts any DataProtocol but a fresh Data
+            // sidesteps any slice-backing-store quirks across Swift versions.
+            let slice = Data(bytes[lo..<hi])
+            do {
+                try handle.write(contentsOf: slice)
+            } catch {
+                throw NTFSError.ioFailure(
+                    description: "write at offset \(offset + UInt64(written)) length \(thisChunk) failed (chunk \(written)/\(total)): \(error)"
+                )
+            }
+            written += thisChunk
         }
     }
 
