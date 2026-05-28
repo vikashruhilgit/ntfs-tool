@@ -151,6 +151,33 @@ public actor FileHandleBlockDevice: BlockDevice {
         }
     }
 
+    /// Discover the usable byte size of the device or .img file. For
+    /// regular files (.img fixtures) uses fstat; for raw block devices
+    /// (/dev/diskN, /dev/rdiskN) uses ioctl(DKIOCGETBLOCKSIZE) +
+    /// ioctl(DKIOCGETBLOCKCOUNT). Sized for the v0.6 mkntfs path which
+    /// needs to know the device size before laying out system files.
+    public func size() async throws -> UInt64 {
+        let fd = handle.fileDescriptor
+        var st = stat()
+        if fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG {
+            return UInt64(st.st_size)
+        }
+        // Raw block device — ioctl path. macOS ioctl numbers from <sys/disk.h>:
+        //   DKIOCGETBLOCKSIZE  = _IOR('d', 24, uint32_t) = 0x40046418
+        //   DKIOCGETBLOCKCOUNT = _IOR('d', 25, uint64_t) = 0x40086419
+        let DKIOCGETBLOCKSIZE: UInt = 0x40046418
+        let DKIOCGETBLOCKCOUNT: UInt = 0x40086419
+        var blockSize: UInt32 = 0
+        var blockCount: UInt64 = 0
+        if ioctl(fd, DKIOCGETBLOCKSIZE, &blockSize) != 0 {
+            throw NTFSError.ioFailure(description: "size(): DKIOCGETBLOCKSIZE failed errno=\(errno)")
+        }
+        if ioctl(fd, DKIOCGETBLOCKCOUNT, &blockCount) != 0 {
+            throw NTFSError.ioFailure(description: "size(): DKIOCGETBLOCKCOUNT failed errno=\(errno)")
+        }
+        return blockCount * UInt64(blockSize)
+    }
+
     public func synchronize() async throws {
         guard isWritable else { return }
         // F_FULLFSYNC is stronger than fsync(): it also asks the drive itself

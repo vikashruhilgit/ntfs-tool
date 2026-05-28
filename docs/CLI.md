@@ -178,7 +178,54 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `truncate` | `<device> <recnum> <newSize>` | Resize file to any byte-precise size (shrink only; growing requires `write`). |
 | `delete` | `<device> <recnum>` | Single-record delete by recnum. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15. (Prefer `rm` for path-based use.) |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
+| `mkntfs` | `<device>` | Format `<device>` as a fresh NTFS volume (`mkntfs -Q`-equivalent). REQUIRES `--yes`. `--label` for volume label, `--serial HEX` for deterministic serial. DESTRUCTIVE. See [Reformat (`mkntfs`)](#reformat-mkntfs). |
 | `reclaim-orphans` | `<device>` | Sweep MFT for orphaned BASE records (IN_USE=1 but unreachable from root) and clear them. Dry-run by default — pass `--confirm` to actually clean. `-v` for per-orphan name/parent details. Native equivalent of `ntfsfix` / `chkdsk /f` for orphan recovery. **Extension-record safe:** never frees a v0.5-migration extension record (a record holding a live file's migrated `$DATA` / `$INDEX_ALLOCATION`) — freeing one would corrupt the base file; leaked extensions are reported with a `chkdsk /f` recommendation, not auto-freed. |
+
+## Reformat (`mkntfs`)
+
+> NEW in v0.6 — self-contained NTFS reformat without Homebrew, macFUSE,
+> Linux VM, or Windows.
+
+`ntfsctl mkntfs <device> --yes` creates a fresh, spec-correct NTFS volume
+on the target device or disk image. The output is byte-compatible with
+`mkntfs -Q` (Linux `ntfsprogs`): readable by macOS `livefiles_ntfs`,
+Linux `ntfs-3g`, and Windows.
+
+```bash
+# Format a 4 TB external drive (after unmounting first):
+diskutil unmountDisk /dev/disk10
+sudo ntfsctl mkntfs /dev/disk10s1 --label "MyData" --yes
+
+# Format a disk image for development/CI:
+dd if=/dev/zero of=fixture.img bs=1m count=256
+ntfsctl mkntfs fixture.img --label TEST --yes
+
+# Verify a fresh volume looks clean:
+ntfsctl info fixture.img
+ntfsctl verify --deep fixture.img    # expects 0 of everything
+```
+
+### Safety
+
+- `--yes` is REQUIRED. Without it, `mkntfs` prints the target device,
+  size, and label, then exits with an error and writes nothing.
+- The target is unconditionally overwritten — there is no backup or
+  undo. Always run against a disk image first if you're unsure.
+
+### Scope
+
+- Equivalent to `mkntfs -Q` (quick format): the bad-cluster sweep is
+  skipped; `$LogFile` is initialized to all-`0xFF` (Windows / `ntfs-3g`
+  re-initialize it on first mount); `$Secure` carries a minimal default
+  security descriptor (Everyone full control) — sufficient for data
+  volumes, but not for a bootable Windows install.
+- Compression, encryption, and Volume Shadow Copy setup are explicitly
+  out of scope.
+- The pure-Swift `$UpCase` table is generated from Unicode default case
+  mappings (`scripts/generate_upcase_table.swift` is the auditable
+  generator). The `$AttrDef` table follows the NTFS 3.1 spec verbatim.
+  Both have spec-conformance tests against hand-decoded references that
+  do not round-trip through our own decoder.
 
 ## Common task recipes
 

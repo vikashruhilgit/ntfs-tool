@@ -98,7 +98,136 @@ public struct BootSector: Equatable, Sendable {
     /// Decode the signed-cluster-or-negative-power-of-two encoding used by NTFS for
     /// `clustersPerMFTRecord` and `clustersPerIndexRecord`. Returns the resolved size
     /// in bytes, given the volume's cluster size in bytes.
-    public static func resolveRecordSize(field: Int8, clusterSizeBytes: UInt32) -> UInt32 {
+
+    /// Serialize this BootSector into the canonical 512-byte boot sector
+    /// layout (including the standard NTFS-style x86 jump stub at offset 0,
+    /// the NTFS OEM signature at offset 3, the BPB at offsets 11-83, the
+    /// volume serial at offset 72, and the 0xAA55 signature at offset 510).
+    ///
+    /// The inverse of `parse(_:)`. Round-trip is byte-identical for the
+    /// fields BootSector models (modulo the bootstrap stub bytes, which are
+    /// fixed by this writer to the canonical mkntfs jump stub).
+    public func serialize() throws -> Data {
+        // Validate fields first so we surface "bad input" rather than write
+        // a malformed boot sector.
+        guard oemID.count == 8, oemID.hasPrefix("NTFS") else {
+            throw NTFSError.invalidBootSector(reason: "OEM ID must be 8 chars starting with NTFS (got '\(oemID)')")
+        }
+        guard validBytesPerSector.contains(bytesPerSector) else {
+            throw NTFSError.invalidBootSector(reason: "bytesPerSector \(bytesPerSector) invalid")
+        }
+        guard sectorsPerCluster > 0,
+              sectorsPerCluster <= 128,
+              sectorsPerCluster.nonzeroBitCount == 1 else {
+            throw NTFSError.invalidBootSector(reason: "sectorsPerCluster \(sectorsPerCluster) is not a power of two in [1,128]")
+        }
+        guard bootSectorSignature == 0xAA55 else {
+            throw NTFSError.invalidBootSector(reason: "bootSectorSignature must be 0xAA55")
+        }
+
+        var d = Data(count: Self.onDiskSize)
+
+        // --- Jump stub (offset 0-2): canonical NTFS jump-to-code-at-offset-0x54.
+        //     mkntfs writes EB 52 90 — a 2-byte short jump (rel +0x52) then NOP.
+        d[0] = 0xEB
+        d[1] = 0x52
+        d[2] = 0x90
+
+        // --- OEM ID (offset 3, 8 ASCII bytes).
+        let oemBytes = Array(oemID.utf8)
+        precondition(oemBytes.count == 8)
+        for i in 0..<8 { d[3 + i] = oemBytes[i] }
+
+        // --- BPB (offset 11): bytes-per-sector, sectors-per-cluster, then
+        //     a block of FAT-compatibility zeros (NTFS leaves them 0).
+        Self.writeU16LE(into: &d, at: 11, bytesPerSector)
+        d[13] = sectorsPerCluster
+        // 14-15: reserved sectors (u16) — NTFS uses 0
+        // 16: number of FATs (u8) — NTFS uses 0
+        // 17-18: root entries (u16) — NTFS uses 0
+        // 19-20: small total sectors (u16) — NTFS uses 0
+        d[21] = mediaDescriptor
+        // 22-23: sectors per FAT (u16) — NTFS uses 0
+        // 24-25: sectors per track (u16) — NTFS leaves 0 for our purposes;
+        //   mkntfs writes the BIOS geometry but it's advisory only.
+        // 26-27: number of heads (u16) — same.
+        // 28-31: hidden sectors (u32) — 0 here; the partition start is
+        //   set by the partitioner, not by us.
+        // 32-35: large total sectors (u32) — NTFS uses 0; the real total
+        //   lives in the 64-bit field at offset 40.
+
+        // --- NTFS-specific extended BPB (offset 36+).
+        // 36: physical drive number (u8) — 0x80 for hard disks
+        d[36] = 0x80
+        // 37: current head (u8) — 0
+        // 38: extended boot signature (u8) — 0x80 per mkntfs
+        d[38] = 0x80
+        // 39: reserved
+        Self.writeU64LE(into: &d, at: 40, totalSectors)
+        Self.writeU64LE(into: &d, at: 48, mftCluster)
+        Self.writeU64LE(into: &d, at: 56, mftMirrorCluster)
+        d[64] = UInt8(bitPattern: clustersPerMFTRecord)
+        // 65-67: reserved (3 bytes) — 0
+        d[68] = UInt8(bitPattern: clustersPerIndexRecord)
+        // 69-71: reserved (3 bytes) — 0
+        Self.writeU64LE(into: &d, at: 72, volumeSerial)
+        // 80-83: checksum (u32) — 0 (NTFS doesn't use it; chkdsk ignores)
+
+        // --- Boot code (offset 84-509): a 426-byte stub. mkntfs writes a
+        //     small "NTLDR is missing"-style stub; for a data volume we
+        //     leave it as zeros (the volume is non-bootable, which matches
+        //     `mkntfs -Q` behavior for data volumes per the brief — read
+        //     by Windows/livefiles_ntfs without complaint).
+
+        // --- Signature (offset 510).
+        Self.writeU16LE(into: &d, at: 510, bootSectorSignature)
+
+        return d
+    }
+
+    // MARK: — Little-endian writers (mirror of MFTRecord's writers, kept
+    // local to BootSector to avoid a cross-file dependency for what is a
+    // small amount of code).
+
+    static func writeU16LE(into d: inout Data, at offset: Int, _ value: UInt16) {
+        d[offset]     = UInt8(value & 0xFF)
+        d[offset + 1] = UInt8((value >> 8) & 0xFF)
+    }
+    static func writeU64LE(into d: inout Data, at offset: Int, _ value: UInt64) {
+        for i in 0..<8 {
+            d[offset + i] = UInt8((value >> (8 * i)) & 0xFF)
+        }
+    }
+
+    /// Convenience initializer for `mkntfs`: build a BootSector value from
+    /// the volume geometry, ready to be serialized into bytes.
+    public init(
+        oemID: String = "NTFS    ",
+        bytesPerSector: UInt16,
+        sectorsPerCluster: UInt8,
+        mediaDescriptor: UInt8 = 0xF8,
+        totalSectors: UInt64,
+        mftCluster: UInt64,
+        mftMirrorCluster: UInt64,
+        clustersPerMFTRecord: Int8,
+        clustersPerIndexRecord: Int8,
+        volumeSerial: UInt64,
+        bootSectorSignature: UInt16 = 0xAA55
+    ) {
+        self.oemID = oemID
+        self.bytesPerSector = bytesPerSector
+        self.sectorsPerCluster = sectorsPerCluster
+        self.mediaDescriptor = mediaDescriptor
+        self.totalSectors = totalSectors
+        self.mftCluster = mftCluster
+        self.mftMirrorCluster = mftMirrorCluster
+        self.clustersPerMFTRecord = clustersPerMFTRecord
+        self.clustersPerIndexRecord = clustersPerIndexRecord
+        self.volumeSerial = volumeSerial
+        self.bootSectorSignature = bootSectorSignature
+    }
+
+        public static func resolveRecordSize(field: Int8, clusterSizeBytes: UInt32) -> UInt32 {
         if field >= 0 {
             return UInt32(field) * clusterSizeBytes
         }
