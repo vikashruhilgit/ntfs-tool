@@ -627,17 +627,16 @@ echo "apples:  $apples"
 
 These are documented as "v1 scope" with clear pointers to where they'd be lifted in a future hardening pass. None of them prevent ordinary read/write use against typical NTFS volumes.
 
-### `create` into LARGE_INDEX parents — per-leaf cap
+### `create` into LARGE_INDEX parents — per-directory capacity
 
-`create` (and `cp`'s internal create) now descends `$INDEX_ALLOCATION` and inserts into the correct INDX leaf. Real-world directories with hundreds of entries work as long as the specific leaf the new key sorts into still has slack space (~50 entries per typical 4 KiB INDX block).
+`create` (and `cp`'s internal create) descends `$INDEX_ALLOCATION` and inserts into the correct INDX leaf, with automatic leaf split + height growth + multi-extension `$INDEX_ALLOCATION` migration on overflow.
 
-If the target leaf is fully packed, you'll see:
+**v0.7+: per-directory capacity is now bounded only by free clusters and free MFT slots on the volume.** Earlier ceilings have been lifted in successive releases:
 
-```
-unsupportedFeature(description: "LARGE_INDEX leaf full (used X / allocated Y, needed Z) — leaf split not yet implemented")
-```
-
-**Workaround:** create files inside a different (less-full) subdirectory until leaf split is implemented (see [`docs/STATUS.md`](STATUS.md) engineering follow-up #2). Or for fresh directories created via `cp -r`, copy at most ~30-40 files per directory in v1.
+- v0.4: `$INDEX_ROOT` multi-level split.
+- v0.5: `$INDEX_ALLOCATION` migrated to an extension MFT record when it outgrows base-record slack.
+- v0.5.2: leaf-split migration-catch gap closed on two formerly-uncaught call sites.
+- **v0.7: multi-extension `$ATTRIBUTE_LIST`** — when the migrated `$INDEX_ALLOCATION:$I30` extension's own runlist fills its MFT record, a second extension is allocated transparently and a new entry naming it at the split VCN is appended to the base's resident `$ATTRIBUTE_LIST`. The v0.6.x `unsupportedFeature("multi-extension $ATTRIBUTE_LIST required for $INDEX_ALLOCATION:$I30 …")` error is unreachable from this code path post-v0.7.
 
 Small (resident-only `$INDEX_ROOT`) directories are auto-promoted to LARGE_INDEX on overflow — you don't have to do this manually.
 

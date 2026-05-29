@@ -73,6 +73,45 @@ public actor Volume {
     public func _setCreateFileFaultHook(_ point: CreateFileFaultPoint?) {
         _createFileFaultHook = point
     }
+
+    /// v0.7 multi-extension `$ATTRIBUTE_LIST` test-only fault-injection seam.
+    /// When set, fires once after the new extension MFT record is written
+    /// (but before the existing extension's truncation and the base's
+    /// `$ATTRIBUTE_LIST` update). Used by
+    /// `testMultiExtensionIATransactionalFailure` to assert the catch path
+    /// reclaims the new extension slot — no orphans, no dangling
+    /// `$ATTRIBUTE_LIST` pointers.
+    public typealias MultiExtensionFaultHook = @Sendable () throws -> Void
+    private var _multiExtensionFaultHook: MultiExtensionFaultHook?
+    public func _setMultiExtensionFaultHook(_ hook: MultiExtensionFaultHook?) {
+        _multiExtensionFaultHook = hook
+    }
+    private func _consumeMultiExtensionFaultHook() throws {
+        guard let hook = _multiExtensionFaultHook else { return }
+        _multiExtensionFaultHook = nil
+        try hook()
+    }
+
+    /// v0.7 self-heal iter-1: second multi-extension fault-injection seam.
+    /// Fires AFTER the existing extension's TRUNCATION write has hit disk
+    /// but BEFORE the base's `$ATTRIBUTE_LIST` update — the WORST-case
+    /// mid-flight crash window. Without the step-10 catch's rollback, this
+    /// is the data-loss window: base AL still points to existing-ext lvcn=0
+    /// (single entry), but existing-ext's on-disk runlist has been truncated
+    /// to cover only [0..splitVCN-1] — entries living in
+    /// [splitVCN..originalLastVCN] become structurally unreachable.
+    /// Used by `testMultiExtensionIATransactionalFailureAfterTruncation` to
+    /// assert the rollback (restore existing-ext pre-truncation bytes,
+    /// reclaim new-ext slot) is in force.
+    private var _multiExtensionFaultHookAfterTruncation: MultiExtensionFaultHook?
+    public func _setMultiExtensionFaultHookAfterTruncation(_ hook: MultiExtensionFaultHook?) {
+        _multiExtensionFaultHookAfterTruncation = hook
+    }
+    private func _consumeMultiExtensionFaultHookAfterTruncation() throws {
+        guard let hook = _multiExtensionFaultHookAfterTruncation else { return }
+        _multiExtensionFaultHookAfterTruncation = nil
+        try hook()
+    }
     /// Internal: clear the fault hook if it currently equals `point`,
     /// returning true on a successful consume. The split between
     /// "is this our point?" and "clear unconditionally" is critical:
@@ -218,12 +257,167 @@ public actor Volume {
         name: String?
     ) async throws -> Attribute? {
         let all = try await allAttributesOf(recordNumber: recordNumber)
-        return all.first { a in
-            guard a.rawType == type.rawValue else { return false }
-            if let n = name { return a.nameOrEmpty == n }
-            return true
-        }
+        // v0.7 AC-5: when a non-resident attribute is split across multiple
+        // $ATTRIBUTE_LIST entries (multi-extension shape), `all` contains TWO
+        // `Attribute` values with the same (rawType, name) but disjoint VCN
+        // ranges. Returning `.first` here is the v0.6 silent half-read bug —
+        // route through the merge helper to synthesize a single Attribute
+        // covering every VCN. For single-instance attributes
+        // (e.g. $STANDARD_INFORMATION) the helper short-circuits and returns
+        // the lone match unchanged.
+        return try mergeMultiExtensionAttribute(
+            in: all,
+            rawType: type.rawValue,
+            name: name ?? ""
+        )
     }
+
+    /// v0.7 AC-5: the canonical merge seam for multi-extension
+    /// `$ATTRIBUTE_LIST` shapes. Gathers every `Attribute` in `attrs`
+    /// matching `(rawType, name)`, sorts them by `startingVCN`, and
+    /// synthesizes a single `Attribute` whose `.nonResident` value carries
+    /// the extents concatenated in VCN-ascending order.
+    ///
+    /// Required because v0.7's multi-extension $ATTRIBUTE_LIST write path
+    /// (`migrateIndexAllocationOnOverflow` second migration) produces N>1
+    /// `Attribute` values for the same `(type, name)` pair across the base +
+    /// extension records. Pre-v0.7 callsites that just did
+    /// `attrs.first(where: ...)` silently picked the VCN-0 attribute and
+    /// missed every entry living in the suffix extension — the documented
+    /// "19 of 416 names missing" half-read.
+    ///
+    /// Concatenation rules:
+    ///   * All matched attributes must be `.nonResident`. Multi-extension is
+    ///     only meaningful for non-resident attributes (resident attributes
+    ///     don't get an entry-per-extension shape).
+    ///   * Each next attribute's `startingVCN` must equal `prev.lastVCN + 1`
+    ///     (NTFS contiguity invariant). Violation throws `corruptOnDisk` —
+    ///     this indicates either a write-path bug or external corruption.
+    ///   * Per the ntfs3 / ntfs-3g convention enforced by
+    ///     `serializeMultiExtentNonResidentAttribute`, every extent carries
+    ///     identical `allocatedSize` / `realSize` / `initializedSize` (the
+    ///     full attribute size); the merge preserves them verbatim from the
+    ///     first (lowest-VCN) match.
+    ///   * For type/name pairs that are always single-instance (e.g.
+    ///     `$STANDARD_INFORMATION`, `$INDEX_ROOT`, resident $DATA) this is a
+    ///     no-op: with one match the synthesized result is byte-identical to
+    ///     the lone input.
+    ///
+    /// Returns `nil` if no attribute matches `(rawType, name)`.
+    internal func mergeMultiExtensionAttribute(
+        in attrs: [Attribute],
+        rawType: UInt32,
+        name: String
+    ) throws -> Attribute? {
+        let matches = attrs
+            .filter { $0.rawType == rawType && $0.nameOrEmpty == name }
+            .sorted { lhs, rhs in
+                let lvcn: UInt64 = {
+                    if case let .nonResident(s, _, _, _, _, _, _, _) = lhs.value { return s }
+                    return 0
+                }()
+                let rvcn: UInt64 = {
+                    if case let .nonResident(s, _, _, _, _, _, _, _) = rhs.value { return s }
+                    return 0
+                }()
+                return lvcn < rvcn
+            }
+        guard let first = matches.first else { return nil }
+        if matches.count == 1 { return first }
+
+        // Multi-match: every entry MUST be non-resident.
+        var mergedExtents: [Extent] = []
+        var headStartingVCN: UInt64 = 0
+        var tailLastVCN: UInt64 = 0
+        var dataRunsOffset: UInt16 = 0
+        var compressionUnit: UInt8 = 0
+        var allocatedSize: UInt64 = 0
+        var realSize: UInt64 = 0
+        var initializedSize: UInt64 = 0
+        var expectedNextVCN: UInt64 = 0
+
+        for (idx, match) in matches.enumerated() {
+            guard case let .nonResident(
+                startingVCN, lastVCN, dro, cu, allocSize, rSize, iSize, extents
+            ) = match.value else {
+                throw NTFSError.corruptOnDisk(
+                    description: "mergeMultiExtensionAttribute: matched attribute (rawType=0x\(String(rawType, radix: 16, uppercase: true)), name=\"\(name)\") at index \(idx) is unexpectedly resident — multi-extension shape requires non-resident extents on every entry"
+                )
+            }
+            if idx == 0 {
+                headStartingVCN = startingVCN
+                dataRunsOffset = dro
+                compressionUnit = cu
+                // Per the ntfs3 / ntfs-3g convention, every extent of a
+                // multi-extent attribute carries the FULL attribute size on
+                // every entry. Use the first (lowest-VCN) entry's values.
+                allocatedSize = allocSize
+                realSize = rSize
+                initializedSize = iSize
+                expectedNextVCN = startingVCN
+            } else {
+                // Contiguity check: each subsequent extent must start exactly
+                // where the previous one ended. NTFS write paths guarantee
+                // this; a violation is either a write-path bug or external
+                // corruption.
+                guard startingVCN == expectedNextVCN else {
+                    throw NTFSError.corruptOnDisk(
+                        description: "mergeMultiExtensionAttribute: (rawType=0x\(String(rawType, radix: 16, uppercase: true)), name=\"\(name)\") extent \(idx) startingVCN \(startingVCN) does not match expected \(expectedNextVCN) (prev lastVCN+1)"
+                    )
+                }
+            }
+            mergedExtents.append(contentsOf: extents)
+            tailLastVCN = lastVCN
+            expectedNextVCN = lastVCN &+ 1
+        }
+
+        let mergedValue = AttributeValue.nonResident(
+            startingVCN: headStartingVCN,
+            lastVCN: tailLastVCN,
+            dataRunsOffset: dataRunsOffset,
+            compressionUnit: compressionUnit,
+            allocatedSize: allocatedSize,
+            realSize: realSize,
+            initializedSize: initializedSize,
+            extents: mergedExtents
+        )
+        return Attribute(header: first.header, value: mergedValue)
+    }
+
+    // MARK: - v0.7 AC-5: `allAttributesOf` callsite audit
+    //
+    // After v0.7's multi-extension $ATTRIBUTE_LIST write path landed
+    // (Subtasks #2/#3, PR a9dd93e), `allAttributesOf` may return MULTIPLE
+    // Attribute values for the same (rawType, name) when a non-resident
+    // attribute is spread across two or more extension records. Every
+    // callsite that consumes a non-resident attribute via
+    // `attrs.first(where: { type == ... && name == ... })` is at risk of
+    // the silent half-read bug.
+    //
+    // The canonical fix is `mergeMultiExtensionAttribute(in:rawType:name:)`
+    // above; the 12 production callsites below were audited verbatim:
+    //
+    //  | # | file:line                                  | attr read              | verdict                                    |
+    //  |---|--------------------------------------------|------------------------|--------------------------------------------|
+    //  | 1 | Volume.swift `resolveAttribute`            | any                    | ROUTE THROUGH merge (canonical seam)       |
+    //  | 2 | Volume.swift `insertIntoParentI30`         | $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge                        |
+    //  | 3 | Volume.swift `promoteDirectoryToLargeIndex`| $INDEX_ROOT only       | SAFE BY CONSTRUCTION (resident $INDEX_ROOT — pre-promotion, no $INDEX_ALLOCATION exists yet) |
+    //  | 4 | Volume.swift `computeParentRecordBytesForSplit` | $INDEX_ROOT (resident) + uses attrID lookup | ROUTE THROUGH merge for $INDEX_ALLOCATION reads in helpers (`findIndexAllocationAttributeID` uses attrID which is shared across extents — `.first` works for ID; routing is still safe) |
+    //  | 5 | Volume.swift `collectAllFileRefsInLargeIndex` | $INDEX_ALLOCATION:$I30 extents | ROUTE THROUGH merge                  |
+    //  | 6 | Volume.swift `verifyParentRecord`          | $INDEX_ROOT only (spot-check) | SAFE BY CONSTRUCTION (resident $INDEX_ROOT lives in base) |
+    //  | 7 | Volume.swift `removeFromParentI30`         | $INDEX_ROOT + $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge for $INDEX_ALLOCATION |
+    //  | 8 | Volume.swift `refreshParentSizeHint` (~4249)| $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge                       |
+    //  | 9 | Volume.swift `enumerate` (via `readIndexAllocation`) | $INDEX_ALLOCATION:$I30 | ROUTE THROUGH merge (canonical bug site) |
+    //  |10 | Extensions/NTFSFileSystem NTFSItem.swift:164 | unnamed $DATA size hints | SAFE BY CONSTRUCTION (size fields are identical across all extents per the ntfs3/ntfs-3g convention; `.first` is sufficient when only realSize/allocatedSize are consumed) |
+    //  |11 | RunlistBitmapAudit.swift `auditDataRunlistAgainstBitmap` (:240) | unnamed $DATA extents | ROUTE THROUGH merge |
+    //  |12 | RunlistBitmapAudit.swift `resolveDataExtents` (:592) | unnamed $DATA extents | ROUTE THROUGH merge |
+    //
+    // "ROUTE THROUGH merge" = the .first(where:) was replaced with a call
+    // to `mergeMultiExtensionAttribute(in: attrs, rawType:, name:)`.
+    // "SAFE BY CONSTRUCTION" = the callsite reads only attribute families
+    // that NEVER multi-extend in the v0.7 shape (resident attributes,
+    // base-record-resident system info, or size-only consumers of fields
+    // that are identical across extents).
 
     /// MFT record number of the $Bitmap system file. Always 6 on every NTFS
     /// volume — this is part of the NTFS spec, not a per-volume value.
@@ -1067,9 +1261,13 @@ public actor Volume {
             // LARGE_INDEX path: descend the B-tree to find the right leaf and
             // insert there. The MFT record / $INDEX_ROOT is unchanged; the
             // mutation happens entirely inside an INDX block in $INDEX_ALLOCATION.
-            guard let allocAttr = attrs.first(where: {
-                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-            }) else {
+            // v0.7 AC-5: route through the merge so a multi-extension $INDEX_ALLOCATION
+            // surfaces as a single Attribute carrying every VCN's extents.
+            guard let allocAttr = try mergeMultiExtensionAttribute(
+                in: attrs,
+                rawType: AttributeType.indexAllocation.rawValue,
+                name: "$I30"
+            ) else {
                 throw NTFSError.corruptOnDisk(
                     description: "LARGE_INDEX parent \(parentRecordNumber) is missing $INDEX_ALLOCATION:$I30"
                 )
@@ -2645,8 +2843,15 @@ public actor Volume {
             refs.insert(e.fileReference)
         }
         // Collect from $INDEX_ALLOCATION leaves if LARGE_INDEX.
+        // v0.7 AC-5: route through the merge to follow every extension's
+        // VCN range (multi-extension $INDEX_ALLOCATION would otherwise return
+        // only the VCN-0 extension and silently miss files in later extents).
         if root.isLargeIndex,
-           let allocAttr = attrs.first(where: { $0.type == .indexAllocation && $0.nameOrEmpty == "$I30" }),
+           let allocAttr = try mergeMultiExtensionAttribute(
+               in: attrs,
+               rawType: AttributeType.indexAllocation.rawValue,
+               name: "$I30"
+           ),
            case let .nonResident(_, _, _, _, _, _, _, extents) = allocAttr.value {
             let clusterBytes = UInt64(bytesPerCluster)
             let blockSize = Int(indexRecordSizeBytes)
@@ -3520,9 +3725,13 @@ public actor Volume {
         let root = try IndexRoot.parse(rootBytes)
         if root.isLargeIndex {
             // LARGE_INDEX path: find the entry in some leaf INDX block and rewrite that block.
-            guard let allocAttr = attrs.first(where: {
-                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-            }) else { return }  // no $INDEX_ALLOCATION — nothing to remove
+            // v0.7 AC-5: route through the merge so removal sweeps every VCN
+            // range when $INDEX_ALLOCATION is multi-extension.
+            guard let allocAttr = try mergeMultiExtensionAttribute(
+                in: attrs,
+                rawType: AttributeType.indexAllocation.rawValue,
+                name: "$I30"
+            ) else { return }  // no $INDEX_ALLOCATION — nothing to remove
             guard case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
                 return
             }
@@ -4237,9 +4446,13 @@ public actor Volume {
         if root.isLargeIndex {
             // T1.3: LARGE_INDEX path. Walk the leaves via IndexAllocationWriter,
             // find the entry by name, rewrite its keyBytes with bumped sizes.
-            guard let allocAttr = parentAttrs.first(where: {
-                $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-            }), case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
+            // v0.7 AC-5: route through the merge so the size-hint update walks
+            // every VCN range when $INDEX_ALLOCATION is multi-extension.
+            guard let allocAttr = try mergeMultiExtensionAttribute(
+                in: parentAttrs,
+                rawType: AttributeType.indexAllocation.rawValue,
+                name: "$I30"
+            ), case let .nonResident(_, _, _, _, _, _, _, allocExtents) = allocAttr.value else {
                 return
             }
             // Build the new $FILE_NAME body with bumped sizes — same length
@@ -5216,6 +5429,42 @@ public actor Volume {
         let baseRecordBytes = baseRecord.bytes
         let baseSeq = baseRecord.sequenceNumber
 
+        // v0.7 — multi-extension routing. If the base already carries a
+        // `$ATTRIBUTE_LIST` and the migrant `(type, name)` is NOT in the
+        // base's own attribute stream, this is a second-or-later migration:
+        // the attribute has previously been migrated to an extension record
+        // and that extension's own runlist has now overflowed too. Route
+        // to the multi-extension path which allocates an ADDITIONAL
+        // extension slot, splits the existing extension's runlist at an
+        // extent boundary, and appends an entry to the resident
+        // `$ATTRIBUTE_LIST` naming the new extension at `lowestVCN=splitVCN`.
+        //
+        // The `newAttributeBytes` path is the `$DATA` overflow case and
+        // is NOT yet wired to multi-extension (file `$DATA` runlists going
+        // multi-extension is a separate ceiling; v0.7 scope is
+        // `$INDEX_ALLOCATION:$I30` only).
+        if newAttributeBytes == nil {
+            let baseScan = try AttributeMigration.scanAttributes(
+                in: baseRecordBytes,
+                firstAttributeOffset: Int(baseRecord.firstAttributeOffset),
+                usedSize: Int(baseRecord.usedSize)
+            )
+            let hasAttributeList = baseScan.contains {
+                $0.type == AttributeType.attributeList.rawValue
+            }
+            let migrantInBase = baseScan.contains {
+                $0.type == migratingType && $0.name == migratingName
+            }
+            if hasAttributeList && !migrantInBase {
+                try await migrateMultiExtensionOnOverflow(
+                    baseRecordNumber: baseRecordNumber,
+                    migratingType: migratingType,
+                    migratingName: migratingName
+                )
+                return
+            }
+        }
+
         // 2. Allocate a fresh extension MFT record. From here until the
         //    final base commit, any throw must free this slot.
         let extRN = try await allocateMFTRecord()
@@ -5277,6 +5526,372 @@ public actor Volume {
 
         // Drop any cached parses of the migrated base so callers re-read.
         invalidateMFTCaches()
+    }
+
+    /// v0.7 multi-extension `$ATTRIBUTE_LIST` worker. Called when the
+    /// migrant `(migratingType, migratingName)` is already migrated to one
+    /// or more extension records and the LAST such extension's own runlist
+    /// has overflowed its MFT record. Splits the overflowing extension's
+    /// runlist at an extent boundary and adds a SECOND (or Nth) extension
+    /// record + a matching `$ATTRIBUTE_LIST` entry on the base.
+    ///
+    /// Compute-first transactional, mirroring `migrateAttributeOnOverflow`:
+    ///   1. Locate the overflowing existing extension via the resident
+    ///      `$ATTRIBUTE_LIST` on the base (the entry with the highest
+    ///      `lowestVCN` is the latest one).
+    ///   2. Read its current `(type, name)` attribute (sizes, attrID, extents).
+    ///   3. Compute the split point: smallest suffix-extent-count such that
+    ///      the surviving-prefix encoded runlist `<= 50% of (recordSize - overhead)`.
+    ///      Split at an extent boundary only.
+    ///   4. Build the prefix attribute (existing extension, truncated runlist)
+    ///      and the suffix attribute (new extension, starting at splitVCN).
+    ///   5. Allocate a new MFT slot.
+    ///   6. Use `AttributeMigration.buildAdditionalExtensionForAttribute` to
+    ///      compute the new base bytes (with the additional `$ATTRIBUTE_LIST`
+    ///      entry) and the new extension bytes.
+    ///   7. Commit in transactional order: new extension first → existing
+    ///      extension (prefix-truncated) → base. Any throw between alloc
+    ///      and the final base commit reclaims the new MFT slot.
+    ///
+    /// If the existing extension's runlist already fits well within its
+    /// record (no useful split available — e.g. <= 1 extent, or the entire
+    /// runlist is below the 50% budget), this function returns cleanly
+    /// without doing anything. The leaf-split caller may retry the rewrite
+    /// and succeed organically if its overflow was a transient artifact of
+    /// the rewrite path, OR will fail again with the genuine
+    /// `unsupportedFeature` (e.g. non-resident `$ATTRIBUTE_LIST` is needed,
+    /// not multi-extension).
+    private func migrateMultiExtensionOnOverflow(
+        baseRecordNumber: UInt64,
+        migratingType: UInt32,
+        migratingName: String
+    ) async throws {
+        let mft = self.mft()
+        let recordSize = Int(mftRecordSizeBytes)
+        let sectorSize = Int(boot.bytesPerSector)
+        let clusterBytes = UInt64(bytesPerCluster)
+
+        // 1. Re-read the base, walk its $ATTRIBUTE_LIST, find the latest
+        //    extension hosting this migrant family. "Latest" = the entry
+        //    whose lowestVCN is the maximum — that extension covers the
+        //    tail of the migrant's VCN space and is the one whose runlist
+        //    is overflowing.
+        let baseRecord = try await mft.record(at: baseRecordNumber)
+        let baseSeq = baseRecord.sequenceNumber
+        guard let attrListAttr = try baseRecord.attributes().first(where: {
+            $0.rawType == AttributeType.attributeList.rawValue
+        }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: base \(baseRecordNumber) has no $ATTRIBUTE_LIST"
+            )
+        }
+        let entries = try await attributeListEntries(of: attrListAttr)
+        let migrantEntries = entries
+            .filter { $0.attributeType == migratingType && $0.name == migratingName }
+            .sorted { $0.lowestVCN < $1.lowestVCN }
+        guard let lastEntry = migrantEntries.last else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: base \(baseRecordNumber) $ATTRIBUTE_LIST has no entry for type 0x\(String(migratingType, radix: 16, uppercase: true)) name '\(migratingName)'"
+            )
+        }
+        let existingExtRN = lastEntry.recordNumber
+        guard existingExtRN != baseRecordNumber else {
+            // The migrant is "in the base" per $ATTRIBUTE_LIST — but the
+            // caller's branch detected it wasn't in the base's attribute
+            // stream. Programmer error / inconsistency.
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: $ATTRIBUTE_LIST claims migrant is in base \(baseRecordNumber) but base scan found it absent"
+            )
+        }
+        let existingExtRecord = try await mft.record(at: existingExtRN)
+        guard existingExtRecord.sequenceNumber == lastEntry.sequenceNumber else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: extension \(existingExtRN) seq \(existingExtRecord.sequenceNumber) != $ATTRIBUTE_LIST entry seq \(lastEntry.sequenceNumber)"
+            )
+        }
+
+        // 2. Locate the migrant attribute inside the existing extension.
+        let existingExtAttrs = try existingExtRecord.attributes()
+        guard let migrantAttr = existingExtAttrs.first(where: {
+            $0.rawType == migratingType && $0.nameOrEmpty == migratingName
+        }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "migrateMultiExtensionOnOverflow: extension \(existingExtRN) does not carry the expected migrant type 0x\(String(migratingType, radix: 16, uppercase: true)) name '\(migratingName)'"
+            )
+        }
+        guard case let .nonResident(
+            startingVCN, lastVCN, _, _,
+            allocatedSizeBytes, realSizeBytes, initSizeBytes,
+            extents
+        ) = migrantAttr.value else {
+            throw NTFSError.unsupportedFeature(
+                description: "migrateMultiExtensionOnOverflow: migrant in extension \(existingExtRN) is not non-resident — multi-extension only applies to non-resident attributes"
+            )
+        }
+        let migrantAttributeID = migrantAttr.header.attributeID
+
+        // 3. Compute the split point. Measurement-driven: walk extents from
+        //    the END, peeling off suffix extents until the surviving prefix's
+        //    encoded runlist <= 50% of the per-record attribute budget.
+        //    "Attribute budget" = recordSize minus the per-record overhead
+        //    (MFT header + first-attribute offset + this attribute's header
+        //    + non-resident extension + UTF-16 name + end marker). The 50%
+        //    threshold leaves headroom so the prefix can grow on subsequent
+        //    leaf splits without immediately re-splitting (oscillation
+        //    avoidance).
+        let firstAttrOffset = Int(existingExtRecord.firstAttributeOffset)
+        let nameByteCount = migratingName.utf16.count * 2
+        // Per-attribute fixed overhead: 16 (common header) + 48 (non-resident
+        // ext) + name + 8-byte align + end marker.
+        let perAttrOverhead = 16 + 48 + nameByteCount + 7 /* align */ + 4 /* end marker */
+        let attributeBudget = recordSize - firstAttrOffset - perAttrOverhead
+        let runlistBudget = max(64, attributeBudget / 2)
+
+        guard extents.count >= 2 else {
+            // Can't split a single-extent runlist at an extent boundary.
+            // The "overflow" must be coming from something else (e.g. an
+            // extension record with no slack, but a single-extent runlist
+            // is already as small as the encoding gets). Return cleanly —
+            // the leaf-split caller will surface the underlying overflow
+            // separately if it's still a problem.
+            return
+        }
+
+        // Greedy from the END: keep the largest prefix that fits within
+        // `runlistBudget`. We iterate prefix length k = extents.count-1
+        // down to 1 (need at least 1 extent in the prefix AND at least 1
+        // in the suffix) and pick the largest k whose encoded prefix fits.
+        var chosenK: Int = 0
+        for k in (1..<extents.count).reversed() {
+            let prefixCandidate = Array(extents.prefix(k))
+            let encoded = encodeRunlist(extents: prefixCandidate)
+            if encoded.count <= runlistBudget {
+                chosenK = k
+                break
+            }
+        }
+        guard chosenK > 0, chosenK < extents.count else {
+            // Even one-extent prefix is over budget. That's a single-extent
+            // overflow scenario the multi-extension shape can't fix (the
+            // one prefix extent is already too large to encode). Return
+            // cleanly and let the caller surface the underlying issue.
+            return
+        }
+        let prefixExtents = Array(extents.prefix(chosenK))
+        let suffixExtents = Array(extents.suffix(from: chosenK))
+
+        // 4. Compute the split VCN. The prefix covers VCNs
+        //    [startingVCN .. startingVCN + prefixClusterTotal - 1]; the new
+        //    extension's lowestVCN is the next VCN after that.
+        let prefixClusterTotal = prefixExtents.reduce(UInt64(0)) { $0 + $1.clusterCount }
+        let suffixClusterTotal = suffixExtents.reduce(UInt64(0)) { $0 + $1.clusterCount }
+        let prefixLastVCN = startingVCN + prefixClusterTotal - 1
+        let splitVCN = prefixLastVCN + 1
+        // Sanity: lastVCN claimed by the existing attribute equals the sum.
+        _ = lastVCN
+        _ = suffixClusterTotal
+
+        // 5. Build the prefix and suffix attribute byte blobs. Multi-extent
+        //    NTFS attributes carry the FULL allocatedSize / realSize /
+        //    initializedSize on every extent (ntfs3 + ntfs-3g convention) —
+        //    we preserve whatever the existing attribute claimed.
+        let prefixAttrBytes = serializeMultiExtentNonResidentAttribute(
+            type: migratingType,
+            name: migratingName,
+            attrID: migrantAttributeID,
+            flags: migrantAttr.header.flags,
+            startingVCN: startingVCN,
+            lastVCN: prefixLastVCN,
+            allocatedSize: allocatedSizeBytes,
+            realSize: realSizeBytes,
+            initializedSize: initSizeBytes,
+            extents: prefixExtents
+        )
+        let suffixAttrBytes = serializeMultiExtentNonResidentAttribute(
+            type: migratingType,
+            name: migratingName,
+            attrID: migrantAttributeID,
+            flags: migrantAttr.header.flags,
+            startingVCN: splitVCN,
+            lastVCN: lastVCN,
+            allocatedSize: allocatedSizeBytes,
+            realSize: realSizeBytes,
+            initializedSize: initSizeBytes,
+            extents: suffixExtents
+        )
+
+        // 6. Allocate a new MFT slot. From here, any throw must reclaim it.
+        let newExtRN = try await allocateMFTRecord()
+        var newExtSeq: UInt16 = 1
+        if let existing = try? await mft.record(at: newExtRN) {
+            newExtSeq = existing.sequenceNumber &+ 1
+            if newExtSeq == 0 { newExtSeq = 1 }
+        }
+
+        // 7. Pure compute: new base + new extension bytes.
+        let multiResult: AttributeMigration.AdditionalExtensionResult
+        let newExistingExtBytes: Data
+        do {
+            multiResult = try AttributeMigration.buildAdditionalExtensionForAttribute(
+                baseRecordBytes: baseRecord.bytes,
+                baseRN: baseRecordNumber,
+                baseSeq: baseSeq,
+                migratingType: migratingType,
+                migratingName: migratingName,
+                migrantAttributeID: migrantAttributeID,
+                newExtRN: newExtRN,
+                newExtSeq: newExtSeq,
+                splitVCN: splitVCN,
+                suffixAttributeBytes: suffixAttrBytes,
+                recordSize: recordSize,
+                sectorSize: sectorSize
+            )
+            // Splice the prefix attribute back into the existing extension's
+            // record (replacing its current (type, name) attribute).
+            newExistingExtBytes = try rewriteEntireAttributeWithHeaderUpdate(
+                in: existingExtRecord.bytes,
+                recordSize: existingExtRecord.bytes.count,
+                replacingType: migratingType,
+                attributeName: migratingName,
+                replacementBytes: prefixAttrBytes
+            )
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        // 8. Commit the NEW extension record first. Transactional order:
+        //    extension-first, then existing-extension truncation, then base
+        //    (the order that minimizes inconsistency on partial failure —
+        //    same discipline as `migrateAttributeOnOverflow`).
+        do {
+            try await mft.writeRawRecord(at: newExtRN, postFixupBytes: multiResult.newExtensionBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        // 8b. Fire the optional test-only fault hook (if installed). Mirrors
+        //     the createFile hook discipline: fires AFTER the new extension
+        //     write hit disk but BEFORE the existing extension and base are
+        //     touched. The catch must reclaim the new slot — no orphans, no
+        //     dangling pointers.
+        _ = clusterBytes
+        #if DEBUG
+        do {
+            try _consumeMultiExtensionFaultHook()
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+        #endif
+
+        // 9. Commit the EXISTING extension's truncation.
+        //    Save the pre-truncation bytes BEFORE the write so the step-10
+        //    catch can roll back the truncation if the base write fails.
+        //    `writeRawRecord` is per-record atomic (single `device.write` for
+        //    extension records, which always live at recordNumber >= 4 — the
+        //    $MFTMirr mirror only applies to records 0..3, so there's no
+        //    primary/mirror split-write here). If step 9 throws, nothing
+        //    landed on disk → no rollback needed in the step-9 catch.
+        let existingExtPreTruncationBytes: Data = existingExtRecord.bytes
+        do {
+            try await mft.writeRawRecord(at: existingExtRN, postFixupBytes: newExistingExtBytes)
+        } catch {
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        // 9b. Fire the optional second test-only fault hook (if installed).
+        //     Fires AFTER the existing extension truncation has hit disk but
+        //     BEFORE the base's $ATTRIBUTE_LIST update — the worst-case
+        //     mid-flight crash window. The catch below MUST roll back the
+        //     truncation (otherwise: silent data loss for entries in
+        //     splitVCN..originalLastVCN).
+        #if DEBUG
+        do {
+            try _consumeMultiExtensionFaultHookAfterTruncation()
+        } catch {
+            // Rollback discipline mirrors step-10 catch (same recovery path).
+            try? await mft.writeRawRecord(at: existingExtRN, postFixupBytes: existingExtPreTruncationBytes)
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+        #endif
+
+        // 10. Commit the new base record (the $ATTRIBUTE_LIST update).
+        do {
+            try await mft.writeRawRecord(at: baseRecordNumber, postFixupBytes: multiResult.newBaseBytes)
+        } catch {
+            // BUG FIX (v0.7 self-heal iter-1): step-10 (base write) failure
+            // leaves the existing-extension TRUNCATED on disk (step 9 already
+            // landed). The base's on-disk $ATTRIBUTE_LIST still points only
+            // at existing-ext lvcn=0 (single entry), so a reader would see a
+            // runlist covering only [0..splitVCN-1] — entries living in
+            // [splitVCN..originalLastVCN] become structurally unreachable
+            // (silent data loss). RESTORE the existing-extension's
+            // pre-truncation bytes BEFORE reclaiming the new-ext slot. The
+            // "failed to restore" path is best-effort `try?` — we're already
+            // in error recovery, and the worst case becomes "fail loud" not
+            // "data-loss silently". Post-rollback worst-case is identical to
+            // the pre-migration state: base AL unchanged, existing-ext full
+            // runlist, new-ext slot reclaimed.
+            try? await mft.writeRawRecord(at: existingExtRN, postFixupBytes: existingExtPreTruncationBytes)
+            try? await reclaimOrphanedMFTRecord(at: newExtRN)
+            throw error
+        }
+
+        invalidateMFTCaches()
+    }
+
+    /// Generic non-resident attribute serializer for the multi-extension
+    /// `$INDEX_ALLOCATION` (and any future) split path. Like
+    /// `serializeIndexAllocationAttribute`, but takes the attribute `type`,
+    /// `name`, `attrID`, `startingVCN`, `lastVCN`, and the explicit size
+    /// triple. Multi-extent attributes duplicate `allocatedSize`/`realSize`/
+    /// `initializedSize` across every extent (ntfs3 + ntfs-3g convention).
+    private func serializeMultiExtentNonResidentAttribute(
+        type: UInt32,
+        name: String,
+        attrID: UInt16,
+        flags: UInt16,
+        startingVCN: UInt64,
+        lastVCN: UInt64,
+        allocatedSize: UInt64,
+        realSize: UInt64,
+        initializedSize: UInt64,
+        extents: [Extent]
+    ) -> Data {
+        let nameUTF16 = Array(name.utf16)
+        let nameByteCount = nameUTF16.count * 2
+        let runlist = encodeRunlist(extents: extents)
+        let runlistOffset = 64 + nameByteCount
+        let rawLen = runlistOffset + runlist.count
+        let alignedLen = ((rawLen + 7) / 8) * 8
+        var data = Data(count: alignedLen)
+        MFTRecord.writeU32LE(into: &data, at: 0,  value: type)
+        MFTRecord.writeU32LE(into: &data, at: 4,  value: UInt32(alignedLen))
+        data[data.startIndex + 8] = 1                           // non-resident
+        data[data.startIndex + 9] = UInt8(nameUTF16.count)
+        MFTRecord.writeU16LE(into: &data, at: 10, value: 64)    // name offset (after non-resident extension)
+        MFTRecord.writeU16LE(into: &data, at: 12, value: flags)
+        MFTRecord.writeU16LE(into: &data, at: 14, value: attrID)
+        MFTRecord.writeU64LE(into: &data, at: 16, value: startingVCN)
+        MFTRecord.writeU64LE(into: &data, at: 24, value: lastVCN)
+        MFTRecord.writeU16LE(into: &data, at: 32, value: UInt16(runlistOffset))
+        data[data.startIndex + 34] = 0                           // compression unit
+        // 35..39 reserved zeros
+        MFTRecord.writeU64LE(into: &data, at: 40, value: allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: realSize)
+        MFTRecord.writeU64LE(into: &data, at: 56, value: initializedSize)
+        for (i, codeUnit) in nameUTF16.enumerated() {
+            data[data.startIndex + 64 + 2 * i]     = UInt8(codeUnit & 0xFF)
+            data[data.startIndex + 64 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
+        }
+        for (i, byte) in runlist.enumerated() {
+            data[data.startIndex + runlistOffset + i] = byte
+        }
+        return data
     }
 
     /// Roll back an MFT record allocation by flipping IN_USE off. Used both
@@ -5953,9 +6568,14 @@ public actor Volume {
         directoryRecord: UInt64,
         seenReferences: inout Set<UInt64>
     ) async throws -> [DirectoryEntry] {
-        guard let allocAttr = attributes.first(where: {
-            $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
-        }) else {
+        // v0.7 AC-5: route through the merge so directory enumeration walks
+        // every VCN range when $INDEX_ALLOCATION is multi-extension — pre-fix
+        // this was the canonical "19 of 416 names missing" half-read bug site.
+        guard let allocAttr = try mergeMultiExtensionAttribute(
+            in: attributes,
+            rawType: AttributeType.indexAllocation.rawValue,
+            name: "$I30"
+        ) else {
             // LARGE_INDEX flag set but no $INDEX_ALLOCATION present in
             // directory record \(directoryRecord) — treat as a fixture quirk;
             // the entries we already have from $INDEX_ROOT are still valid.

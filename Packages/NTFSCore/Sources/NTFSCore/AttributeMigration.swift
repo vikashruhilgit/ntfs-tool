@@ -32,6 +32,24 @@ public enum AttributeMigration {
         }
     }
 
+    /// v0.7 multi-extension migration result.
+    ///
+    /// `newBaseBytes` is the rewritten base record carrying the previously
+    /// existing `$ATTRIBUTE_LIST` plus ONE additional entry of the same
+    /// `(attributeType, name)` family with `lowestVCN == splitVCN` and
+    /// `mftReference == (newExtSeq << 48) | newExtRN`.
+    /// `newExtensionBytes` is the freshly-built extension MFT record holding
+    /// the suffix attribute (with `startingVCN == splitVCN`).
+    public struct AdditionalExtensionResult: Sendable, Equatable {
+        public let newBaseBytes: Data
+        public let newExtensionBytes: Data
+
+        public init(newBaseBytes: Data, newExtensionBytes: Data) {
+            self.newBaseBytes = newBaseBytes
+            self.newExtensionBytes = newExtensionBytes
+        }
+    }
+
     /// Build a migration of a single named-or-unnamed attribute (identified by
     /// `migratingType` + `migratingName`) out of the base record and into a new
     /// extension record, adding a resident `$ATTRIBUTE_LIST` to the base in its
@@ -254,6 +272,231 @@ public enum AttributeMigration {
         )
 
         return Result(newBaseBytes: newBase, newExtBytes: newExt)
+    }
+
+    /// v0.7 — multi-extension `$ATTRIBUTE_LIST` builder. Used when the
+    /// migrant (`migratingType:migratingName`) is ALREADY migrated to an
+    /// existing extension record, and that extension's own runlist is now
+    /// too large to fit a single MFT record. The caller allocates a fresh
+    /// extension slot and computes the runlist split at an extent boundary,
+    /// then asks this builder to:
+    ///
+    ///   1. Append an ADDITIONAL `$ATTRIBUTE_LIST` entry to the base record
+    ///      naming the same `(attributeType, name)` pair with
+    ///      `lowestVCN == splitVCN` and `mftReference == new extension`.
+    ///   2. Re-sort the `$ATTRIBUTE_LIST` body canonically
+    ///      `(attributeType, name UTF-16, lowestVCN)`.
+    ///   3. Build a fresh extension MFT record carrying `suffixAttributeBytes`
+    ///      with `baseFileReference = (baseSeq << 48) | baseRN`.
+    ///
+    /// Pure / no I/O. Inputs are all bytes; outputs are post-fix-up bytes
+    /// suitable for `MFT.writeRawRecord` (the caller is responsible for the
+    /// USA reverseFixup, just like `buildAttributeMigration`).
+    ///
+    /// The caller MUST also separately rewrite the *existing* extension's
+    /// record to truncate its runlist to the surviving prefix (covering
+    /// VCN `0..splitVCN-1` for a `lowestVCN==0` first extent, generally
+    /// `firstVCN..splitVCN-1` for higher extents); that rewrite lives in
+    /// `Volume` because it requires the runlist encoder and is record-shape
+    /// dependent. This builder does NOT touch the existing extension.
+    ///
+    /// ### Split-point heuristic (AC-4, measurement-driven)
+    ///
+    /// The caller picks `splitVCN` such that the surviving-prefix runlist
+    /// (the existing extension's truncated runlist, re-serialized via the
+    /// canonical `encodeRunlist`) is `<= 50% of (recordSize - fixed_attribute_overhead)`.
+    /// "Fixed overhead" = the existing extension's attribute header
+    /// (16 bytes common header + 48 bytes non-resident extension + UTF-16
+    /// name + alignment + the MFT record header + end marker). The 50%
+    /// threshold leaves headroom so the runlist can grow on subsequent leaf
+    /// splits without immediately re-splitting (the "oscillation" failure
+    /// mode the AC-4 unit test guards against).
+    ///
+    /// Split at an **extent boundary** only — never mid-extent. This keeps
+    /// the runlist-encoded bytes well-defined and avoids the variable-width
+    /// encoding hazards mid-extent splits would invite. NTFS runlist
+    /// encoding is variable-width per extent (signed-delta + length), so
+    /// analytical "K from extent count" can mis-budget; measure the actual
+    /// encoded bytes.
+    ///
+    /// ### Parameters
+    ///
+    /// - `baseRecordBytes`: the current base record (carrying the existing
+    ///   resident `$ATTRIBUTE_LIST` with N entries; this builder produces
+    ///   one with N+1 entries).
+    /// - `migratingType` / `migratingName`: the attribute family being
+    ///   extended (e.g. `0xA0` / `"$I30"`).
+    /// - `migrantAttributeID`: the existing migrant's attribute ID. Multi-
+    ///   extent NTFS attributes share the same attribute ID across all
+    ///   their extents; the new `$ATTRIBUTE_LIST` entry MUST use it.
+    /// - `newExtRN` / `newExtSeq`: identity of the freshly-allocated
+    ///   extension MFT slot.
+    /// - `splitVCN`: the new extension's `lowestVCN` (= first VCN it
+    ///   covers, = `lastVCN_of_surviving_prefix + 1`).
+    /// - `suffixAttributeBytes`: the caller-built attribute blob (header +
+    ///   non-resident extension + runlist for VCNs `splitVCN..lastVCN`)
+    ///   to splice into the new extension record. Header MUST carry
+    ///   `startingVCN == splitVCN`.
+    /// - `recordSize` / `sectorSize`: same constants the base record was
+    ///   built with.
+    ///
+    /// ### Returns
+    ///
+    /// `AdditionalExtensionResult.newBaseBytes` and `.newExtensionBytes`.
+    /// Both are post-fix-up byte images.
+    public static func buildAdditionalExtensionForAttribute(
+        baseRecordBytes: Data,
+        baseRN: UInt64,
+        baseSeq: UInt16,
+        migratingType: UInt32,
+        migratingName: String,
+        migrantAttributeID: UInt16,
+        newExtRN: UInt64,
+        newExtSeq: UInt16,
+        splitVCN: UInt64,
+        suffixAttributeBytes: Data,
+        recordSize: Int,
+        sectorSize: Int
+    ) throws -> AdditionalExtensionResult {
+        guard baseRecordBytes.count == recordSize else {
+            throw NTFSError.corruptOnDisk(
+                description: "AttributeMigration.buildAdditionalExtensionForAttribute: base record size \(baseRecordBytes.count) != expected \(recordSize)"
+            )
+        }
+        guard recordSize >= 256, sectorSize > 2, recordSize % sectorSize == 0 else {
+            throw NTFSError.corruptOnDisk(
+                description: "AttributeMigration.buildAdditionalExtensionForAttribute: invalid recordSize \(recordSize) / sectorSize \(sectorSize)"
+            )
+        }
+        guard splitVCN > 0 else {
+            throw NTFSError.corruptOnDisk(
+                description: "AttributeMigration.buildAdditionalExtensionForAttribute: splitVCN must be > 0 (the new extension can't start at VCN 0)"
+            )
+        }
+
+        // Re-read the base record header in the same way `MFTRecord.parse` does.
+        let firstAttrOffset = Int(try baseRecordBytes.readU16LE(at: 20))
+        let baseUsedSize = Int(try baseRecordBytes.readU32LE(at: 24))
+        let nextAttrID = try baseRecordBytes.readU16LE(at: 40)
+
+        let scan = try scanAttributes(
+            in: baseRecordBytes,
+            firstAttributeOffset: firstAttrOffset,
+            usedSize: baseUsedSize
+        )
+
+        // Find the existing $ATTRIBUTE_LIST attribute.
+        guard let attrListIdx = scan.firstIndex(where: {
+            $0.type == AttributeType.attributeList.rawValue
+        }) else {
+            throw NTFSError.corruptOnDisk(
+                description: "AttributeMigration.buildAdditionalExtensionForAttribute: base record has no $ATTRIBUTE_LIST to extend"
+            )
+        }
+        let attrListAttr = scan[attrListIdx]
+
+        // Read the resident $ATTRIBUTE_LIST body (non-resident is a separate
+        // ceiling, not yet handled at this entry point).
+        let nonResidentByte = try baseRecordBytes.readU8(at: attrListAttr.start + 8)
+        guard nonResidentByte == 0 else {
+            throw NTFSError.unsupportedFeature(
+                description: "buildAdditionalExtensionForAttribute: non-resident $ATTRIBUTE_LIST not supported yet"
+            )
+        }
+        let valueLength = Int(try baseRecordBytes.readU32LE(at: attrListAttr.start + 16))
+        let valueOffset = Int(try baseRecordBytes.readU16LE(at: attrListAttr.start + 20))
+        let bodyStart = attrListAttr.start + valueOffset
+        let body = baseRecordBytes.subdata(
+            in: (baseRecordBytes.startIndex + bodyStart)..<(baseRecordBytes.startIndex + bodyStart + valueLength)
+        )
+        var entries = try AttributeListEntry.parseAll(in: body)
+
+        // Append the new entry naming the new extension at lowestVCN=splitVCN.
+        let newEntry = AttributeListEntry.make(
+            attributeType: migratingType,
+            attributeName: migratingName,
+            recordNumber: newExtRN,
+            sequenceNumber: newExtSeq,
+            attributeID: migrantAttributeID,
+            lowestVCN: splitVCN
+        )
+        entries.append(newEntry)
+
+        // NTFS canonical sort: (attributeType, name UTF-16 binary, lowestVCN).
+        entries.sort { a, b in
+            if a.attributeType != b.attributeType { return a.attributeType < b.attributeType }
+            let an = Array(a.name.utf16), bn = Array(b.name.utf16)
+            if an.lexicographicallyPrecedes(bn) { return true }
+            if bn.lexicographicallyPrecedes(an) { return false }
+            return a.lowestVCN < b.lowestVCN
+        }
+
+        let newAttrListBody = serializeAttributeListBody(entries)
+        // Reuse the existing $ATTRIBUTE_LIST attribute ID; only the body grows.
+        let newAttrListBytes = buildResidentAttribute(
+            type: AttributeType.attributeList.rawValue,
+            attrID: attrListAttr.attributeID,
+            flags: 0,
+            value: newAttrListBody
+        )
+
+        // Compose the new base attribute stream: every existing attribute
+        // EXCEPT the old $ATTRIBUTE_LIST, then the rebuilt one, then the end
+        // marker. Preserves the (attribute-stream-order) layout of every
+        // non-$ATTRIBUTE_LIST attribute; appends the new $ATTRIBUTE_LIST at
+        // the tail (its byte position within the stream doesn't matter for
+        // correctness; the contents do).
+        let attrsStart = firstAttrOffset
+        var newAttrs = Data()
+        for (idx, attr) in scan.enumerated() where idx != attrListIdx {
+            newAttrs.append(baseRecordBytes[
+                (baseRecordBytes.startIndex + attr.start)..<(baseRecordBytes.startIndex + attr.start + attr.length)
+            ])
+        }
+        newAttrs.append(newAttrListBytes)
+
+        let newUsedSize = attrsStart + newAttrs.count + 4
+        guard newUsedSize <= recordSize else {
+            throw NTFSError.unsupportedFeature(
+                description: "buildAdditionalExtensionForAttribute: enlarged $ATTRIBUTE_LIST exceeds base record slack — non-resident $ATTRIBUTE_LIST not yet implemented"
+            )
+        }
+
+        var newBase = Data(count: recordSize)
+        for i in 0..<attrsStart {
+            newBase[newBase.startIndex + i] = baseRecordBytes[baseRecordBytes.startIndex + i]
+        }
+        for (i, byte) in newAttrs.enumerated() {
+            newBase[newBase.startIndex + attrsStart + i] = byte
+        }
+        MFTRecord.writeU32LE(into: &newBase, at: attrsStart + newAttrs.count, value: AttributeType.endMarker)
+        MFTRecord.writeU32LE(into: &newBase, at: 24, value: UInt32(newUsedSize))
+        // nextAttributeID doesn't need to bump: the new $ATTRIBUTE_LIST reuses
+        // the existing attribute ID; the new extension reuses the migrant's
+        // attribute ID (multi-extent attributes share IDs across extents).
+        // Preserve the existing value verbatim.
+        MFTRecord.writeU16LE(into: &newBase, at: 40, value: nextAttrID)
+
+        // Build the new extension record carrying the suffix attribute blob.
+        let baseRef = packMFTReference(recordNumber: baseRN, sequenceNumber: baseSeq)
+        let newExt = try MFTRecord.buildExtensionRecord(
+            recordNumber: newExtRN,
+            sequenceNumber: newExtSeq,
+            baseFileReference: baseRef,
+            attributesBytes: suffixAttributeBytes,
+            // The suffix shares its attribute ID with the prefix (multi-extent
+            // attributes); the extension's own nextAttributeID must still be
+            // greater than that, since any future attribute added to this
+            // extension picks IDs from this counter.
+            nextAttributeID: migrantAttributeID &+ 1,
+            recordSize: recordSize,
+            sectorSize: sectorSize
+        )
+
+        return AdditionalExtensionResult(
+            newBaseBytes: newBase,
+            newExtensionBytes: newExt
+        )
     }
 
     /// Build a migration of the unique `$INDEX_ALLOCATION:$I30` attribute out

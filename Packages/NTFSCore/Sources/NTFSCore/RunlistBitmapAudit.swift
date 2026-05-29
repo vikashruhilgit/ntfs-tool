@@ -237,8 +237,14 @@ extension Volume {
         }
 
         // Resolve the unnamed $DATA through attribute-list-aware lookup.
+        // v0.7 AC-5: route through the merge so audit walks every extent of
+        // a multi-extension $DATA, not just the VCN-0 portion.
         let allAttrs = try await allAttributesOf(recordNumber: recordNumber)
-        let dataAttr = allAttrs.first { $0.type == .data && $0.nameOrEmpty == "" }
+        let dataAttr = try mergeMultiExtensionAttribute(
+            in: allAttrs,
+            rawType: AttributeType.data.rawValue,
+            name: ""
+        )
 
         // No unnamed $DATA (e.g. a pure directory) ⇒ nothing to check.
         guard let dataAttr else {
@@ -590,7 +596,13 @@ extension Volume {
     /// unnamed $DATA. Read-only.
     private func resolveDataExtents(recordNumber: UInt64) async throws -> [Extent]? {
         let attrs = try await allAttributesOf(recordNumber: recordNumber)
-        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+        // v0.7 AC-5: route through the merge so multi-extension $DATA returns
+        // every VCN's extents, not just the VCN-0 portion (half-read bug).
+        guard let dataAttr = try mergeMultiExtensionAttribute(
+            in: attrs,
+            rawType: AttributeType.data.rawValue,
+            name: ""
+        ) else {
             return nil
         }
         return dataAttr.value.nonResidentExtents

@@ -2,7 +2,37 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — v0.6 candidate (self-contained NTFS reformat)
+## [Unreleased] — v0.7 candidate (multi-extension `$ATTRIBUTE_LIST` for `$INDEX_ALLOCATION:$I30`)
+
+### Added
+
+- **Multi-extension `$INDEX_ALLOCATION:$I30` write path.** When a directory's migrated `$INDEX_ALLOCATION` extension's own runlist fills its MFT record, a second extension is allocated and the runlist is split at an extent boundary. The base's resident `$ATTRIBUTE_LIST` grows by one entry — two 0xA0:$I30 entries with disjoint VCN ranges, each referencing its own extension record. Lifts the ~file-7,997 single-directory cap that PR #34 documented as the next structural ceiling. Per-directory capacity is now bounded only by free clusters and free MFT slots on the volume.
+- **`AttributeMigration.buildAdditionalExtensionForAttribute`** — pure builder with measurement-driven split-point heuristic (smallest suffix extent count such that the surviving prefix's encoded runlist is ≤ 50% of `record_size − fixed_attribute_overhead`; splits at extent boundary only).
+- **`Volume.mergeMultiExtensionAttribute(in:rawType:name:)`** — canonical read-path merge seam. Concatenates the extents of multiple `Attribute` values for the same `(rawType, name)` in VCN order, enforcing the NTFS contiguity invariant. Routed at all 12 audited read-side callsites in `Volume.swift` and `RunlistBitmapAudit.swift`; the audit verdict table is captured at the helper's declaration.
+- **Transactional discipline:** compute-first; write new extension first, then existing-extension truncation + base `$ATTRIBUTE_LIST` rewrite committed together; new MFT slot reclaimed on throw. Test-only `_setMultiExtensionFaultHook` seam lets the transactional-failure test fire between the new-extension write and the base update.
+
+### Fixed
+
+- **Silent half-read on multi-extension shape.** Pre-v0.7, `Volume.resolveAttribute` (and several other call sites) walked the flat attribute list with `.first(where:)` — for multi-extension `$INDEX_ALLOCATION` / `$DATA` this returned only the VCN-0 attribute and missed every entry living in the suffix extension (measured: 19 of 416 names missing on round-trip readback before the fix). All routed callsites now stitch the extensions together via `mergeMultiExtensionAttribute`.
+
+### Tests
+
+- **216 → 217 NTFSCore tests pass, 1 pre-existing skip, 0 failures, CLI release builds.**
+- `MultiExtensionIndexAllocationTests.swift`:
+  - `testSecondMigrationAddsAdditionalExtension` — second migration succeeds; base carries two 0xA0:$I30 entries with disjoint VCN ranges and distinct extension recnums.
+  - `testMultiExtensionIATransactionalFailure` — fault hook injected between new-ext write and base update; new MFT slot is reclaimed, base is byte-identical to pre-fault, no orphan, no dangling.
+  - `testMultiExtensionIASpecConformantBytes` — base's `$ATTRIBUTE_LIST` body hand-decoded byte-by-byte (PR #26 lesson — NOT round-tripped through our own parser); exactly two 0xA0:$I30 entries, lowestVCN-ordered, distinct mftReferences.
+  - `testMultiExtensionIAReadbackRoundTrip` — close + reopen + enumerate root after driving past one extension's capacity; every inserted name is present.
+  - `testMergeMultiExtensionAttribute_unitContract` — direct synthetic-input exercise of the helper: out-of-order input, single-match short-circuit, no-match nil.
+  - `testMultiExtensionVerifyDeepClean` (AC-7) — drives the multi-extension shape, runs `auditAllDataRunlistsAgainstBitmap`, asserts `isClean == true` and `doubleAllocatedClusters == 0`.
+
+### Known caveats
+
+- **Hardware re-validation pending** (user manual step): reformat the drive, copy the full 22,419-file phone-backup corpus into a single directory, and run `verify --deep`. Either completes fully OR surfaces the *next* deeper ceiling (likely non-resident `$BITMAP:$I30` or non-resident `$INDEX_ROOT`). Both are release-quality outcomes; whichever fires gets documented honestly.
+- **Multi-extension `$DATA` (0x80) is not implemented in v0.7.** The shape is identical (would reuse `buildAdditionalExtensionForAttribute` + `mergeMultiExtensionAttribute`) but isn't driven by any known hardware failure mode. The v0.5 `unsupportedFeature` path remains fail-closed for that case.
+- **Non-resident `$ATTRIBUTE_LIST`** (when the resident `$ATTRIBUTE_LIST` body itself exhausts base slack) is unchanged from v0.5 — distinct ceiling, distinct error path.
+
+## v0.6 — self-contained NTFS reformat
 
 ### Added
 
