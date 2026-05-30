@@ -246,4 +246,390 @@ final class DirectoryIndexLocalityTests: XCTestCase {
             """
         )
     }
+
+    // MARK: - AC-4 / AC-7: fragmented-volume graceful degradation
+
+    /// Swiss-cheese fragmentation of the volume's free space: allocate every
+    /// free cluster as a 1-cluster extent (up to a cap), then free every other
+    /// one. This heavily fragments the (low) region it covers, so as `$DATA`
+    /// fills the index lane the allocator's private `indexChunkClusters` (256)
+    /// contiguous probe fails and `allocateIndexClusters(near:)` is driven down
+    /// its single-cluster degrade leaf (`findFreeRun(256) → findFreeRun(1)`).
+    /// (The default `cap` leaves the upper free region intact, so the first few
+    /// INDX blocks may still land contiguously in the upper-25% lane before the
+    /// degrade path takes over — the multi-extent result below proves it ran.)
+    ///
+    /// Mirrors `MultiExtensionIndexAllocationTests.fragmentFreeSpace` (that
+    /// helper is `private` to its file, so we re-declare it here rather than
+    /// importing it). Returns the count of single-cluster holes punched, for
+    /// diagnostics.
+    @discardableResult
+    func fragmentFreeSpace(_ volume: Volume, cap: Int = 8192) async throws -> Int {
+        var singles: [Extent] = []
+        while let e = try? await volume.allocateClusters(1) {
+            singles.append(e)
+            if singles.count > cap { break }
+        }
+        var holes = 0
+        for (i, e) in singles.enumerated() where i % 2 == 0 {
+            try await volume.freeClusters(e)
+            holes += 1
+        }
+        return holes
+    }
+
+    /// AC-4 / AC-7 — graceful degradation on a fragmented volume.
+    ///
+    /// Fragment the volume's free space into a swiss-cheese pattern so NO
+    /// 256-cluster contiguous run survives, then drive a directory's index
+    /// non-resident and grow it across several INDX blocks. With locality
+    /// unable to find a contiguous chunk, `allocateIndexClusters(near:)` must
+    /// degrade to the single-cluster fallback (`findFreeRun(1)`) — exactly
+    /// today's `allocateClusters(1)` behavior — and the directory must STILL
+    /// grow correctly with no crash/corruption.
+    ///
+    /// Assertions:
+    ///   1. the directory's `$INDEX_ALLOCATION` runlist has MULTIPLE extents
+    ///      (degrade path engaged — locality could not keep it to 1 extent,
+    ///      because the single-cluster fallback hands out scattered holes);
+    ///   2. every created file enumerates back AND its `$DATA` reads back to
+    ///      the written length (no structural corruption from the fallback).
+    ///
+    /// AC-4 also requires the PR #35 multi-extension `$ATTRIBUTE_LIST` fallback
+    /// to keep working for the pathological case. That mechanism is proven
+    /// end-to-end and unchanged by `MultiExtensionIndexAllocationTests`
+    /// (testSecondMigrationAddsAdditionalExtension, …TransactionalFailure,
+    /// …SpecConformantBytes, …VerifyDeepClean) — this test does not re-derive
+    /// it; it proves the single-cluster degrade chain that sits BELOW the
+    /// migration fallback.
+    ///
+    /// OBSERVED (64 MiB swiss-cheese, 1,500 entries): the fragmented runlist
+    /// reached ~83 extents AND the directory migrated to `$ATTRIBUTE_LIST` —
+    /// i.e. on a genuinely pathological volume BOTH the single-cluster degrade
+    /// chain AND the PR #35 multi-extension fallback engage organically, while
+    /// the directory still grows correctly and reads back. (Contrast the AC-3
+    /// payoff test on a healthy 512 MiB volume: 1 extent, no migration.)
+    func testFragmentedVolumeFallsBackAndStillGrows() async throws {
+        // Smaller image so the swiss-cheese fragmentation covers essentially
+        // all free space (no 256-run survives anywhere) within the cap.
+        let volume = try await freshFormattedVolume(sizeMiB: 64, label: "FRAGFB")
+
+        let holes = try await fragmentFreeSpace(volume)
+        XCTAssertGreaterThan(
+            holes, 256,
+            "fragmentation must punch enough holes that no 256-cluster run survives; punched \(holes)"
+        )
+
+        let dirRN = try await makeSubdirectory(volume: volume, named: "fragdir")
+
+        // Drive enough entries to push the index non-resident and grow it
+        // across several INDX blocks. Resident $DATA (bytesPerFile=0 would stay
+        // resident); use a small non-resident payload so each file consumes a
+        // hole and the index is forced to grow from the remaining scattered
+        // holes. Stops early on outOfSpace (the fragmented 64 MiB image is
+        // deliberately tight) — the partial count is fine for the degrade proof.
+        let created = try await driveDirectory(
+            volume: volume,
+            dirRN: dirRN,
+            entryCount: 1500,
+            namePrefix: "frag",
+            bytesPerFile: 4096
+        )
+        XCTAssertGreaterThan(
+            created, 200,
+            "must create enough entries to force multi-block index growth; got \(created)"
+        )
+
+        let extents = try await indexAllocationExtentCount(volume: volume, dirRN: dirRN)
+        let migrated = try await directoryMigratedToAttributeList(volume: volume, dirRN: dirRN)
+
+        print("""
+            === AC-4/AC-7 FRAGMENTED-VOLUME DEGRADE ===
+            image size:                 64 MiB (swiss-cheese fragmented)
+            holes punched:              \(holes)
+            entries created:            \(created)
+            $INDEX_ALLOCATION extents:  \(extents)
+            migrated to $ATTRIBUTE_LIST: \(migrated)
+            ===========================================
+            """)
+
+        // (1) Degrade path engaged: the index could not be kept to 1 extent on
+        //     a fully-fragmented volume, so the single-cluster fallback produced
+        //     a multi-extent runlist. (>1 proves the fallback chain ran without
+        //     crashing — contrast the contiguous test's ==1.)
+        XCTAssertGreaterThan(
+            extents, 1,
+            """
+            On a swiss-cheese-fragmented volume the locality allocator must \
+            degrade to single-cluster fallback, producing a MULTI-extent \
+            $INDEX_ALLOCATION runlist; measured \(extents) extents at \(created) \
+            entries. ==1 would mean a contiguous chunk survived fragmentation \
+            (test setup failed to fragment).
+            """
+        )
+
+        // (2) No corruption: every created file enumerates and reads back.
+        let entries = try await volume.enumerate(directory: dirRN)
+        let nonDosNames = Set(
+            entries.filter { $0.fileName.namespace != .dos }.map { $0.fileName.name }
+        )
+        for i in 0..<created {
+            let name = String(format: "frag-%06d.bin", i)
+            XCTAssertTrue(
+                nonDosNames.contains(name),
+                "fragmented-grow file '\(name)' must still enumerate (index grew correctly under fallback)"
+            )
+        }
+        // Spot-check readback on a sample so we don't read 1000s of files.
+        let sampleIndices = stride(from: 0, to: created, by: max(1, created / 25))
+        for i in sampleIndices {
+            let name = String(format: "frag-%06d.bin", i)
+            guard let entry = entries.first(where: {
+                $0.fileName.namespace != .dos && $0.fileName.name == name
+            }) else {
+                XCTFail("sample file '\(name)' missing from enumeration")
+                continue
+            }
+            let bytes = try await volume.readFile(at: entry.recordNumber)
+            XCTAssertEqual(
+                bytes.count, 4096,
+                "sample file '\(name)' $DATA must read back to its written length under the fallback"
+            )
+        }
+    }
+
+    // MARK: - AC-5: no cluster leak (deep-audit + orphan reachability)
+
+    /// Reachability orphan walk: IN_USE user base records (rn >= 16, not an
+    /// extension) that are NOT reachable from root via `enumerate`. Mirrors
+    /// `MultiExtensionIndexAllocationTests.orphans` (private there). A leaked
+    /// extension record or a dangling INDX-referenced child would surface here.
+    func orphans(in volume: Volume, maxRN: UInt64 = 4096) async throws -> Set<UInt64> {
+        let mft = await volume.mft()
+        var inUseUser: Set<UInt64> = []
+        for rn: UInt64 in 0..<maxRN {
+            guard let rec = try? await mft.record(at: rn) else { continue }
+            if rec.baseFileReference != 0 { continue }
+            if rec.isInUse, rn >= 16 { inUseUser.insert(rn) }
+        }
+        var reachable: Set<UInt64> = [5]
+        var queue: [UInt64] = [5]
+        while let dir = queue.popLast() {
+            guard let entries = try? await volume.enumerate(directory: dir) else { continue }
+            for e in entries where e.fileName.namespace != .dos {
+                if !reachable.contains(e.recordNumber) {
+                    reachable.insert(e.recordNumber)
+                    if e.isDirectory { queue.append(e.recordNumber) }
+                }
+            }
+        }
+        return inUseUser.subtracting(reachable.filter { $0 >= 16 })
+    }
+
+    /// AC-5 (no leak on delete). Drive a directory to a few thousand entries
+    /// (locality-grown, multi-INDX-block), then delete every file and the now-
+    /// empty directory, and assert the whole-volume deep audit is clean with
+    /// zero free-but-referenced / double-allocated clusters and no orphans.
+    ///
+    /// Because every INDX cluster is marked in `$Bitmap` only at build+splice
+    /// time (allocate-on-use — no reserved tail), `deleteFile` frees exactly
+    /// what was referenced and nothing leaks. The pre/post free-cluster-count
+    /// comparison is the direct INDX-leak canary (the `$DATA`-focused audit
+    /// catches double-alloc/free-but-referenced; the count delta catches a
+    /// silently-leaked INDX tail).
+    ///
+    /// Scale: 2,500 entries on a 256 MiB image — enough to grow the index
+    /// across several INDX blocks (verified via extent count) without the cost
+    /// of the 4,000-entry payoff test.
+    func testNoLeakAfterDeletingLocalityGrownDirectory() async throws {
+        let volume = try await freshFormattedVolume(sizeMiB: 256, label: "NOLEAKD")
+
+        let bmBefore = try await volume.bitmap()
+        let freeBefore = bmBefore.freeClusterCount
+
+        let dirRN = try await makeSubdirectory(volume: volume, named: "deldir")
+        let entryTarget = 2500
+        let created = try await driveDirectory(
+            volume: volume,
+            dirRN: dirRN,
+            entryCount: entryTarget,
+            namePrefix: "del",
+            bytesPerFile: 4096
+        )
+        XCTAssertGreaterThan(created, 500, "need a substantial directory to grow the index; got \(created)")
+
+        // Confirm the index actually grew non-resident (this test is only
+        // meaningful if there ARE INDX clusters to leak).
+        let extentsGrown = try await indexAllocationExtentCount(volume: volume, dirRN: dirRN)
+        XCTAssertGreaterThan(
+            extentsGrown, 0,
+            "directory must have a non-resident $INDEX_ALLOCATION (INDX clusters to free); extents=\(extentsGrown)"
+        )
+
+        // Delete every file, then the now-empty directory.
+        let entries = try await volume.enumerate(directory: dirRN)
+        for e in entries where e.fileName.namespace != .dos {
+            try await volume.deleteFile(at: e.recordNumber)
+        }
+        try await volume.deleteFile(at: dirRN)
+
+        // (1) Free-cluster count must return to baseline (no leaked INDX or
+        //     $DATA tail). This is the direct INDX-leak canary.
+        let bmAfter = try await volume.bitmap()
+        let freeAfter = bmAfter.freeClusterCount
+        print("""
+            === AC-5 NO-LEAK-ON-DELETE ===
+            entries created/deleted:    \(created)
+            $INDEX_ALLOCATION extents (pre-delete): \(extentsGrown)
+            free clusters before build: \(freeBefore)
+            free clusters after delete: \(freeAfter)
+            ==============================
+            """)
+        XCTAssertEqual(
+            freeAfter, freeBefore,
+            """
+            free-cluster count must return to baseline after deleting the whole \
+            locality-grown directory — any shortfall is a leaked INDX/$DATA tail. \
+            before=\(freeBefore), after=\(freeAfter), leaked=\(Int64(freeBefore) - Int64(freeAfter)).
+            """
+        )
+
+        // (2) Whole-volume deep audit clean.
+        let sweep = try await volume.auditAllDataRunlistsAgainstBitmap()
+        XCTAssertTrue(
+            sweep.isClean,
+            """
+            deep audit must be clean after delete; got \
+            freeButReferenced=\(sweep.freeButReferencedClusters), \
+            outOfRange=\(sweep.outOfRangeClusters), \
+            doubleAllocated=\(sweep.doubleAllocatedClusters), \
+            unreadable=\(sweep.unreadableRecords.count)
+            """
+        )
+        XCTAssertEqual(sweep.freeButReferencedClusters, 0, "0 free-but-referenced clusters")
+        XCTAssertEqual(sweep.doubleAllocatedClusters, 0, "0 double-allocated clusters")
+
+        // (3) No orphans (the deleted directory + children left nothing
+        //     IN_USE-but-unreachable).
+        let orphanSet = try await orphans(in: volume)
+        XCTAssertTrue(
+            orphanSet.isEmpty,
+            "no orphans after deleting the locality-grown directory; got \(orphanSet.sorted())"
+        )
+    }
+
+    /// AC-5 (no leak on aborted growth — crash-simulating). Drive a directory
+    /// partway so it's locality-grown (several INDX blocks), then simulate an
+    /// abort DURING further index growth and assert disk consistency.
+    ///
+    /// MECHANISM: `_setCreateFileFaultHook(.afterI30CommitBeforeReturn)`.
+    /// Per Volume.swift, `.afterI30CommitBeforeReturn` throws AFTER
+    /// `insertIntoParentI30` has committed (the leaf-split/promote path that
+    /// allocates+splices the new INDX block runs INSIDE `insertIntoParentI30`,
+    /// and marks each INDX cluster in `$Bitmap` at build+splice time) but
+    /// BEFORE `createFile` returns. This faithfully represents "abort mid-
+    /// directory-growth": the index has just grown (a new INDX cluster may have
+    /// been allocated and spliced into the runlist) and we crash before the
+    /// operation completes. The allocate-on-use discipline (AC-2) guarantees no
+    /// reserved-but-unmarked chunk exists, so the on-disk state must remain
+    /// consistent: 0 free-but-referenced, 0 double-allocated, no orphans, and
+    /// the directory still fully enumerates.
+    ///
+    /// (We use the fault hook rather than a reopen-consistency proof because a
+    /// fault point DOES land right after INDX growth — it is the more faithful
+    /// "abort mid-growth" representation.)
+    ///
+    /// Scale: ~800 entries on a 256 MiB image — enough to be multi-INDX-block
+    /// before the aborted create.
+    func testNoLeakAfterAbortedDirectoryGrowth() async throws {
+        let volume = try await freshFormattedVolume(sizeMiB: 256, label: "NOLEAKA")
+        let dirRN = try await makeSubdirectory(volume: volume, named: "abortdir")
+
+        // Drive partway so the index is locality-grown (multi-INDX-block).
+        let created = try await driveDirectory(
+            volume: volume,
+            dirRN: dirRN,
+            entryCount: 800,
+            namePrefix: "ab",
+            bytesPerFile: 4096
+        )
+        XCTAssertGreaterThan(created, 300, "directory must be locality-grown before abort; got \(created)")
+        let extentsBefore = try await indexAllocationExtentCount(volume: volume, dirRN: dirRN)
+        XCTAssertGreaterThan(
+            extentsBefore, 0,
+            "directory must have a non-resident $INDEX_ALLOCATION before the aborted growth"
+        )
+
+        // Snapshot the reachable name set pre-abort (data-loss canary).
+        let entriesPre = try await volume.enumerate(directory: dirRN)
+        let namesPre = Set(
+            entriesPre.filter { $0.fileName.namespace != .dos }.map { $0.fileName.name }
+        )
+
+        // Install the fault hook: the NEXT createFile commits its $I30 entry
+        // (running the INDX-growth allocate+splice), then throws before
+        // returning — the crash-mid-growth window.
+        await volume._setCreateFileFaultHook(.afterI30CommitBeforeReturn)
+        var caught: Error?
+        do {
+            _ = try await volume.createFile(named: "ab-ABORT-MARKER.bin", inDirectory: dirRN)
+        } catch {
+            caught = error
+        }
+        await volume._setCreateFileFaultHook(nil)
+
+        let err = try XCTUnwrap(caught, "the aborted createFile must throw at .afterI30CommitBeforeReturn")
+        if case NTFSError.ioFailure(let desc) = err {
+            XCTAssertTrue(
+                desc.contains("afterI30CommitBeforeReturn"),
+                "expected the afterI30CommitBeforeReturn fault; got: \(desc)"
+            )
+        } else {
+            XCTFail("expected NTFSError.ioFailure from the fault hook; got: \(err)")
+        }
+
+        // (1) Whole-volume deep audit clean despite the mid-growth abort.
+        let sweep = try await volume.auditAllDataRunlistsAgainstBitmap()
+        print("""
+            === AC-5 NO-LEAK-ON-ABORT ===
+            entries before abort:       \(created)
+            $INDEX_ALLOCATION extents:  \(extentsBefore)
+            freeButReferenced:          \(sweep.freeButReferencedClusters)
+            doubleAllocated:            \(sweep.doubleAllocatedClusters)
+            =============================
+            """)
+        XCTAssertTrue(
+            sweep.isClean,
+            """
+            deep audit must be clean after a mid-growth abort (allocate-on-use \
+            leaves no reserved tail); got \
+            freeButReferenced=\(sweep.freeButReferencedClusters), \
+            outOfRange=\(sweep.outOfRangeClusters), \
+            doubleAllocated=\(sweep.doubleAllocatedClusters), \
+            unreadable=\(sweep.unreadableRecords.count)
+            """
+        )
+        XCTAssertEqual(sweep.freeButReferencedClusters, 0, "0 free-but-referenced after abort")
+        XCTAssertEqual(sweep.doubleAllocatedClusters, 0, "0 double-allocated after abort")
+
+        // (2) No orphans introduced by the aborted growth.
+        let orphanSet = try await orphans(in: volume)
+        XCTAssertTrue(
+            orphanSet.isEmpty,
+            "no orphans after the aborted directory growth; got \(orphanSet.sorted())"
+        )
+
+        // (3) Data-loss canary: every name present pre-abort still enumerates
+        //     (the abort neither dropped existing entries nor corrupted the
+        //     index it had just grown).
+        let entriesPost = try await volume.enumerate(directory: dirRN)
+        let namesPost = Set(
+            entriesPost.filter { $0.fileName.namespace != .dos }.map { $0.fileName.name }
+        )
+        let missing = namesPre.subtracting(namesPost)
+        XCTAssertTrue(
+            missing.isEmpty,
+            "post-abort: all pre-abort entries must still enumerate; missing \(missing.sorted().prefix(5))"
+        )
+    }
 }
