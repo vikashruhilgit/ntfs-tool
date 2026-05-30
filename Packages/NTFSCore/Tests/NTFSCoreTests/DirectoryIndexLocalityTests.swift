@@ -166,26 +166,32 @@ final class DirectoryIndexLocalityTests: XCTestCase {
         return attrs.contains { $0.rawType == AttributeType.attributeList.rawValue }
     }
 
-    // MARK: - AC-0: pre-fix fragmentation baseline
+    // MARK: - AC-3: post-fix locality payoff
 
-    /// AC-0 baseline. Drives a fresh subdirectory to a large entry count with
-    /// per-file non-resident `$DATA` writes interleaved (the real `cp -r`
-    /// allocation order) and asserts the directory's `$INDEX_ALLOCATION` extent
-    /// count is LARGE (≫ 10) — the pre-fix fragmentation made concrete.
+    /// AC-3 payoff. Drives a fresh subdirectory to the SAME 4,000-entry scale
+    /// as the AC-0 baseline — with the SAME per-file non-resident `$DATA`
+    /// interleave (load-bearing: it reproduces the real `cp -r` allocation
+    /// order that scattered the index pre-fix) — and asserts the OPPOSITE of
+    /// the baseline:
+    ///   1. the directory's `$INDEX_ALLOCATION` runlist has FEW extents (≤ 10),
+    ///      because the per-directory locality allocator places consecutive
+    ///      INDX blocks contiguously in an index lane away from the `$DATA`
+    ///      front, so the runs coalesce; AND
+    ///   2. the directory did NOT migrate to `$ATTRIBUTE_LIST` — the `$I30`
+    ///      overflow/cap mechanism never fires, because a coalesced runlist is
+    ///      a handful of bytes and fits the base MFT record forever.
     ///
-    /// Scale choice: the brief's headline number is ~8,000 entries. Each entry
-    /// here is a full createFile + a 4 KiB non-resident $DATA write, which is
-    /// substantially heavier than a bare createFile, so 8,000 would dominate
-    /// test time. 4,000 entries already drives the index well past the resident
-    /// threshold and produces heavy fragmentation (dozens-to-hundreds of
-    /// extents) while finishing in a reasonable time. The assertion is
-    /// scale-independent ("count ≫ 10"); the exact measured number is recorded
-    /// in the MEASURED comment below.
+    /// Scale choice: identical to the baseline — 4,000 full createFile + 4 KiB
+    /// non-resident `$DATA` writes. The assertion is the inverse of AC-0's.
     ///
     // MEASURED PRE-FIX (v0.7.1, unfixed code): 222 extents at 4000 entries on a 512 MiB image
     //   (the directory ALSO migrated to $ATTRIBUTE_LIST — the $I30 cap mechanism fired,
     //   confirming the runlist outgrew the 1 KB base MFT record exactly as the brief predicts).
-    func testPreFixIndexFragmentationBaseline() async throws {
+    // MEASURED POST-FIX (v0.7.1, locality allocator): 1 extent at 4000 entries on a 512 MiB image,
+    //   NO $ATTRIBUTE_LIST migration. The per-directory locality hint + high index lane
+    //   (indexChunkClusters=256, upper-25% lane base) keeps every INDX block contiguous, so the
+    //   whole directory's $I30 runlist coalesces into a SINGLE extent (down from 222 pre-fix).
+    func testLargeDirectoryIndexStaysContiguous() async throws {
         let volume = try await freshFormattedVolume(sizeMiB: 512)
         let dirRN = try await makeSubdirectory(volume: volume, named: "bigdir")
 
@@ -200,33 +206,43 @@ final class DirectoryIndexLocalityTests: XCTestCase {
 
         XCTAssertGreaterThan(
             created, 1000,
-            "harness must create a substantial number of entries to demonstrate fragmentation; got \(created)"
+            "harness must create a substantial number of entries to demonstrate locality; got \(created)"
         )
 
         let extents = try await indexAllocationExtentCount(volume: volume, dirRN: dirRN)
         let migrated = try await directoryMigratedToAttributeList(volume: volume, dirRN: dirRN)
 
         print("""
-            === AC-0 PRE-FIX INDEX FRAGMENTATION BASELINE ===
+            === AC-3 POST-FIX INDEX LOCALITY PAYOFF ===
             image size:                 512 MiB
             entries created:            \(created) (target \(entryTarget))
             $INDEX_ALLOCATION extents:  \(extents)
             migrated to $ATTRIBUTE_LIST: \(migrated)
-            =================================================
+            ===========================================
             """)
 
-        // The core baseline assertion: the pre-fix global next-fit allocator
-        // scatters INDX blocks, so the runlist has MANY extents. A
-        // per-directory-contiguous allocator (the later fix) would keep this in
-        // the single digits. ≫ 10 proves the fragmentation exists today.
-        XCTAssertGreaterThan(
+        // (1) The per-directory locality allocator keeps consecutive INDX
+        //     blocks contiguous → the runlist coalesces to a handful of
+        //     extents (down from the measured 222 pre-fix).
+        XCTAssertLessThanOrEqual(
             extents, 10,
             """
-            PRE-FIX baseline expects HEAVY $INDEX_ALLOCATION fragmentation \
-            (≫ 10 extents) from the global next-fit allocator interleaving file \
-            $DATA between INDX-block allocations; measured \(extents) extents at \
-            \(created) entries. If this is small, either the fix already landed \
-            or the per-file $DATA interleave isn't happening.
+            POST-FIX expects FEW $INDEX_ALLOCATION extents (≤ 10) from the \
+            per-directory locality allocator coalescing consecutive INDX \
+            blocks; measured \(extents) extents at \(created) entries (pre-fix \
+            was 222). If this is large, the locality hint/lane isn't keeping \
+            the index contiguous.
+            """
+        )
+
+        // (2) A coalesced runlist never overflows the base MFT record, so the
+        //     $I30 cap/migration mechanism must NOT fire at this scale.
+        XCTAssertFalse(
+            migrated,
+            """
+            POST-FIX expects NO $ATTRIBUTE_LIST migration at \(created) entries \
+            — a contiguous index runlist is a few bytes and fits the base MFT \
+            record forever. Migration firing means the runlist still grew large.
             """
         )
     }

@@ -1464,7 +1464,11 @@ public actor Volume {
                 description: "promote: indexRecordSizeBytes (\(indexRecordSizeBytes)) != bytesPerCluster (\(clusterBytes)) — multi-cluster INDX promotion not yet supported"
             )
         }
-        let extent = try await allocateClusters(1)
+        // v0.7.1: resident→large promotion — the directory has NO existing
+        // $INDEX_ALLOCATION extents yet, so there is no per-directory tail to
+        // bias toward. Pass nil so the index allocator seeds the directory's
+        // index lane in the high region, away from the bulk-$DATA front.
+        let extent = try await allocateIndexClusters(near: indexLocalityHint(forExtents: []))
         guard let leafLCN = extent.startLCN else {
             throw NTFSError.corruptOnDisk(description: "promote: allocator returned sparse extent")
         }
@@ -1632,8 +1636,11 @@ public actor Volume {
             )
         }
 
-        // 2. Allocate one new cluster for the right-half leaf.
-        let newExtent = try await allocateClusters(1)
+        // 2. Allocate one new cluster for the right-half leaf, biased to land
+        //    contiguous with the directory's existing $INDEX_ALLOCATION tail.
+        let newExtent = try await allocateIndexClusters(
+            near: indexLocalityHint(forExtents: allocationExtents)
+        )
         guard let newLCN = newExtent.startLCN else {
             throw NTFSError.corruptOnDisk(description: "splitLeaf: allocator returned sparse extent")
         }
@@ -2122,10 +2129,21 @@ public actor Volume {
         // Allocate 2 new clusters. The primary leaf extent is independent;
         // it's already in `primaryNewExtent`. Track our extra allocations
         // so the caller can free them on commit failure.
-        let leftInterExtent = try await allocateClusters(1)
+        // v0.7.1: bias both interior blocks toward the directory's index tail.
+        // The left intermediate aims at the tail of everything already in the
+        // (in-flight) runlist: existing extents + the primary leaf + any
+        // cascade-accumulated extents. The right intermediate then aims right
+        // after the left one so the two land contiguous with each other.
+        let leftInterRunlistSoFar =
+            allocationExtents + [primaryNewExtent] + cascadeAccumulatedExtents
+        let leftInterExtent = try await allocateIndexClusters(
+            near: indexLocalityHint(forExtents: leftInterRunlistSoFar)
+        )
         let rightInterExtent: Extent
         do {
-            rightInterExtent = try await allocateClusters(1)
+            rightInterExtent = try await allocateIndexClusters(
+                near: indexLocalityHint(forExtents: leftInterRunlistSoFar + [leftInterExtent])
+            )
         } catch {
             try? await freeClusters(leftInterExtent)
             throw error
@@ -2545,10 +2563,17 @@ public actor Volume {
                 let leftHalf = Array(splice.newInterior[0..<mid])
                 let rightHalf = Array(splice.newInterior[(mid + 1)..<splice.newInterior.count])
 
-                // Allocate cluster for right half.
+                // Allocate cluster for right half, biased to extend the
+                // directory's in-flight index runlist tail (existing extents +
+                // primary leaf + cascade extents accumulated so far) so the
+                // cascade's new interior blocks stay contiguous. (v0.7.1)
                 let rightExtent: Extent
                 do {
-                    rightExtent = try await allocateClusters(1)
+                    rightExtent = try await allocateIndexClusters(
+                        near: indexLocalityHint(
+                            forExtents: allocationExtents + [primaryNewExtent] + extraExtents
+                        )
+                    )
                 } catch {
                     for ext in extraExtents { try? await freeClusters(ext) }
                     throw error
@@ -6104,6 +6129,90 @@ public actor Volume {
         bm.clearDirty()
         _bitmap = bm
         advanceAllocHint(after: extent, clusterCount: bm.clusterCount)
+        return extent
+    }
+
+    // MARK: - v0.7.1: per-directory index ($INDEX_ALLOCATION) locality allocator
+
+    /// Target contiguous run length (clusters) the index allocator AIMS at when
+    /// placing a directory's next INDX block. This is an IN-MEMORY search target
+    /// ONLY — never reserved up front in `$Bitmap`. A larger value gives a
+    /// relocated index lane more contiguous headroom so it survives many
+    /// subsequent single-block allocations before needing to relocate again,
+    /// which is what keeps the runlist coalesced to a handful of extents.
+    /// Tuned empirically against the AC-3 4,000-entry test (see
+    /// DirectoryIndexLocalityTests).
+    private static let indexChunkClusters: UInt64 = 256
+
+    /// LCN immediately after a directory's last (non-sparse) INDX block, or nil
+    /// if the directory has no $INDEX_ALLOCATION extents yet. Migration-safe:
+    /// callers pass the in-scope `allocationExtents`, which is built from the
+    /// $ATTRIBUTE_LIST-aware merged view, so this tracks the true runlist tail
+    /// even after a PR #35 multi-extension migration.
+    private func indexLocalityHint(forExtents extents: [Extent]) -> UInt64? {
+        for ext in extents.reversed() {
+            guard let lcn = ext.startLCN else { continue }  // skip sparse
+            return lcn + ext.clusterCount
+        }
+        return nil
+    }
+
+    /// High-base bias for the index lane: the LCN the index allocator starts
+    /// searching from when a directory has NO existing index extents (first
+    /// INDX block) and no caller hint. Placing the index lane in the upper
+    /// region of the volume keeps it away from the bulk-`$DATA` front (which
+    /// fills from low clusters via `_allocHint`), so interleaved file-data
+    /// writes during a `cp -r` don't creep into and shred the index lane.
+    /// `findFreeRun` wraps, so if the high region is full it still finds low
+    /// free space — the bias is a preference, never a hard reservation.
+    private func indexLaneBase(volumeClusterCount: UInt64) -> UInt64 {
+        // Upper ~25% of the volume. Empirically this keeps the index lane clear
+        // of the $DATA front for directories driven to thousands of entries on
+        // the test image sizes, while leaving plenty of low space for $DATA.
+        guard volumeClusterCount > 0 else { return 0 }
+        return volumeClusterCount - (volumeClusterCount / 4)
+    }
+
+    /// Allocate ONE cluster for a directory INDX block, preferring per-directory
+    /// locality so consecutive blocks coalesce into one runlist extent.
+    ///
+    /// - Probe for a contiguous run of `indexChunkClusters` free clusters
+    ///   starting at `hint` (the directory's runlist tail). If found at L: when
+    ///   the lane is healthy L == hint → the new block is contiguous with the
+    ///   directory's existing index (coalesces); when file data crept in, L is a
+    ///   fresh contiguous region → next blocks extend it. Mark ONLY ONE cluster
+    ///   (L).
+    /// - If no chunk-sized run exists anywhere (full/fragmented volume): degrade
+    ///   to a single free cluster (today's behavior). This is the AC-4 fallback.
+    ///
+    /// CRITICAL (AC-2/AC-5): marks exactly ONE cluster in `$Bitmap`,
+    /// transactionally, per call — NEVER reserves the chunk up front. The
+    /// "chunk" is purely an in-memory target the search aims at; there is no
+    /// reserved-but-unmarked tail to leak on crash, and no new crash window vs.
+    /// `allocateClusters(1)`. Does NOT advance the global `_allocHint` — keeps
+    /// the index lane separate from the `$DATA` lane.
+    func allocateIndexClusters(near hint: UInt64?) async throws -> Extent {
+        var bm = try await bitmap()
+        // When the directory already has an index tail, bias toward it; when it
+        // doesn't (first INDX block), bias to the high index lane so the lane
+        // starts away from the $DATA front.
+        let base = hint ?? indexLaneBase(volumeClusterCount: bm.clusterCount)
+        let chosen: UInt64
+        if let l = bm.findFreeRun(count: Self.indexChunkClusters, startingAt: base) {
+            chosen = l                                   // contiguous-or-relocate
+        } else if let l = bm.findFreeRun(count: 1, startingAt: base) {
+            chosen = l                                   // degrade: nearest single (AC-4)
+        } else {
+            throw NTFSError.outOfSpace(
+                requestedClusters: 1,
+                freeClusters: bm.freeClusterCount
+            )
+        }
+        let extent = try bm.allocate(1, startingAt: chosen)  // marks [chosen, chosen+1)
+        try await persistBitmap(bm)
+        bm.clearDirty()
+        _bitmap = bm
+        // Deliberately NOT advancing _allocHint — the index lane is separate.
         return extent
     }
 
