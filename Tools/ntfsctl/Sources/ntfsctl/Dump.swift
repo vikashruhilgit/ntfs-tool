@@ -63,6 +63,20 @@ struct Dump: AsyncParsableCommand {
         print("  Base record:            \(record.isBaseRecord ? "yes" : "no (extension record)")")
         print("  Migrated ($ATTR_LIST):  \(audit.hasAttributeList ? "yes" : "no")")
 
+        // (1b) If the target is a directory, surface its index runlist. A
+        // directory's INDX blocks (4 KiB B-tree nodes) live in the
+        // non-resident $INDEX_ALLOCATION (type 0xA0, name "$I30") attribute,
+        // whose runlist lists the clusters holding them. The EXTENT COUNT is
+        // the fragmentation signal: real NTFS allocates a directory's INDX
+        // blocks contiguously (few extents); the pre-fix global next-fit
+        // allocator scatters them (one extent per block → linear growth that
+        // overflows the 1 KB MFT record at ~8,000 files). Read via the merged,
+        // $ATTRIBUTE_LIST-aware view so a migrated directory's index runlist is
+        // stitched across extensions. STRICTLY READ-ONLY.
+        if record.isDirectory {
+            try await printIndexAllocationExtents(volume: volume, recordNumber: rn)
+        }
+
         // (2) Unnamed $DATA: resident vs non-resident.
         print("$DATA:")
         if audit.dataResident {
@@ -120,6 +134,48 @@ struct Dump: AsyncParsableCommand {
             }
             throw ExitCode(1)
         }
+    }
+
+    /// Print the directory's `$INDEX_ALLOCATION:$I30` runlist via the merged,
+    /// `$ATTRIBUTE_LIST`-aware view. Surfaces the extent count (the
+    /// fragmentation signal) prominently, then each non-sparse extent's
+    /// `(startLCN, clusterCount)`. STRICTLY READ-ONLY: `allAttributesOf` is a
+    /// pure read. If the directory has no non-resident `$INDEX_ALLOCATION:$I30`
+    /// (small directory whose index is still resident in `$INDEX_ROOT`), this
+    /// notes that and returns — a resident index has no runlist to fragment.
+    private func printIndexAllocationExtents(volume: NTFSCore.Volume, recordNumber rn: UInt64) async throws {
+        let attrs = try await volume.allAttributesOf(recordNumber: rn)
+        guard let ia = attrs.first(where: {
+            $0.type == .indexAllocation && $0.nameOrEmpty == "$I30"
+        }) else {
+            print("$INDEX_ALLOCATION:$I30:")
+            print("  Storage:                resident index ($INDEX_ROOT only — no $INDEX_ALLOCATION)")
+            return
+        }
+
+        print("$INDEX_ALLOCATION:$I30:")
+        guard case let .nonResident(_, lastVCN, _, _, allocatedSize, _, _, extents) = ia.value else {
+            print("  Storage:                resident (unexpected for $INDEX_ALLOCATION)")
+            return
+        }
+
+        // Non-sparse extents are the physical INDX-block allocations; sparse
+        // runs (rare for $I30) carry no allocation. The fragmentation metric is
+        // the non-sparse extent count.
+        let nonSparse = extents.filter { !$0.isSparse }
+        print("  Storage:                non-resident")
+        print(String(format: "  allocatedSize:          %@", sizeColumn(allocatedSize)))
+        print("  lastVCN:                \(lastVCN)")
+        print("  $INDEX_ALLOCATION extents: \(nonSparse.count)")
+
+        print(String(format: "  %-12@ %@",
+                     "startLCN" as NSString,
+                     "clusterCount" as NSString))
+        print("  " + String(repeating: "-", count: 32))
+        for e in nonSparse {
+            print(String(format: "  %-12llu %llu", e.startLCN ?? 0, e.clusterCount))
+        }
+        print("")
     }
 
     /// Per-extent $Bitmap verdict: a clean extent reports `ALLOCATED <n>`;
