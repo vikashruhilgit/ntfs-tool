@@ -2,6 +2,38 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — v0.7.1 (per-directory index-allocation locality lane — the ROOT-CAUSE fix)
+
+The ~8,000-file single-directory cap was a **fragmentation symptom, not an NTFS structural limit.** Real NTFS drivers (Windows ntfs.sys, Paragon, Tuxera, ntfs-3g) keep a directory's `$INDEX_ALLOCATION` runlist tiny by allocating its INDX blocks contiguously (per-directory locality), so it never approaches the MFT-record size limit. Pre-v0.7.1 we allocated every INDX block via the GLOBAL next-fit hint shared with file `$DATA`; during a `cp -r`, file-data clusters interleaved between consecutive INDX-block allocations and scattered them → one runlist extent per block → linear runlist growth → base-record overflow at ~8 k files. v0.7 (below) treated the symptom (split the giant runlist across extension records); v0.7.1 stops the runlist from getting giant in the first place — the fix that should have come first.
+
+### Added
+
+- **Per-directory index-allocation locality lane (`Volume.allocateIndexClusters(near:)`).** Allocates ONE cluster for a directory INDX block, biasing toward the directory's runlist tail (or, for the first INDX block, an upper-25%-of-volume index-lane base away from the `$DATA` front). Probes `findFreeRun(count: indexChunkClusters, startingAt: hint)`; on a healthy lane the run starts AT the hint so the new block is contiguous with the directory's existing index and coalesces into ONE runlist extent. Replaces the GLOBAL-hinted `allocateClusters(1)` at the 5 directory-INDX allocation sites (leaf-split/promote/cascade/height-grow paths in `Volume.swift`). Deliberately does NOT advance the global `_allocHint` — the index lane stays separate from the `$DATA` lane.
+- **`Volume.indexLocalityHint(forExtents:)`** — derives the per-directory hint as `lastNonSparseExtent.startLCN + clusterCount`. Migration-safe: callers pass the `$ATTRIBUTE_LIST`-aware merged `allocationExtents`, so the hint tracks the true runlist tail even after a PR #35 multi-extension migration.
+- **`indexChunkClusters = 256`** — the in-memory contiguous target the search aims at; gives the index lane headroom so it survives many subsequent single-block allocations before relocating, which is what keeps the runlist coalesced.
+- **Allocate-on-use discipline (NO up-front `$Bitmap` reservation).** Each INDX cluster is marked allocated in `$Bitmap` ONE AT A TIME, at the moment it is actually built + spliced into the runlist — exactly as before. The "chunk" is purely an in-memory target LCN range; the on-disk `$Bitmap` mutation stays per-block and transactional. There is no reserved-but-unmarked tail to leak on crash and no new crash window vs. `allocateClusters(1)`.
+
+### Fixed
+
+- **The ~file-7,997 single-directory cap, at its root.** Measured on a 4,000-entry directory driven with the real `cp -r` interleave (per-file non-resident `$DATA` writes between INDX-block allocations) on a 512 MiB image: the `$INDEX_ALLOCATION` runlist dropped from **222 extents → 1 extent**, with **NO `$ATTRIBUTE_LIST` migration** triggered at all (pre-fix the same directory both fragmented to 222 extents AND migrated — the `$I30` cap mechanism fired). A coalesced runlist is a handful of bytes and fits the base MFT record forever.
+
+### Changed
+
+- **Multi-extension `$ATTRIBUTE_LIST` (v0.7 / PR #35) repositioned as the rare last-resort fallback** for genuinely fragmented/pathological volumes, rather than the primary capacity mechanism. It remains fully functional and is still proven end-to-end by the unchanged PR #35 suite; on a swiss-cheese-fragmented volume both the new single-cluster degrade chain and the PR #35 migration engage organically.
+
+### Tests
+
+- **217 → 221 NTFSCore tests pass, 1 pre-existing skip, 0 failures (222 executed, +4 new), CLI release builds.** `MultiExtensionIndexAllocationTests` (the 7-test PR #35 suite) pass UNCHANGED, confirming the fallback still works.
+- `DirectoryIndexLocalityTests.swift` (new this subtask):
+  - `testFragmentedVolumeFallsBackAndStillGrows` (AC-4/AC-7) — swiss-cheese-fragments a 64 MiB volume so no 256-cluster run survives, drives a directory across multiple INDX blocks, and asserts the index STILL grows correctly: the `$INDEX_ALLOCATION` runlist has MULTIPLE extents (the `findFreeRun(256)→findFreeRun(1)` degrade chain engaged; observed ~83 extents + an organic `$ATTRIBUTE_LIST` migration), every created file enumerates, and sampled files read back to their written length.
+  - `testNoLeakAfterDeletingLocalityGrownDirectory` (AC-5) — drives a 2,500-entry locality-grown (multi-INDX-block) directory, deletes every file then the directory, and asserts the free-cluster count returns to baseline EXACTLY (0 leaked), `auditAllDataRunlistsAgainstBitmap().isClean == true` with 0 free-but-referenced / 0 double-allocated clusters, and 0 orphans. Proves the allocate-on-use guarantee: delete frees exactly what was referenced because nothing was reserved ahead.
+  - `testNoLeakAfterAbortedDirectoryGrowth` (AC-5) — drives a directory locality-grown, then crash-simulates an abort mid-INDX-growth via `_setCreateFileFaultHook(.afterI30CommitBeforeReturn)` (throws right after the `$I30` commit that runs the INDX allocate+splice), and asserts the deep audit is clean (0 free-but-referenced, 0 double-allocated), 0 orphans, and no pre-abort entry is dropped — confirming no leaked-on-crash tail.
+- `testLargeDirectoryIndexStaysContiguous` (AC-3, added by the prior subtask) — the 222→1-extent payoff with no migration.
+
+### Known caveats
+
+- **AC-9 hardware re-validation remains a pending MANUAL step.** Reformat a drive (`mkntfs -Q`), then run the full 22,419-file phone-backup `cp -rT … | tee` into a single directory and `verify --deep`. With a contiguous index runlist (~8 bytes for the whole directory) this run should finally complete, or cap far, far higher. Multi-extension `$ATTRIBUTE_LIST` (PR #35) remains the correct rare fallback if a real volume is fragmented enough to force it.
+
 ## [Unreleased] — v0.7 candidate (multi-extension `$ATTRIBUTE_LIST` for `$INDEX_ALLOCATION:$I30`)
 
 ### Added
