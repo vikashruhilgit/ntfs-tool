@@ -37,19 +37,20 @@ sudo ntfsctl dump /dev/disk10s1 /Photos/vacation.jpg       # decodes runlist, $B
 sudo ntfsctl verify --deep /dev/disk10s1                    # whole-volume runlist ↔ $Bitmap audit
 ```
 
-There's also an [`NTFSCore`](Packages/NTFSCore) Swift library (embed in any project — **210 unit tests**, no FSKit dependency) and an FSKit System Extension + SwiftUI menu-bar app (code complete, mount UX needs Apple Developer entitlement or SIP-off to validate against real hardware — see [`docs/STATUS.md`](docs/STATUS.md)).
+There's also an [`NTFSCore`](Packages/NTFSCore) Swift library (embed in any project — **226 unit tests**, no FSKit dependency) and an FSKit System Extension + SwiftUI menu-bar app (code complete, mount UX needs Apple Developer entitlement or SIP-off to validate against real hardware — see [`docs/STATUS.md`](docs/STATUS.md)).
 
 Built for macOS 15.4+ (Sequoia) on Apple Silicon. Swift 6.0+ / Xcode 16.3+ to build from source.
 
-## What's new — v0.5 → v0.6 highlights
+## What's new — v0.5 → v0.7 highlights
 
-- **🔁 Pure-Swift NTFS formatter** (`ntfsctl mkntfs`). Equivalent to `mkntfs -Q`, output mountable by macOS / Linux `ntfs-3g` / Windows. **The project is now self-sufficient for the full test loop on macOS** — no Homebrew, no `macFUSE`, no Linux VM, no Windows required for reformat.
-- **📈 Large-directory capacity lifted to "free clusters + MFT slots".** v0.4 `$INDEX_ROOT` multi-level split + v0.5 `$ATTRIBUTE_LIST` migration (`$INDEX_ALLOCATION` and `$DATA` overflow → extension MFT records + base `$ATTRIBUTE_LIST`) + next-fit allocator to cut fragmentation. The original ~50-file LARGE_INDEX cap is gone; the ~350-file `$DATA` cap is gone; the ~6,139-file post-migration leaf-split cap is gone.
-- **🔬 Built-in diagnostics.** `ntfsctl dump <path>` decodes any file's `$DATA` runlist and cross-checks each cluster against `$Bitmap`. `ntfsctl verify --deep` does the same audit volume-wide (free-but-referenced, out-of-range, double-allocated). These are what we use to validate hardware runs.
-- **🔁 cp gained `-T` / merge mode** so re-running the same copy doesn't accidentally nest. Plus a preflight line that prints the resolved destination + conflict policy before any bytes move.
-- **♻️ Every code path is `$ATTRIBUTE_LIST`-aware.** `delete`, `truncate`, `verify`, `reclaim-orphans`, FSKit `getAttributes`, the cp leaf-split path — all migrated files behave correctly through the full lifecycle (create / read / modify / delete / reclaim).
-- **🛡️ Independent spec-conformance assertions.** Hardened against the "writer and reader share the same bug" trap — multi-extent `$DATA`, boot sector, `$UpCase`, `$AttrDef` are byte-checked against hand-decoded references, not just round-tripped through our own decoder.
-- **🧪 87 → 210 unit tests** across this arc.
+- **🎉 Full real-hardware validation.** The complete **22,419-file / 39.6 GiB** phone backup copied into a single directory tree on a freshly-formatted 4 TB WD My Passport — `verify --deep` clean (0 orphans / leaks / dangling / out-of-range / double-allocated; 11.6 M runlist clusters audited). The original ~350-file cap (and ~1,611 / ~6,139 / ~7,997 successors) are all gone — per-directory capacity is now bounded only by free clusters + MFT slots.
+- **🧭 Directory-index locality allocator (v0.7.1)** — the root-cause fix that lifted the last cap. Keeps a directory's `$INDEX_ALLOCATION` index blocks contiguous (the Windows/Paragon/Tuxera approach), so the runlist stays tiny and never overflows the MFT record (measured: 222 extents → 1 at 4,000 entries). The `$ATTRIBUTE_LIST` multi-extension machinery is the rare fallback, not the primary mechanism.
+- **🔁 Pure-Swift NTFS formatter** (`ntfsctl mkntfs`). Equivalent to `mkntfs -Q`, output mountable by macOS / Linux `ntfs-3g` / Windows. **Self-sufficient on macOS** — no Homebrew, no `macFUSE`, no Linux VM, no Windows required to format.
+- **✂️ Complete copy / move / skip / replace matrix.** `cp` (replace default, `-n` skip, `-T` merge), `cp --move` (cross-device cut — source deleted only after a confirmed copy; `--dry-run` previews), `mv` (within-volume rename/move with `-n` skip / default replace, atomic so the source is never lost).
+- **🔬 Built-in diagnostics.** `ntfsctl dump <path>` decodes a file's runlist + cross-checks each cluster against `$Bitmap`; `ntfsctl verify --deep` does the same volume-wide (free-but-referenced / out-of-range / double-allocated).
+- **♻️ Every code path is `$ATTRIBUTE_LIST`-aware** — create / read / write / truncate / delete / rename / verify / reclaim-orphans all handle migrated files through the full lifecycle.
+- **🛡️ Independent spec-conformance assertions.** Hardened against the "writer and reader share the same bug" trap — multi-extent `$DATA`, boot sector, `$UpCase`, `$AttrDef` are byte-checked against hand-decoded references, not round-tripped through our own decoder.
+- **🧪 87 → 226 unit tests** across this arc (plus a `Tools/ntfsctl` integration suite).
 
 Full per-PR changelog: [`CHANGELOG.md`](CHANGELOG.md). Detailed state: [`docs/STATUS.md`](docs/STATUS.md).
 
@@ -133,7 +134,7 @@ The FSKit extension is code-complete but Apple's runtime requires either SIP-off
 
 ```
 ntfs-tool/
-├── Packages/NTFSCore/     Swift library — pure NTFS read/write/format, 210 tests
+├── Packages/NTFSCore/     Swift library — pure NTFS read/write/format, 226 tests
 ├── Extensions/NTFSFileSystem/  FSKit System Extension
 ├── Apps/NTFSMountManager/      SwiftUI menu-bar app
 ├── Tools/ntfsctl/         Command-line tool (16 subcommands)
@@ -149,7 +150,7 @@ ntfs-tool/
 ```bash
 # NTFSCore (no Xcode needed)
 cd Packages/NTFSCore && swift build && swift test
-# → 210 tests pass
+# → 226 tests pass
 
 # ntfsctl CLI (no Xcode needed)
 cd Tools/ntfsctl && swift build --configuration release
@@ -165,9 +166,9 @@ xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager build
 | Layer | Status |
 |---|---|
 | `ntfsctl` read commands (`info`, `scan`, `list`, `cat`, `verify`, `dump`) | Production-ready |
-| `ntfsctl` write commands (`cp`, `write`, `rm`, `mv`, `create`, `delete`, `truncate`) | Production-ready for typical workflows; large-directory cp validated to 6,000+ files; **next structural ceiling is multi-extension `$INDEX_ALLOCATION` for very large dirs (>~15k entries), tracked in [`docs/STATUS.md`](docs/STATUS.md)** |
+| `ntfsctl` write commands (`cp` (+`--move`), `write`, `rm`, `mv`, `create`, `delete`, `truncate`) | Production-ready; validated by a full **22,419-file / 39.6 GiB** single-tree copy on a real 4 TB WD drive (`verify --deep` clean). No known per-directory capacity cap — bounded only by free clusters + MFT slots. |
 | `ntfsctl` volume admin (`mkntfs`, `reclaim-orphans`, `setdirty`) | Production-ready |
-| `NTFSCore` library | Production-ready (210/210 tests, real 4 TB Windows drive validated) |
+| `NTFSCore` library | Production-ready (226 tests, full 22,419-file copy validated on a real 4 TB WD drive) |
 | FSKit extension build | Builds clean |
 | FSKit mount in Finder | Needs SIP-off / entitlement to validate |
 | Windows `chkdsk /f` clean | Pending — manual user step on a Windows machine |
@@ -182,4 +183,4 @@ The NTFS implementation is a clean-room Swift port from publicly-documented on-d
 
 ## Contributing
 
-Architecture notes + conventions in [`CLAUDE.md`](CLAUDE.md). For substantive work, file an issue first to align on approach. Active engineering follow-ups are documented in [`docs/STATUS.md`](docs/STATUS.md) — most notably: multi-extension `$INDEX_ALLOCATION` (the next structural cap), CI workflow repair (broken since PR #29, currently merging on local-test signal only), and the `rename`/`delete` extension-record-awareness audit (an `AUDIT-TODO` marker in v0.5.2).
+Architecture notes + conventions in [`CLAUDE.md`](CLAUDE.md). For substantive work, file an issue first to align on approach. Remaining follow-ups (documented in [`docs/STATUS.md`](docs/STATUS.md)): Windows `chkdsk /f` validation (manual, needs a Windows machine — the only external correctness gate left), CI workflow repair (the `.github/workflows/ci.yml` macOS jobs fail at provisioning; merges currently rely on local `swift test`), and optional polish like multi-extension `$DATA` (the file-level analogue of the shipped multi-extension `$INDEX_ALLOCATION`; not driven by any known failure).
