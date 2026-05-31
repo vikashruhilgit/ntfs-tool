@@ -112,8 +112,19 @@ public enum Mkntfs {
         guard clusterBytes > 0 else {
             throw NTFSError.invalidBootSector(reason: "bytesPerCluster is 0")
         }
-        let totalSectors = deviceSizeBytes / bps
-        let totalClusters = deviceSizeBytes / clusterBytes
+        // NTFS reserves the FINAL sector of the partition for the backup boot
+        // sector, and the boot sector's "total sectors" field EXCLUDES it
+        // (volume sectors = partition sectors − 1). Windows (and macOS
+        // livefiles) compute the backup-boot-sector LBA from this field and
+        // reject the volume as corrupt if it's off by even one — our own
+        // reader never validated it, which is why `verify` passed while
+        // Windows refused. A Windows-formatted reference of this exact 4 TB
+        // drive reports 7813965823 sectors / 976745727 clusters; pre-fix we
+        // emitted 7813965824 / 976745728 (each +1). Derive both from the
+        // partition size minus one sector.
+        let partitionSectors = deviceSizeBytes / bps
+        let totalSectors = partitionSectors > 0 ? partitionSectors - 1 : 0
+        let totalClusters = (deviceSizeBytes - bps) / clusterBytes
 
         // Resolve clustersPerMFTRecord:
         //   recordSize / clusterBytes if record >= cluster (typical: record=1024,
@@ -151,8 +162,14 @@ public enum Mkntfs {
         )
         let mftClusters = max(UInt64(4), (mftInitialBytes + clusterBytes - 1) / clusterBytes)
 
-        // Backup boot sector lives in the very last sector of the volume.
-        let backupBsLBA = totalSectors > 0 ? totalSectors - 1 : 0
+        // Backup boot sector lives at LBA == totalSectors — i.e. the volume's
+        // last sector, which is the last PHYSICAL sector of the partition
+        // (partitionSectors − 1). This is the exact LBA Windows/livefiles
+        // recompute from the boot sector's total-sectors field, so the field
+        // and this write location MUST agree (now that totalSectors itself is
+        // partitionSectors − 1, that LBA is unchanged from before — only the
+        // field value dropped by 1, closing the mismatch).
+        let backupBsLBA = totalSectors
         // The cluster containing the backup BS is reserved.
         let backupBsCluster = backupBsLBA / spc
 
