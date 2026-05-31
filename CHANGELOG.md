@@ -2,6 +2,27 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — v0.7.2 (move + conflict model: cp --move + mv skip/replace + rename atomicity)
+
+Completes the copy/move/skip/replace model. `cp` gains a cross-device **cut** (`--move`), `mv` gains skip/replace conflict handling, and the underlying `Volume.rename` is made abort-atomic so a replace can never lose the source. The dominant safety property throughout: **a source is never deleted unless its copy/move succeeded** — skipped (`-n`) and failed transfers keep their source, `--dry-run` previews deletions without touching anything, and `mv` replace is transactional (insert-before-remove rename, so the source survives a mid-flight abort).
+
+### Added
+
+- **`cp --move` (alias `--remove-source`) — cross-device cut.** After each file's copy SUCCEEDS, its source is deleted: the host file for host→volume, the volume file (via the extension-record-aware delete) for `--from-volume`. Deletion is per-file and strictly post-success — a skipped file (`-n` collision / non-regular source) or a failed file keeps its source. With `-r`, an emptied source directory is removed depth-first only after ALL its children moved; a directory with a skipped/failed child is preserved. `--dry-run --move` previews and is inert (writes/deletes nothing). The summary reports the moved-file count + freed bytes. The volume→host path opens the device writable only when `--move` is set; plain pulls stay read-only.
+- **`mv -n` / `--no-clobber` + default replace.** `mv` no longer hard-refuses an existing destination. When the destination name already exists: `-n` **skips** (no-op, exit 0); the default **replaces** (delete the existing destination, then atomically move the source onto its name). Replace targets an existing file or an EMPTY directory; a populated-directory destination is refused (would orphan its contents). Case-only renames and exact self-moves are handled as no-data-loss special cases (the source record is never deleted when the dest lookup resolves back to the source itself).
+- **Completed copy/move/skip/replace matrix.** Documented in `docs/CLI.md`: `cp` / `cp --move` (host↔volume, both directions), `mv` (within-volume rename/relocate), `-T` merge, and the `-n` skip vs default-replace conflict policies — one consistent model with a single safety rule across all cells.
+
+### Fixed
+
+- **`Volume.rename` `$I30` mutation is now abort-atomic (insert-before-remove).** The new `$I30` entry is inserted under the destination parent BEFORE the old entry is removed from the source parent, so an abort mid-rename can never leave the record unreachable from both parents — the source is never lost. Closes `AUDIT-TODO(rename-i30-atomicity)`. This is the prerequisite that makes `mv` default-replace safe: the actual source-never-lost guarantee comes from rename atomicity, not from operation ordering alone.
+
+### Tests
+
+- **226 NTFSCore tests pass, 1 pre-existing skip, 0 failures; ntfsctl 24 tests, 0 failures; CLI release builds.**
+- `RenameAtomicityTests` (NTFSCore) — proves `Volume.rename` is insert-before-remove: the source record stays reachable through a simulated mid-rename abort.
+- `CpMoveIntegrationTests` (ntfsctl) — `cp --move` host→volume and `--from-volume --move`: sources deleted only after a successful copy, skipped/failed sources preserved, emptied directories removed depth-first only when fully moved, `--dry-run --move` inert, freed-bytes accounting.
+- `MvIntegrationTests` (ntfsctl) — `mv` skip (`-n`), default replace, replace refuses a non-empty directory, replace transactional abort never loses the source, case-only rename keeps data, exact self-move is a no-op (not data loss), and the plain no-conflict rename still works.
+
 ## [Unreleased] — v0.7.1 (per-directory index-allocation locality lane — the ROOT-CAUSE fix)
 
 The ~8,000-file single-directory cap was a **fragmentation symptom, not an NTFS structural limit.** Real NTFS drivers (Windows ntfs.sys, Paragon, Tuxera, ntfs-3g) keep a directory's `$INDEX_ALLOCATION` runlist tiny by allocating its INDX blocks contiguously (per-directory locality), so it never approaches the MFT-record size limit. Pre-v0.7.1 we allocated every INDX block via the GLOBAL next-fit hint shared with file `$DATA`; during a `cp -r`, file-data clusters interleaved between consecutive INDX-block allocations and scattered them → one runlist extent per block → linear runlist growth → base-record overflow at ~8 k files. v0.7 (below) treated the symptom (split the giant runlist across extension records); v0.7.1 stops the runlist from getting giant in the first place — the fix that should have come first.

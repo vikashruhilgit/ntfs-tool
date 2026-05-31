@@ -171,10 +171,10 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 0 = auto-bounded by `$MFT`'s logical size). `--verbose` for per-record details. **`--deep`** additionally runs a whole-volume runlist↔`$Bitmap` + double-allocation sweep — catches free-but-referenced / out-of-range / double-allocated clusters the plain check can't see (the v0.5 multi-extent / portability diagnostic). **Read-only.** |
 | `dump` | `<device> <path>` | Read-only deep dump of ONE file's unnamed `$DATA`: MFT record identity (base vs migrated/`$ATTRIBUTE_LIST`), `$DATA` header (resident vs non-resident, real/allocated/initialized sizes, lastVCN), the decoded runlist as an extent table with each extent's `$Bitmap` status (`ALLOCATED` / `FREE(!)` / `OUT_OF_RANGE(!)`, plus an advisory `OVERLAPS_RESERVED(!)` per-extent flag), and a final `runlist OK` / `runlist FAULTY` verdict. `--verbose` for per-cluster detail. The single-file companion to `verify --deep`: both share the same audit, and the pass/fail verdict covers exactly free-but-referenced / out-of-range / double-allocated clusters. Reserved-region overlap is reported only as the advisory per-extent flag and is NOT part of either command's verdict, so the two always agree. **Read-only.** |
 | `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
-| `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `-T`/`--no-target-directory` merges a directory source's contents into an existing dest dir (instead of nesting). `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
+| `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `-T`/`--no-target-directory` merges a directory source's contents into an existing dest dir (instead of nesting). `--move`/`--remove-source` turns the copy into a cross-device cut — each source is deleted **after** its own copy succeeds (skipped/failed sources are preserved; `--dry-run` previews the deletions). `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
 | `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N`: 0 (rewrite) / file size (append) / `0 < N ≤ size-bytes.count` (in-place mid-file patch). `--from-file <path>` streams from a host file. |
 | `rm` | `<device> <recnum-or-path>` | Delete a file or directory. `-r` recursive. `-v` verbose. |
-| `mv` | `<device> <src-path> <dest-path>` | Rename or move (with auto-create of intermediate destination dirs). |
+| `mv` | `<device> <src-path> <dest-path>` | Rename or move within a single volume (with auto-create of intermediate destination dirs). Existing destination: default **replaces** it (delete-then-atomic-rename; a populated-directory destination is refused), `-n`/`--no-clobber` **skips** (no-op, exit 0). The source is never lost even if a replace aborts mid-flight (the underlying rename is insert-before-remove). |
 | `truncate` | `<device> <recnum> <newSize>` | Resize file to any byte-precise size (shrink only; growing requires `write`). |
 | `delete` | `<device> <recnum>` | Single-record delete by recnum. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15. (Prefer `rm` for path-based use.) |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
@@ -337,6 +337,84 @@ diskutil mount /dev/disk10s1
 ```
 
 **Per-leaf cap reminder:** v1's LARGE_INDEX support has no leaf split. If you're copying many files into a single fresh directory, expect ~30-50 files per directory before hitting `unsupportedFeature(...leaf full)`. Existing Windows-formatted volumes typically already have multi-leaf trees so this matters less for inserts into pre-existing folders.
+
+### Move instead of copy (`cp --move`) — cross-device cut
+
+`cp --move` (alias `--remove-source`) keeps the same copy semantics but turns each copy into a **cut**: after a file's copy SUCCEEDS, its source is deleted. The deletion is per-file and strictly post-success — a file that was **skipped** (a `-n` collision or a non-regular source) or that **failed** keeps its source. With `-r`, an emptied source directory is removed depth-first only after *all* its children moved; a directory that still holds a skipped or failed child is preserved.
+
+- **host → volume** deletes the host source file after the volume write succeeds.
+- **volume → host** (`--from-volume --move`) deletes the volume source (via the extension-record-aware delete) after the pull succeeds; the device is opened writable in this case.
+- **`--dry-run --move`** previews and is inert — it prints what *would* be deleted but writes and deletes nothing.
+
+The summary reports the moved-file count and freed bytes (`moved: deleted N source file(s), freed X`).
+
+> **Safety rule:** a source is only ever deleted *after* its own copy succeeds. Nothing is deleted speculatively, and `--dry-run` previews the deletions without touching anything.
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# Cut a single host file onto the volume (host copy is removed after success):
+sudo ntfsctl cp --move ~/photo.jpg /dev/disk10s1 /Backups/Photos/
+
+# Recursively move a whole host tree onto the volume, emptying the source:
+sudo ntfsctl cp -r --move ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone
+
+# Pull-and-cut: move files OFF the volume back to the host (deletes volume sources):
+sudo ntfsctl cp -r --from-volume --move /Backups/MyPhone /dev/disk10s1 ~/restored/
+
+# Preview a move without writing or deleting anything:
+sudo ntfsctl cp -r --move --dry-run ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone
+
+diskutil mount /dev/disk10s1
+```
+
+### Rename / relocate within a volume (`mv`) — skip vs replace
+
+`mv` renames or relocates a file or directory **within a single NTFS volume** (intermediate destination directories are auto-created). For a cross-device move (host ↔ volume) use `cp --move` instead.
+
+When the destination name already exists:
+
+- **default = replace** — the existing destination is deleted, then the source is atomically moved onto its name. Replace applies to an existing file or an EMPTY directory; a **populated** directory destination is refused (it would orphan its contents).
+- **`-n` / `--no-clobber` = skip** — the existing destination is left untouched and `mv` exits 0 without moving.
+
+Replace is transactional: the underlying `Volume.rename` is insert-before-remove, so the **source is never lost even if the move aborts mid-flight**. Case-only renames and exact self-moves are handled as no-data-loss special cases.
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# Simple rename in the same directory:
+sudo ntfsctl mv /dev/disk10s1 /Backups/draft.txt /Backups/final.txt
+
+# Relocate into another directory (auto-creates /Archive if missing):
+sudo ntfsctl mv /dev/disk10s1 /Backups/draft.txt /Archive/final.txt
+
+# Replace an existing destination (default): /Backups/final.txt is deleted, draft moved onto it:
+sudo ntfsctl mv /dev/disk10s1 /Backups/draft.txt /Backups/final.txt
+
+# Don't clobber an existing destination — skip and exit 0:
+sudo ntfsctl mv -n /dev/disk10s1 /Backups/draft.txt /Backups/final.txt
+
+diskutil mount /dev/disk10s1
+```
+
+### Copy / move / skip / replace capability matrix
+
+The complete model across copy vs move, the two transfer directions, and the conflict policies:
+
+| Operation | Copy (keep source) | Move (delete source after success) |
+|---|---|---|
+| host → volume | `cp` | `cp --move` |
+| volume → host | `cp --from-volume` | `cp --from-volume --move` |
+| within one volume (rename/relocate) | (n/a — same device) | `mv` |
+| merge a directory's contents into an existing dir | `cp -T` | `cp -T --move` |
+| conflict: replace existing (default) | `cp` / `mv` | `cp --move` / `mv` |
+| conflict: skip existing | `cp -n` / `mv -n` | `cp --move -n` / `mv -n` |
+
+Safety guarantees that hold across the whole matrix:
+
+- A source is **only ever deleted after its copy/move succeeds** — skipped (`-n`) and failed transfers keep their source.
+- `cp --move --dry-run` **previews** the deletions and is completely inert.
+- `mv` replace is **transactional**: the source is never lost even if the move aborts mid-flight (insert-before-remove rename).
 
 ### Validate a volume's structural integrity
 
