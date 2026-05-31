@@ -147,10 +147,39 @@ final class MkntfsTests: XCTestCase {
         XCTAssertEqual(geom.bytesPerSector, 512)
         XCTAssertEqual(geom.sectorsPerCluster, 8)
         XCTAssertEqual(geom.bytesPerCluster, 4096)
-        XCTAssertEqual(geom.totalSectors, 524_288)
+        // SPEC-CONFORMANCE (not round-trip-via-our-reader): NTFS's boot-sector
+        // total-sectors field is partitionSectors − 1 — the final sector is the
+        // backup boot sector and is excluded. 256 MiB / 512 = 524288 partition
+        // sectors → 524287 reported. A Windows-formatted reference of the 4 TB
+        // WD drive reports 7813965823 (= 7813965824 − 1); pre-fix mkntfs emitted
+        // the un-decremented value and Windows/livefiles rejected the volume as
+        // corrupt (the backup-BS LBA they recompute from this field was one
+        // sector past the volume). See fix in Mkntfs.planGeometry.
+        XCTAssertEqual(geom.totalSectors, 524_287, "total-sectors must be partitionSectors − 1 (backup-BS reservation)")
+        XCTAssertEqual(geom.totalClusters, (256 * 1024 * 1024 - 512) / 4096, "total-clusters must derive from (deviceBytes − oneSector)")
         XCTAssertEqual(geom.clustersPerMFTRecord, -10)  // 2^10 = 1024
+        // The backup boot sector LBA MUST equal the total-sectors field (the
+        // volume's last sector) so Windows finds the backup BS where the boot
+        // sector says it is. This is the invariant whose violation caused the
+        // "Windows: corrupted" report.
+        XCTAssertEqual(geom.bootBackupSectorLBA, geom.totalSectors, "backup-BS LBA must equal the total-sectors field")
+        // ...and that LBA is the last PHYSICAL sector of the partition.
+        XCTAssertEqual(geom.bootBackupSectorLBA, 256 * 1024 * 1024 / 512 - 1)
         // System files must come before the backup BS cluster.
         XCTAssertLessThan(geom.bitmapStartLCN + geom.bitmapClusterCount, geom.bootBackupStartLCN)
+    }
+
+    /// Direct spec assertion of the off-by-one fix on the real 4 TB WD drive
+    /// geometry — the exact values a Windows `format` produced on this drive.
+    func testPlanGeometryMatchesWindowsReferenceForFourTBDrive() throws {
+        // disk11s1: 4_000_750_501_888 bytes (7813965824 × 512-byte sectors).
+        let geom = try Mkntfs.planGeometry(
+            deviceSizeBytes: 4_000_750_501_888,
+            options: Mkntfs.Options()
+        )
+        XCTAssertEqual(geom.totalSectors, 7_813_965_823, "must match the Windows-formatted reference (partitionSectors − 1)")
+        XCTAssertEqual(geom.totalClusters, 976_745_727, "must match the Windows-formatted reference cluster count")
+        XCTAssertEqual(geom.bootBackupSectorLBA, 7_813_965_823, "backup BS at the volume's last sector")
     }
 }
 
