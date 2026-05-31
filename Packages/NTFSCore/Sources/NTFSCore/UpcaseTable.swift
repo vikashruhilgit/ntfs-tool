@@ -17,6 +17,19 @@ public enum UpcaseTable {
     /// The full 128 KiB NTFS $UpCase table, ready to be written to disk.
     public static let data: Data = Data(rawBytes)
 
+    /// Map a single UTF-16 code unit to its NTFS uppercase form via the
+    /// standard `$UpCase` table. This is the per-code-unit casing NTFS's
+    /// `COLLATION_FILE_NAME` uses to order directory ($I30) index entries —
+    /// it must match Windows/ntfs-3g exactly, because they binary-search the
+    /// sorted B-tree. (The standard Unicode-derived table here matches what
+    /// `mkntfs`/Windows generate; volumes with a custom `$UpCase` are
+    /// vanishingly rare.)
+    @inline(__always)
+    public static func upcase(_ unit: UInt16) -> UInt16 {
+        let i = Int(unit) << 1
+        return UInt16(rawBytes[i]) | (UInt16(rawBytes[i + 1]) << 8)
+    }
+
     /// 131,072 raw little-endian bytes (65,536 UTF-16 codepoints).
     public static let rawBytes: [UInt8] = [
         0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00,
