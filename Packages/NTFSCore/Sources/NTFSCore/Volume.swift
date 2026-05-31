@@ -112,6 +112,26 @@ public actor Volume {
         _multiExtensionFaultHookAfterTruncation = nil
         try hook()
     }
+
+    /// v0.7.1 leaf-split commit-sequence fault-injection seam. Fires once,
+    /// AFTER the destructive LEFT-leaf rewrite in `splitLeafAndPromote` has
+    /// hit disk but BEFORE the RIGHT-leaf write — the worst-case mid-commit
+    /// window: the original leaf has been trimmed to its left half and the
+    /// right-half leaf cluster (plus any height-grow / interior-chain
+    /// clusters) are marked allocated in `$Bitmap` but not yet referenced by
+    /// anything the still-uncommitted parent points at. Without the step-4–6b
+    /// rollback this is the cluster-LEAK + half-rewritten-index window.
+    /// Used by `DirectoryIndexLocalityTests` to assert the rollback frees the
+    /// provisional clusters and restores the original leaf.
+    private var _splitLeafFaultHookAfterLeftLeaf: MultiExtensionFaultHook?
+    public func _setSplitLeafFaultHookAfterLeftLeaf(_ hook: MultiExtensionFaultHook?) {
+        _splitLeafFaultHookAfterLeftLeaf = hook
+    }
+    private func _consumeSplitLeafFaultHookAfterLeftLeaf() throws {
+        guard let hook = _splitLeafFaultHookAfterLeftLeaf else { return }
+        _splitLeafFaultHookAfterLeftLeaf = nil
+        try hook()
+    }
     /// Internal: clear the fault hook if it currently equals `point`,
     /// returning true on a successful consume. The split between
     /// "is this our point?" and "clear unconditionally" is critical:
@@ -1312,7 +1332,19 @@ public actor Volume {
                 return
             case let .leafFull(leafVCN, leafByteOffset, _, _, _, merged):
                 // T1.2: split the full leaf, promote the median into $INDEX_ROOT.
-                // `i30Committed` already true from the pre-call set above.
+                //
+                // `.leafFull` means `IndexAllocationWriter.insert` descended but
+                // did NOT write the new entry anywhere — it flushed any cached
+                // PRIOR entries and handed us `merged` to split. So nothing about
+                // the NEW entry is durable yet. Reset the conservative
+                // `i30Committed` flag (set true before the insert call to cover
+                // the `.inserted` leaf-write) back to false: `splitLeafAndPromote`
+                // owns its own commit point and flips the flag true only once its
+                // parent-record write — the linearization point — has hit disk.
+                // A pre-commit rollback then leaves the flag false so `createFile`
+                // reclaims the child's MFT slot cleanly (no orphan), rather than
+                // the previous "always treat split as committed" behaviour.
+                i30Committed = false
                 try await splitLeafAndPromote(
                     parentRecordNumber: parentRecordNumber,
                     leafVCN: leafVCN,
@@ -1320,7 +1352,8 @@ public actor Volume {
                     mergedSortedEntries: merged,
                     rootBytes: rootBytes,
                     indexRoot: root,
-                    allocationExtents: allocExtents
+                    allocationExtents: allocExtents,
+                    i30Committed: &i30Committed
                 )
                 return
             }
@@ -1592,7 +1625,11 @@ public actor Volume {
         mergedSortedEntries: [(fileRef: UInt64, body: Data, sortKey: String)],
         rootBytes: Data,
         indexRoot: IndexRoot,
-        allocationExtents: [Extent]
+        allocationExtents: [Extent],
+        // v0.7.1: set `true` only at the linearization point (the parent-record
+        // commit). A throw with the flag still `false` means nothing about the
+        // new entry is durable, so `createFile` reclaims the child's MFT slot.
+        i30Committed: inout Bool
     ) async throws {
         // Snapshot whole-tree state BEFORE the split so the post-split
         // verification can compare delta correctly. Expected after split:
@@ -1691,80 +1728,179 @@ public actor Volume {
             throw error
         }
         let newParentRecordBytes = computed.parentRecordBytes
-
-        // 4. Build the LEFT leaf — rewrite original leaf bytes with leftEntries.
         let blockSize = Int(indexRecordSizeBytes)
         let sectorSize = Int(boot.bytesPerSector)
-        let originalLeafRaw = try await device.read(offset: leafByteOffset, length: blockSize)
-        let originalLeafFixed = try UpdateSequenceArray.applyFixup(
-            recordBytes: originalLeafRaw,
-            usaOffset: Int(try originalLeafRaw.readU16LE(at: 4)),
-            usaCount: Int(try originalLeafRaw.readU16LE(at: 6)),
-            blockSize: sectorSize
-        )
-        let leftBlock = try IndexAllocationWriter.buildLeafIndexBlock(
-            sourceBlockBytes: originalLeafFixed,
-            sortedEntries: leftEntries.map { ($0.fileRef, $0.body, $0.sortKey) },
-            blockSize: blockSize
-        )
-        let leftOnDisk = try UpdateSequenceArray.reverseFixup(
-            recordBytes: leftBlock,
-            usaOffset: Int(try leftBlock.readU16LE(at: 4)),
-            usaCount: Int(try leftBlock.readU16LE(at: 6)),
-            blockSize: sectorSize
-        )
-        try await device.write(offset: leafByteOffset, bytes: leftOnDisk)
-
-        // 5. Build the RIGHT leaf at the new VCN — fresh block with rightEntries.
-        let rightBlock = try buildEmptyIndxBlock(
-            blockSize: blockSize,
-            sectorSize: sectorSize,
-            vcn: newVCN,
-            entries: rightEntries.map { ($0.fileRef, $0.body, $0.sortKey) }
-        )
-        let rightOnDisk = try UpdateSequenceArray.reverseFixup(
-            recordBytes: rightBlock,
-            usaOffset: Int(try rightBlock.readU16LE(at: 4)),
-            usaCount: Int(try rightBlock.readU16LE(at: 6)),
-            blockSize: sectorSize
-        )
-        try await device.write(offset: deviceByteOffset(forLCN: newLCN), bytes: rightOnDisk)
-
-        // 6. (v0.4 Phase 3(A)) If height-grow fired, write the new
-        //    intermediate INDX blocks BEFORE committing the parent record.
-        //    Order matters: the parent record's new $INDEX_ROOT will point
-        //    at these intermediates, so they must exist on disk first or a
-        //    crash between writes would orphan dependent references.
-        for intermediate in computed.intermediates {
-            try await device.write(
-                offset: intermediate.byteOffset,
-                bytes: intermediate.postFixupBytes
-            )
-        }
-
         let mft = self.mft()
 
-        // 6b. (v0.5 follow-up) If the directory's $INDEX_ALLOCATION / $BITMAP
-        //     have migrated into extension records, commit those rewritten
-        //     extension records BEFORE the base. Extension-first mirrors
-        //     `migrateAttributeOnOverflow`: if a crash lands between these
-        //     writes and the base commit, the extension describes the new
-        //     leaf cluster (already written above) while the base's
-        //     $INDEX_ROOT still reflects the pre-split tree — i.e. the new
-        //     leaf is allocated + described but simply not yet referenced.
-        //     On next mount the directory is internally consistent at its
-        //     pre-split shape; nothing the base points at is missing.
-        for extWrite in computed.extraRecordWrites {
-            try await mft.writeRawRecord(
-                at: extWrite.recordNumber,
-                postFixupBytes: extWrite.postFixupBytes
-            )
+        // --- Transactional commit sequence (steps 4-6b) ---------------------
+        //
+        // Everything below mutates durable state up to (but excluding) the
+        // parent-record commit in step 7. The pre-fix gap (present since the
+        // split path landed; PR #36 only swapped the allocator): a
+        // `device.write` that throws partway through steps 4-6b leaked the
+        // provisionally-allocated clusters (`newExtent` for the right-half
+        // leaf + `computed.extraClustersAllocated` from any height-grow /
+        // interior-chain cascade) — marked allocated in `$Bitmap` with nothing
+        // the (still-uncommitted) parent points at referencing them — and left
+        // the on-disk index half-rewritten (the original leaf trimmed to its
+        // left half, the right half not yet reachable).
+        //
+        // We close it with a rollback that mirrors the compute-step `catch`
+        // above: on any throw before the parent commit, restore every block we
+        // destructively overwrote (the original leaf; any in-place interior
+        // rewrites; any migrated extension records) and free every cluster we
+        // provisionally allocated, leaving the directory byte-for-byte at its
+        // pre-split shape. Because the flag stays `false`, `createFile` then
+        // reclaims the child's MFT slot too — a fully clean abort.
+        //
+        // SCOPE: this recovers from a clean `device.write` THROW (ENOSPC / EIO
+        // surfaced synchronously by the fd). A true power loss mid-write — or a
+        // torn parent-record write in step 7 — is the LogFile journal's job
+        // (Phase 6) and remains out of scope; step 7 is therefore deliberately
+        // left outside the rollback (see its comment).
+        let provisionalClusters = [newExtent] + computed.extraClustersAllocated
+
+        // A write whose offset lands inside a provisional (freshly-allocated)
+        // cluster is additive — the cluster is freed on rollback, so its
+        // contents need no restore. A write OUTSIDE them is a destructive
+        // in-place rewrite of a pre-existing block the uncommitted parent still
+        // references; those we snapshot and restore byte-for-byte.
+        func isProvisionalOffset(_ offset: UInt64) -> Bool {
+            for ext in provisionalClusters {
+                guard let lcn = ext.startLCN else { continue }
+                let start = deviceByteOffset(forLCN: lcn)
+                let end = start + ext.clusterCount * clusterBytes
+                if offset >= start && offset < end { return true }
+            }
+            return false
         }
 
-        // 7. Commit the precomputed parent MFT record (overflow already
-        //    ruled out in step 3, possibly after a height-grow). This
-        //    finalizes the split atomically from the tree-shape
-        //    perspective.
+        // Captured originals for destructive in-place writes, oldest-first;
+        // the rollback replays them newest-first.
+        var blockRestores: [(offset: UInt64, bytes: Data)] = []
+        var recordRestores: [(recordNumber: UInt64, postFixupBytes: Data)] = []
+
+        // Undo the pre-commit writes (reverse order) then release every
+        // provisionally-allocated cluster. Best-effort `try?`: we are already
+        // unwinding an error, and a restore that itself fails should not mask
+        // the original — the worst case degrades to a loud, recoverable state
+        // (leaked-but-detectable), never silent data loss.
+        func rollbackPreCommit() async {
+            for r in recordRestores.reversed() {
+                try? await mft.writeRawRecord(at: r.recordNumber, postFixupBytes: r.postFixupBytes)
+            }
+            for r in blockRestores.reversed() {
+                try? await device.write(offset: r.offset, bytes: r.bytes)
+            }
+            for ext in provisionalClusters {
+                try? await freeClusters(ext)
+            }
+        }
+
+        do {
+            // 4. Build the LEFT leaf — destructive in-place rewrite of the
+            //    original leaf bytes with leftEntries. Snapshot the original
+            //    on-disk bytes BEFORE the write so the rollback can restore them.
+            let originalLeafRaw = try await device.read(offset: leafByteOffset, length: blockSize)
+            let originalLeafFixed = try UpdateSequenceArray.applyFixup(
+                recordBytes: originalLeafRaw,
+                usaOffset: Int(try originalLeafRaw.readU16LE(at: 4)),
+                usaCount: Int(try originalLeafRaw.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+            let leftBlock = try IndexAllocationWriter.buildLeafIndexBlock(
+                sourceBlockBytes: originalLeafFixed,
+                sortedEntries: leftEntries.map { ($0.fileRef, $0.body, $0.sortKey) },
+                blockSize: blockSize
+            )
+            let leftOnDisk = try UpdateSequenceArray.reverseFixup(
+                recordBytes: leftBlock,
+                usaOffset: Int(try leftBlock.readU16LE(at: 4)),
+                usaCount: Int(try leftBlock.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+            blockRestores.append((offset: leafByteOffset, bytes: originalLeafRaw))
+            try await device.write(offset: leafByteOffset, bytes: leftOnDisk)
+
+            #if DEBUG
+            // Fault-injection: the worst-case mid-commit window — the original
+            // leaf has just been trimmed to its left half on disk and the
+            // provisional clusters are allocated but not yet referenced.
+            try _consumeSplitLeafFaultHookAfterLeftLeaf()
+            #endif
+
+            // 5. Build the RIGHT leaf at the new VCN — fresh block with
+            //    rightEntries (additive; lives in `newExtent`, freed on rollback).
+            let rightBlock = try buildEmptyIndxBlock(
+                blockSize: blockSize,
+                sectorSize: sectorSize,
+                vcn: newVCN,
+                entries: rightEntries.map { ($0.fileRef, $0.body, $0.sortKey) }
+            )
+            let rightOnDisk = try UpdateSequenceArray.reverseFixup(
+                recordBytes: rightBlock,
+                usaOffset: Int(try rightBlock.readU16LE(at: 4)),
+                usaCount: Int(try rightBlock.readU16LE(at: 6)),
+                blockSize: sectorSize
+            )
+            try await device.write(offset: deviceByteOffset(forLCN: newLCN), bytes: rightOnDisk)
+
+            // 6. (v0.4 Phase 3(A) / Phase 3(B-D)) If a height-grow or an
+            //    interior-chain cascade fired, write the intermediate INDX
+            //    blocks BEFORE committing the parent record. Order matters: the
+            //    parent's new $INDEX_ROOT will point at these intermediates, so
+            //    they must exist on disk first. New-cluster intermediates are
+            //    additive (freed on rollback); the cascade's in-place rewrites
+            //    of existing interior blocks are destructive, so snapshot those.
+            for intermediate in computed.intermediates {
+                if !isProvisionalOffset(intermediate.byteOffset) {
+                    let original = try await device.read(offset: intermediate.byteOffset, length: blockSize)
+                    blockRestores.append((offset: intermediate.byteOffset, bytes: original))
+                }
+                try await device.write(
+                    offset: intermediate.byteOffset,
+                    bytes: intermediate.postFixupBytes
+                )
+            }
+
+            // 6b. (v0.5 follow-up) If the directory's $INDEX_ALLOCATION / $BITMAP
+            //     have migrated into extension records, commit those rewritten
+            //     extension records BEFORE the base. Extension-first mirrors
+            //     `migrateAttributeOnOverflow`. These are destructive in-place
+            //     rewrites of pre-existing extension records: snapshot the
+            //     current on-disk bytes first so the rollback restores the
+            //     pre-split runlist — otherwise the restored extension would
+            //     reference the just-freed provisional clusters (free-but-
+            //     referenced). On a successful commit (step 7) the extension and
+            //     base land together; if step 7 throws, the existing
+            //     "extension describes the new leaf but base still points at the
+            //     pre-split tree" reasoning holds (the migration itself is a
+            //     consistent representation change, not rolled back here).
+            for extWrite in computed.extraRecordWrites {
+                let current = try await mft.record(at: extWrite.recordNumber)
+                recordRestores.append((recordNumber: extWrite.recordNumber, postFixupBytes: current.bytes))
+                try await mft.writeRawRecord(
+                    at: extWrite.recordNumber,
+                    postFixupBytes: extWrite.postFixupBytes
+                )
+            }
+        } catch {
+            await rollbackPreCommit()
+            throw error
+        }
+
+        // 7. Commit the precomputed parent MFT record (overflow already ruled
+        //    out in step 3, possibly after a height-grow). This is the
+        //    linearization point: once it lands, the split is durable and the
+        //    new entry is reachable. Mark `i30Committed` IMMEDIATELY before the
+        //    write (mirrors `createFile`'s resident $INDEX_ROOT path): a throw
+        //    here is treated as post-commit, so `createFile` retains the child's
+        //    MFT slot as a recoverable orphan rather than risk a dangling $I30
+        //    entry against a possibly torn parent record. By this point all
+        //    blocks the parent references are durable, so freeing clusters here
+        //    would create free-but-referenced — hence step 7 is OUTSIDE the
+        //    rollback above.
+        i30Committed = true
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParentRecordBytes)
         // Self-check: re-read + re-parse + walk attributes. Any malformation
         // surfaces here with a precise location rather than as a later

@@ -632,4 +632,167 @@ final class DirectoryIndexLocalityTests: XCTestCase {
             "post-abort: all pre-abort entries must still enumerate; missing \(missing.sorted().prefix(5))"
         )
     }
+
+    /// AC-5 (no leak on a mid-COMMIT leaf-split failure — the gap the Phase 4.5
+    /// holistic review of PR #36 surfaced).
+    ///
+    /// `splitLeafAndPromote` does its device writes (LEFT/RIGHT leaves, any
+    /// height-grow/cascade intermediates, the parent-record commit) AFTER the
+    /// in-memory `computeParentRecordBytesForSplit` step. Pre-fix, a
+    /// `device.write` that threw partway through that write sequence left the
+    /// provisionally-allocated clusters (`newExtent` for the right-half leaf +
+    /// any cascade extents) marked allocated in `$Bitmap` with nothing pointing
+    /// at them — a silent cluster LEAK — and the original leaf trimmed to its
+    /// left half (a half-rewritten index). The compute-step `catch` already
+    /// freed `newExtent` on a *compute* failure; the *commit-sequence* failure
+    /// had no such rollback.
+    ///
+    /// MECHANISM: `_setSplitLeafFaultHookAfterLeftLeaf` fires once, AFTER the
+    /// destructive LEFT-leaf rewrite has hit disk but BEFORE the RIGHT-leaf
+    /// write — exactly the worst-case window (leaf trimmed, clusters allocated,
+    /// parent not yet committed). We drive a directory multi-INDX-block, arm the
+    /// hook, then create files until one triggers a leaf split (which the hook
+    /// aborts), and assert the post-abort on-disk state is pristine:
+    ///   * free-cluster count is byte-for-byte restored (the direct LEAK canary:
+    ///     pre-fix it would drop by ≥1 cluster — the never-freed `newExtent`);
+    ///   * whole-volume deep audit clean — 0 free-but-referenced, 0
+    ///     double-allocated (a restored extension referencing a freed cluster
+    ///     would trip free-but-referenced);
+    ///   * no orphans (the rollback leaves `i30Committed` false, so `createFile`
+    ///     reclaims the child's MFT slot — a fully clean abort);
+    ///   * the data-loss canary holds: every name present pre-abort still
+    ///     enumerates (the LEFT leaf was restored, not left half-rewritten).
+    func testNoLeakAfterMidCommitLeafSplitFailure() async throws {
+        let volume = try await freshFormattedVolume(sizeMiB: 256, label: "NOLEAKC")
+        let dirRN = try await makeSubdirectory(volume: volume, named: "splitfail")
+
+        // Drive partway so the directory is multi-INDX-block (so a subsequent
+        // insert will eventually hit a full leaf and split).
+        let created = try await driveDirectory(
+            volume: volume,
+            dirRN: dirRN,
+            entryCount: 800,
+            namePrefix: "sf",
+            bytesPerFile: 4096
+        )
+        XCTAssertGreaterThan(created, 300, "directory must be locality-grown before the split; got \(created)")
+        let extentsBefore = try await indexAllocationExtentCount(volume: volume, dirRN: dirRN)
+        XCTAssertGreaterThan(
+            extentsBefore, 0,
+            "directory must have a non-resident $INDEX_ALLOCATION (a leaf to split)"
+        )
+
+        // Snapshot the reachable name set pre-abort (data-loss canary).
+        let entriesPre = try await volume.enumerate(directory: dirRN)
+        let namesPre = Set(
+            entriesPre.filter { $0.fileName.namespace != .dos }.map { $0.fileName.name }
+        )
+
+        // Arm the mid-commit fault. It is single-shot, so the FIRST leaf split
+        // fires it and throws; non-splitting inserts before then succeed.
+        let injected = NTFSError.ioFailure(description: "splitLeaf fault: mid-commit after-left-leaf")
+        await volume._setSplitLeafFaultHookAfterLeftLeaf { throw injected }
+
+        var triggered = false
+        var freeBeforeAborted: UInt64 = 0
+        var attempts = 0
+        for i in 0..<3000 {
+            attempts += 1
+            let name = String(format: "sf-SPLIT-%05d.bin", i)
+            // Snapshot free clusters IMMEDIATELY before this create so the
+            // canary brackets exactly the create that aborts. Non-splitting
+            // inserts allocate no clusters; the split allocates `newExtent`.
+            let bm = try await volume.bitmap()
+            freeBeforeAborted = bm.freeClusterCount
+            do {
+                _ = try await volume.createFile(named: name, inDirectory: dirRN)
+            } catch let e as NTFSError {
+                if case NTFSError.ioFailure(let desc) = e, desc.contains("splitLeaf fault") {
+                    triggered = true
+                    break
+                }
+                throw e  // unexpected error — surface it
+            }
+        }
+        await volume._setSplitLeafFaultHookAfterLeftLeaf(nil)
+
+        guard triggered else {
+            throw XCTSkip("""
+                no leaf split was triggered in \(attempts) createFile attempts on this fixture — \
+                the mid-commit failure window was not exercised.
+                """)
+        }
+
+        // (1) LEAK canary: the split's provisional clusters must be freed, so
+        //     the free-cluster count returns to its pre-abort value exactly.
+        let bmAfter = try await volume.bitmap()
+        let freeAfter = bmAfter.freeClusterCount
+        print("""
+            === AC-5 NO-LEAK-ON-MID-COMMIT-SPLIT-FAILURE ===
+            entries before split:       \(created)
+            $INDEX_ALLOCATION extents:  \(extentsBefore)
+            createFile attempts:        \(attempts)
+            free clusters before abort: \(freeBeforeAborted)
+            free clusters after abort:  \(freeAfter)
+            ================================================
+            """)
+        XCTAssertEqual(
+            freeAfter, freeBeforeAborted,
+            """
+            free-cluster count must be restored after a mid-commit split failure — \
+            any shortfall is a LEAKED provisional INDX cluster the rollback failed to free. \
+            before=\(freeBeforeAborted), after=\(freeAfter), leaked=\(Int64(freeBeforeAborted) - Int64(freeAfter)).
+            """
+        )
+
+        // (2) Whole-volume deep audit clean (0 free-but-referenced catches a
+        //     restored extension still naming a freed cluster).
+        let sweep = try await volume.auditAllDataRunlistsAgainstBitmap()
+        XCTAssertTrue(
+            sweep.isClean,
+            """
+            deep audit must be clean after a mid-commit split failure; got \
+            freeButReferenced=\(sweep.freeButReferencedClusters), \
+            outOfRange=\(sweep.outOfRangeClusters), \
+            doubleAllocated=\(sweep.doubleAllocatedClusters), \
+            unreadable=\(sweep.unreadableRecords.count)
+            """
+        )
+        XCTAssertEqual(sweep.freeButReferencedClusters, 0, "0 free-but-referenced after mid-commit split failure")
+        XCTAssertEqual(sweep.doubleAllocatedClusters, 0, "0 double-allocated after mid-commit split failure")
+
+        // (3) No orphans — the rollback kept i30Committed false, so createFile
+        //     reclaimed the child's MFT slot (no IN_USE-but-unreachable record).
+        let orphanSet = try await orphans(in: volume)
+        XCTAssertTrue(
+            orphanSet.isEmpty,
+            "no orphans after a clean mid-commit split rollback; got \(orphanSet.sorted())"
+        )
+
+        // (4) Data-loss canary: every name present pre-abort still enumerates
+        //     (the destructively-trimmed LEFT leaf was restored). The directory
+        //     must also still enumerate without throwing.
+        let entriesPost = try await volume.enumerate(directory: dirRN)
+        let namesPost = Set(
+            entriesPost.filter { $0.fileName.namespace != .dos }.map { $0.fileName.name }
+        )
+        let missing = namesPre.subtracting(namesPost)
+        XCTAssertTrue(
+            missing.isEmpty,
+            """
+            post-abort: all pre-abort entries must still enumerate (the LEFT leaf must be \
+            restored, not left half-rewritten); missing \(missing.sorted().prefix(5)).
+            """
+        )
+
+        // (5) The directory is fully usable again: a fresh create after the
+        //     rolled-back split succeeds and is reachable.
+        let recoveryName = "sf-RECOVERY.bin"
+        _ = try await volume.createFile(named: recoveryName, inDirectory: dirRN)
+        let entriesRecovered = try await volume.enumerate(directory: dirRN)
+        XCTAssertTrue(
+            entriesRecovered.contains { $0.fileName.name == recoveryName },
+            "a create after the rolled-back split must succeed and enumerate"
+        )
+    }
 }
