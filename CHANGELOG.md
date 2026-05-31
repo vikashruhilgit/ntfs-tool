@@ -2,6 +2,16 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — v0.7.3 — `$MFT` auto-grow (write to real Windows-formatted volumes)
+
+### Fixed
+
+- **`ntfsctl` can now write to a freshly Windows-formatted NTFS volume.** A real Windows quick-format starts `$MFT.$DATA` at just **16 records** (the base system files) and grows the MFT on demand; ours over-allocated a ≥16 MiB / 16,384-record `$MFT`. `allocateMFTRecord` refused to grow `$MFT` (`"auto-grow is disabled in v0.2"`), so on a real Windows drive the **very first** user-file create failed — it needs MFT record 16, one past the initial allocation. Every prior success (incl. the 22,419-file hardware copy) only worked because *our* `mkntfs` over-allocated the MFT — the same weak-oracle blind spot the `mkntfs` removal exposed.
+  - `allocateMFTRecord(allowGrowth:)` now invokes the (already-implemented, already-tested) `growMFTDataByClusters` when it runs out of materialized slots: it grows `$MFT.$DATA` by a 64-cluster / 256-record chunk and extends `$MFT.$BITMAP` to expose the new slots, then retries.
+  - Growth is enabled **only** for the base-record allocation at the start of `createFile` — a safe point (no transactional state read/built yet; the parent is re-read afterward). It stays **off** for extension-record allocation mid-migration, side-stepping the historical "grow + leaf-split interaction" corruption hazard the old comment flagged. The base allocation's 256-record runway means mid-transaction extension allocations virtually always find a ready slot.
+  - **Ceiling:** `$MFT.$BITMAP` growth is bounded by its existing allocatedSize (no cascading bitmap-of-bitmap growth yet) — on a typical 4 KiB `$BITMAP` that caps the MFT at ~32,768 records. Far above the old 16-record wall and adequate for large backups; past it, a clear `unsupportedFeature` is thrown.
+  - New `MFTAutoGrowTests` (3 tests) build a **16-record `$MFT` fixture** that mirrors the real Windows drive (test-only `Mkntfs.Options.mftInitialClustersOverride`) and prove: (1) the first create grows the MFT and succeeds past slot 16; (2) 3,200 files across 4 subdirectories — driving dozens of growth rounds **and** `$I30` leaf-splits/height-grows — leave a spotless whole-volume deep audit (0 free-but-referenced / out-of-range / double-allocated) and 0 orphans; (3) content survives growth + reopen-from-disk byte-exact.
+
 ## [Unreleased] — v0.7.2 (cont.) — `mkntfs` REMOVED
 
 ### Removed
