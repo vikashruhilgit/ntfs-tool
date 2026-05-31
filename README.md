@@ -2,14 +2,13 @@
 
 Read/write NTFS on Apple Silicon Macs from the command line. MIT-licensed.
 
-`ntfsctl` is a single-binary CLI that reads, writes, copies, renames, deletes, **formats**, and audits NTFS volumes — no Apple Developer subscription, no SIP changes, no FSKit entitlement, no third-party drivers (no `macFUSE`, no `ntfs-3g`, no Linux VM, no Windows). It operates on raw block devices, so it works regardless of whether macOS has the drive mounted.
+`ntfsctl` is a single-binary CLI that reads, writes, copies, renames, deletes, and audits files on **existing** NTFS volumes — no Apple Developer subscription, no SIP changes, no FSKit entitlement, no third-party drivers (no `macFUSE`, no `ntfs-3g`). It operates on raw block devices, so it works regardless of whether macOS has the drive mounted.
+
+> **Formatting:** `ntfsctl` does **not** create NTFS volumes — format the drive once on Windows (or with `mkntfs-3g`), then use `ntfsctl` to read/write it. (A pure-Swift formatter was prototyped and removed: producing volumes that Windows + macOS mount cleanly is a spec-faithful effort on the scale of `ntfsprogs`, out of scope for this tool.)
 
 ```bash
 # Find your NTFS drive:
 sudo ntfsctl scan
-
-# Format from scratch — pure-Swift NTFS quick-format, no external tools needed:
-sudo ntfsctl mkntfs --label "MyDrive" --yes /dev/disk10s1
 
 # List a directory by path:
 sudo ntfsctl list --long /dev/disk10s1 /Photos
@@ -45,7 +44,6 @@ Built for macOS 15.4+ (Sequoia) on Apple Silicon. Swift 6.0+ / Xcode 16.3+ to bu
 
 - **🎉 Full real-hardware validation.** The complete **22,419-file / 39.6 GiB** phone backup copied into a single directory tree on a freshly-formatted 4 TB WD My Passport — `verify --deep` clean (0 orphans / leaks / dangling / out-of-range / double-allocated; 11.6 M runlist clusters audited). The original ~350-file cap (and ~1,611 / ~6,139 / ~7,997 successors) are all gone — per-directory capacity is now bounded only by free clusters + MFT slots.
 - **🧭 Directory-index locality allocator (v0.7.1)** — the root-cause fix that lifted the last cap. Keeps a directory's `$INDEX_ALLOCATION` index blocks contiguous (the Windows/Paragon/Tuxera approach), so the runlist stays tiny and never overflows the MFT record (measured: 222 extents → 1 at 4,000 entries). The `$ATTRIBUTE_LIST` multi-extension machinery is the rare fallback, not the primary mechanism.
-- **🔁 Pure-Swift NTFS formatter** (`ntfsctl mkntfs`). Equivalent to `mkntfs -Q`, output mountable by macOS / Linux `ntfs-3g` / Windows. **Self-sufficient on macOS** — no Homebrew, no `macFUSE`, no Linux VM, no Windows required to format.
 - **✂️ Complete copy / move / skip / replace matrix.** `cp` (replace default, `-n` skip, `-T` merge), `cp --move` (cross-device cut — source deleted only after a confirmed copy; `--dry-run` previews), `mv` (within-volume rename/move with `-n` skip / default replace, atomic so the source is never lost).
 - **🔬 Built-in diagnostics.** `ntfsctl dump <path>` decodes a file's runlist + cross-checks each cluster against `$Bitmap`; `ntfsctl verify --deep` does the same volume-wide (free-but-referenced / out-of-range / double-allocated).
 - **♻️ Every code path is `$ATTRIBUTE_LIST`-aware** — create / read / write / truncate / delete / rename / verify / reclaim-orphans all handle migrated files through the full lifecycle.
@@ -87,20 +85,19 @@ The drive stays plugged in throughout — only the filesystem mount is dropped.
 - **Exclusive `flock()` on the device** — two concurrent `ntfsctl` processes on the same device fail-fast instead of corrupting the bitmap.
 - **Compute-first transactional writes** — every multi-attribute mutation (leaf split, migration, file create, file delete) builds the new state in memory first, then commits, then reclaims allocations on any throw. `verify --deep` catches any rollback gap volume-wide.
 - **`$ATTRIBUTE_LIST` sequence-number cross-check on read** — a stale `$ATTRIBUTE_LIST` entry pointing at a recycled extension MFT slot throws `corruptOnDisk` at read time rather than silently returning another file's bytes.
-- **`mkntfs` requires `--yes`** — destructive operation refuses to run without explicit acknowledgement and always prints device path + size + label first.
 - **`reclaim-orphans` never frees a legitimate extension record** — a structural precondition guarantees a v0.5-migration extension record (holding a live file's migrated `$DATA` / `$INDEX_ALLOCATION`) can't reach the reclaim set; only confirmed-base-free leaked extensions are reclaimable.
 - **`rm -r /` rejected** — a one-typo full-volume wipe is impossible by design. Recursive deletes require `--force`.
 - **Bare arguments are always paths, never MFT record numbers** — a file literally named "38" no longer silently targets MFT record 38. Pass `--recnum` to opt into the legacy numeric form.
 
 Full CLI walkthrough: [`docs/CLI.md`](docs/CLI.md).
 
-## Subcommand reference (16 total)
+## Subcommand reference (15 total)
 
 | Group | Subcommands |
 |---|---|
 | **Read** | `info`, `scan`, `list`, `cat`, `verify` (+ `--deep`), `dump` |
 | **Write** | `create`, `write`, `truncate`, `cp` (+ `-T`/`-r`/`--from-volume`/`--progress`/`--dry-run`/`-n`), `rm`, `mv`, `delete` |
-| **Volume admin** | `mkntfs`, `setdirty`, `reclaim-orphans` |
+| **Volume admin** | `setdirty`, `reclaim-orphans` |
 
 Detail + examples: [`docs/CLI.md`](docs/CLI.md).
 
@@ -121,9 +118,6 @@ try await volume.beginWriteSession()
 let recnum = try await volume.createFile(named: "new.txt", inDirectory: 5)
 try await volume.write(at: recnum, offset: 0, bytes: Data("hi".utf8))
 try await volume.endWriteSession()
-
-// Format from scratch (mkntfs equivalent)
-try await Mkntfs.format(device: device, label: "MyDrive")
 ```
 
 ## Quick start — FSKit extension
@@ -167,7 +161,8 @@ xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager build
 |---|---|
 | `ntfsctl` read commands (`info`, `scan`, `list`, `cat`, `verify`, `dump`) | Production-ready |
 | `ntfsctl` write commands (`cp` (+`--move`), `write`, `rm`, `mv`, `create`, `delete`, `truncate`) | Production-ready; validated by a full **22,419-file / 39.6 GiB** single-tree copy on a real 4 TB WD drive (`verify --deep` clean). No known per-directory capacity cap — bounded only by free clusters + MFT slots. |
-| `ntfsctl` volume admin (`mkntfs`, `reclaim-orphans`, `setdirty`) | Production-ready |
+| `ntfsctl` volume admin (`reclaim-orphans`, `setdirty`) | Production-ready |
+| NTFS formatting | **Not provided** — format on Windows / `mkntfs-3g`; `ntfsctl` operates on existing volumes (prototype formatter removed — see [`docs/STATUS.md`](docs/STATUS.md)) |
 | `NTFSCore` library | Production-ready (226 tests, full 22,419-file copy validated on a real 4 TB WD drive) |
 | FSKit extension build | Builds clean |
 | FSKit mount in Finder | Needs SIP-off / entitlement to validate |

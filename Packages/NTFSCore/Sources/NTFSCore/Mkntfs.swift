@@ -1,6 +1,21 @@
 import Foundation
 
-// Mkntfs.swift — pure-Swift in-memory NTFS volume formatter.
+// Mkntfs.swift — INTERNAL TEST-FIXTURE volume builder. NOT a portable formatter.
+//
+// ⚠️ DO NOT expose this as a user-facing command and DO NOT use it to format a
+// real drive you intend to read on Windows or macOS. The volumes it produces
+// are self-consistent for NTFSCore's OWN reader (sufficient to build large
+// writable .img fixtures for the allocator / migration / locality test suites),
+// but they are NOT mountable by Windows or macOS `livefiles_ntfs`. Hardware
+// testing (2026-05-31) proved this: a volume formatted here is rejected as
+// corrupt by Windows and EIOs at mount under livefiles, because faithful NTFS
+// formatting requires structures this builder does not reproduce (correct BPB
+// geometry incl. hidden-sectors, conventional $MFT/$MFTMirr placement, real
+// boot code, and a spec-valid $Secure with $SDS/$SDH/$SII B-trees + SD hashes).
+// A correct formatter is a dedicated effort (~ntfsprogs' 5000-line mkntfs.c)
+// and is out of scope; the `ntfsctl mkntfs` CLI command was REMOVED for this
+// reason. To format a portable NTFS volume, use Windows (or mkntfs-3g); this
+// project's value is read/write on EXISTING NTFS volumes.
 //
 // Builds a self-consistent NTFS 3.1 initial volume image (matching what
 // `mkntfs -Q` would emit) and writes it to a BlockDevice in one pass:
