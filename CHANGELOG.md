@@ -2,6 +2,25 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — v0.7.2 (cont.) — `mkntfs` REMOVED
+
+### Removed
+
+- **`ntfsctl mkntfs` — the pure-Swift NTFS formatter (added v0.6) is removed.** Hardware testing proved its output was accepted by NTFSCore's own (lenient) reader but **rejected as corrupt by Windows and macOS `livefiles_ntfs`**. Concrete defects found: total-sectors off-by-one (fixed, but insufficient), zero BPB geometry (hidden-sectors/track/heads), non-conventional `$MFT`/`$MFTMirr` placement, no boot code, and — fundamentally — no spec-valid `$Secure` (`$SDS`/`$SDH`/`$SII` B-trees + SD hashes). A faithful formatter is an `ntfsprogs`-`mkntfs.c`-scale effort (out of scope), and a half-correct one that yields "valid-to-us / corrupt-to-Windows" volumes is actively harmful. **To format an NTFS volume, use Windows or `mkntfs-3g`; `ntfsctl` operates on existing volumes.**
+  - Removed: the `mkntfs` CLI subcommand (`Tools/ntfsctl/Sources/ntfsctl/Mkntfs.swift`) and its registration.
+  - Retained (NTFSCore-internal, clearly relabelled, NOT user-facing, NOT portable): `Volume.formatNTFS` / `Mkntfs` / `UpcaseTable` / `AttrDefTable` / `BootSector.serialize` — used solely to build large writable `.img` fixtures for the allocator / migration / locality test suites (a committed fixture can't be 512 MiB). These produce volumes valid for our own reader only.
+  - Lesson recorded in `docs/STATUS.md`: `mkntfs` was merged on a weak oracle ("passes our own reader"). Anything that writes an on-disk format for *other* systems to consume must be validated against those systems before shipping.
+
+### Docs
+
+- **`docs/CLI.md` stale-content sweep** — corrected pre-v0.2/v0.3 claims that contradicted shipped behavior:
+  - Replaced "file lookup is by MFT record number, not by path" / "a future iteration could add path-resolution" with the current model: **paths are primary** for every targeting subcommand; `--recnum` (or `--parent-recnum`) opts into the legacy numeric form, and a bare argument is always a path.
+  - Rewrote the Reading and Writing workflow examples to lead with the path form.
+  - Fixed the `--offset` docs: in-place mid-file patch is supported (not just rewrite/append).
+  - Subcommand table: `create` now documents `--parent <path>` (default `/`) + `--parent-recnum` (was wrongly "`--parent <recnum>` default 5"); `rm` now documents `--force` (required for recursive) + `--dry-run` + `--recnum`; `delete`, `truncate`, `list` clarified as path-first.
+  - Replaced the "~30-50 files per directory / no leaf split" cap reminder and the "LARGE_INDEX = too many entries" troubleshooting entry — per-directory capacity is bounded only by free clusters + MFT slots (validated at 22,419 files).
+- **`ntfsctl --help` top-level abstract** no longer says "Command-line companion to the NTFSCore reader. Read-only in v1; write subcommands land with Block G." — it now reflects the shipped read/write CLI and the "operates on existing volumes; format on Windows" workflow.
+
 ## [Unreleased] — v0.7.2 (move + conflict model: cp --move + mv skip/replace + rename atomicity)
 
 Completes the copy/move/skip/replace model. `cp` gains a cross-device **cut** (`--move`), `mv` gains skip/replace conflict handling, and the underlying `Volume.rename` is made abort-atomic so a replace can never lose the source. The dominant safety property throughout: **a source is never deleted unless its copy/move succeeded** — skipped (`-n`) and failed transfers keep their source, `--dry-run` previews deletions without touching anything, and `mv` replace is transactional (insert-before-remove rename, so the source survives a mid-flight abort).

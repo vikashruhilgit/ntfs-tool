@@ -76,39 +76,33 @@ diskutil unmount /dev/disk10s1
 # Volume metadata
 sudo ntfsctl info /dev/disk10s1
 
-# List the root directory
-sudo ntfsctl list /dev/disk10s1                 # names only
-sudo ntfsctl list --long /dev/disk10s1          # with MFT record numbers + sizes
+# List a directory by PATH (the primary form)
+sudo ntfsctl list /dev/disk10s1                 # root, names only
+sudo ntfsctl list --long /dev/disk10s1          # root, with sizes + record numbers
+sudo ntfsctl list --long /dev/disk10s1 /Photos  # a subdirectory by path
 
-# Descend into a subdirectory by its MFT record number
-sudo ntfsctl list --long /dev/disk10s1 44       # 44 is the example RECNUM of a subdirectory
-
-# Read a file's content (by MFT record number) to stdout
-sudo ntfsctl cat /dev/disk10s1 36 > /tmp/extracted.bin
+# Read a file's content by PATH to stdout
+sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg > /tmp/extracted.jpg
 
 # Identify content type via magic bytes (pipe through `file`)
-sudo ntfsctl cat /dev/disk10s1 36 | file -
+sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg | file -
 
 # Hex-dump the first 64 bytes
-sudo ntfsctl cat /dev/disk10s1 36 | head -c 64 | hexdump -C
+sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg | head -c 64 | hexdump -C
 
 # Compute SHA-256
-sudo ntfsctl cat /dev/disk10s1 36 | shasum -a 256
+sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg | shasum -a 256
 
-# Sanity-check the volume (sweep first ~64 MFT records, report parse errors)
+# Sanity-check the volume (full MFT sweep + orphan detection)
 sudo ntfsctl verify /dev/disk10s1
 
 # Done — re-mount with Apple's driver so Finder works again
 diskutil mount /dev/disk10s1
 ```
 
-**File lookup is by MFT record number, not by path.** This is intentional — NTFS is record-oriented and there's no `chdir`/`open(path)` abstraction in the raw API. To find a file:
+**Files and directories are addressed by path by default** (e.g. `/Photos/vacation.jpg`), resolved from the volume root. Every targeting subcommand (`list`, `cat`, `dump`, `create`, `write`, `truncate`, `rm`, `mv`, `delete`) accepts a path.
 
-1. `ntfsctl list --long /dev/diskN` shows the root's children with their record numbers.
-2. Descend into a subdirectory by passing its record number as the second argument.
-3. Repeat until you find the file you want.
-
-A future iteration could add a path-resolution helper (`ntfsctl ls /path/to/file`) — for now, it's record-number based.
+The legacy MFT-record-number form is still available where it's useful — pass `--recnum` (or, for `create`, `--parent-recnum`) to interpret the argument as a record number instead of a path. A bare argument is **always** a path, so a file literally named `38` targets the path `/38`, never record 38.
 
 ## Writing workflow
 
@@ -116,44 +110,55 @@ A future iteration could add a path-resolution helper (`ntfsctl ls /path/to/file
 # 1. Unmount Apple's mount (required for any write)
 diskutil unmount /dev/disk10s1
 
-# 2. Create an empty file in a parent directory
-#    --parent <recnum> selects the parent dir. Default is root (5).
-#    The parent directory must have a resident-only $INDEX_ROOT — see Constraints.
-sudo ntfsctl create /dev/disk10s1 my-note.txt --parent 44
-# Prints: "Created 'my-note.txt' at MFT record 37"  (slot number varies)
+# 2. Create an empty file in a parent directory (by path).
+#    --parent <path> selects the parent dir (default /). Intermediate
+#    directories are NOT auto-created by `create` — use `cp` for that, or
+#    create each level. Pass --parent-recnum for the legacy numeric form.
+sudo ntfsctl create /dev/disk10s1 my-note.txt --parent /Notes
 
 # 3. Write content. Bytes come from stdin.
-echo "Hello from ntfsctl on macOS." | sudo ntfsctl write /dev/disk10s1 37
+echo "Hello from ntfsctl on macOS." | sudo ntfsctl write /dev/disk10s1 /Notes/my-note.txt
 
 # Or write the contents of an existing file
-cat /tmp/source.txt | sudo ntfsctl write /dev/disk10s1 37
+cat /tmp/source.txt | sudo ntfsctl write /dev/disk10s1 /Notes/my-note.txt
 
 # 4. Mark the volume clean so chkdsk / ntfsfix don't flag it
 sudo ntfsctl setdirty /dev/disk10s1 0
 
 # 5. Verify by reading back
-sudo ntfsctl cat /dev/disk10s1 37
+sudo ntfsctl cat /dev/disk10s1 /Notes/my-note.txt
 
 # 6. (Optional) Resize the file
-sudo ntfsctl truncate /dev/disk10s1 37 0       # make it empty
-sudo ntfsctl truncate /dev/disk10s1 37 4096    # shrink to 4096 bytes (cluster-aligned)
+sudo ntfsctl truncate /dev/disk10s1 /Notes/my-note.txt 0       # make it empty
+sudo ntfsctl truncate /dev/disk10s1 /Notes/my-note.txt 4096    # shrink to 4096 bytes
 
 # 7. Delete (frees clusters + removes from parent's $I30 index)
-sudo ntfsctl delete /dev/disk10s1 37
+sudo ntfsctl rm /dev/disk10s1 /Notes/my-note.txt
 
 # 8. Re-mount so Finder / Apple's driver sees the changes
 diskutil mount /dev/disk10s1
 ```
 
+> For bulk host → volume copies (a whole folder tree, multi-GB files, progress
+> reporting), use `cp` instead of `create` + `write` — see [Recursive copy from
+> host to NTFS](#recursive-copy-from-host-to-ntfs). The create/write/truncate
+> primitives above are for surgical single-file edits.
+
 After remount, your new file appears in Finder under the parent directory. Apple's driver reads it (read-only); our `ntfsctl` wrote it. The bytes are byte-identical to what a native Windows-formatted NTFS would produce — validated against `ntfs-3g` in the project's integration tests.
 
-### Append to an existing file
+### Append to / patch an existing file
 
-The `--offset` flag lets you write at a specific offset. The only supported offsets in v1 are `0` (rewrite) or the file's current size (append):
+The `--offset` flag selects where the write lands. Three modes are supported:
+
+- `--offset 0` (default) — rewrite the file from the start.
+- `--offset <currentSize>` — append.
+- `0 < --offset N` with `N + bytes ≤ currentSize` — in-place mid-file patch (no allocation, no MFT touch).
+
+Writes that *extend* past the current size (other than a pure append) are not supported — use `--from-file` with a full-size payload, or `truncate` then `write`.
 
 ```bash
 # Append. Use the current file size as the offset.
-echo "More content" | sudo ntfsctl write /dev/disk10s1 37 --offset 5      # if existing size is 5 bytes
+echo "More content" | sudo ntfsctl write /dev/disk10s1 /Notes/my-note.txt --offset 5   # if existing size is 5 bytes
 ```
 
 Get the current size from `ntfsctl list --long <parent>` or `ntfsctl info`.
@@ -166,66 +171,37 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 |---|---|---|
 | `scan` | (no args) | List attached NTFS partitions with size + free space + serial. `--include-images` also probes `.img` files in cwd. `--long` for cluster size + MFT location. |
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
-| `list` | `<device> [recnum-or-path]` | List directory contents. Default = 5 (root). Pass `--long` for record numbers + sizes + namespace. Accepts a path like `/Backups` instead of a recnum. |
+| `list` | `<device> [path-or-recnum]` | List directory contents. Default = root (`/`). Accepts a path like `/Backups` (primary) or a bare MFT record number. Pass `--long` for record numbers + sizes + namespace. |
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
 | `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 0 = auto-bounded by `$MFT`'s logical size). `--verbose` for per-record details. **`--deep`** additionally runs a whole-volume runlist↔`$Bitmap` + double-allocation sweep — catches free-but-referenced / out-of-range / double-allocated clusters the plain check can't see (the v0.5 multi-extent / portability diagnostic). **Read-only.** |
 | `dump` | `<device> <path>` | Read-only deep dump of ONE file's unnamed `$DATA`: MFT record identity (base vs migrated/`$ATTRIBUTE_LIST`), `$DATA` header (resident vs non-resident, real/allocated/initialized sizes, lastVCN), the decoded runlist as an extent table with each extent's `$Bitmap` status (`ALLOCATED` / `FREE(!)` / `OUT_OF_RANGE(!)`, plus an advisory `OVERLAPS_RESERVED(!)` per-extent flag), and a final `runlist OK` / `runlist FAULTY` verdict. `--verbose` for per-cluster detail. The single-file companion to `verify --deep`: both share the same audit, and the pass/fail verdict covers exactly free-but-referenced / out-of-range / double-allocated clusters. Reserved-region overlap is reported only as the advisory per-extent flag and is NOT part of either command's verdict, so the two always agree. **Read-only.** |
-| `create` | `<device> <name>` | Create empty file in parent dir. `--parent <recnum>` (default 5), `--directory` for folder. Auto-promotes small dirs to LARGE_INDEX on overflow. |
+| `create` | `<device> <name>` | Create an empty file (or `--directory`) in a parent dir. `--parent <path>` (default `/`); `--parent-recnum N` for the legacy numeric form. Per-directory capacity is bounded only by free clusters + MFT slots (auto leaf-split / height-grow / `$ATTRIBUTE_LIST` migration). |
 | `cp` | `<src> <device> <dest>` | Bidirectional host↔volume copy. `--from-volume` to invert direction. `-r` recursive. `-T`/`--no-target-directory` merges a directory source's contents into an existing dest dir (instead of nesting). `--move`/`--remove-source` turns the copy into a cross-device cut — each source is deleted **after** its own copy succeeds (skipped/failed sources are preserved; `--dry-run` previews the deletions). `--progress` / `--dry-run` / `-n` (no-clobber) / `-v` / `--no-free-check`. |
 | `write` | `<device> <recnum-or-path>` | Write stdin bytes to file. `--offset N`: 0 (rewrite) / file size (append) / `0 < N ≤ size-bytes.count` (in-place mid-file patch). `--from-file <path>` streams from a host file. |
-| `rm` | `<device> <recnum-or-path>` | Delete a file or directory. `-r` recursive. `-v` verbose. |
+| `rm` | `<device> <path-or-recnum>` | Remove a file or directory tree. `-r`/`--recursive` for directories; **`--force` is required** for non-empty recursive deletes; `--dry-run` previews; `-v` verbose; `--recnum` for the numeric form. `rm -r /` and reserved records (0-15) are rejected. |
 | `mv` | `<device> <src-path> <dest-path>` | Rename or move within a single volume (with auto-create of intermediate destination dirs). Existing destination: default **replaces** it (delete-then-atomic-rename; a populated-directory destination is refused), `-n`/`--no-clobber` **skips** (no-op, exit 0). The source is never lost even if a replace aborts mid-flight (the underlying rename is insert-before-remove). |
-| `truncate` | `<device> <recnum> <newSize>` | Resize file to any byte-precise size (shrink only; growing requires `write`). |
-| `delete` | `<device> <recnum>` | Single-record delete by recnum. Frees clusters + removes from parent's $I30. Refuses reserved records 0-15. (Prefer `rm` for path-based use.) |
+| `truncate` | `<device> <path-or-recnum> <newSize>` | Resize a file to any byte-precise size (shrink only; growing requires `write`). `--recnum` for the numeric form. |
+| `delete` | `<device> <path-or-recnum>` | Low-level single-FILE delete (path by default, `--recnum` for the numeric form). Frees clusters + removes from parent's `$I30`. Refuses reserved records 0-15 and directories. (Prefer `rm` for everyday use / directory trees.) |
 | `setdirty` | `<device> <0\|1>` | Toggle the $VOLUME_INFORMATION dirty bit |
-| `mkntfs` | `<device>` | Format `<device>` as a fresh NTFS volume (`mkntfs -Q`-equivalent). REQUIRES `--yes`. `--label` for volume label, `--serial HEX` for deterministic serial. DESTRUCTIVE. See [Reformat (`mkntfs`)](#reformat-mkntfs). |
 | `reclaim-orphans` | `<device>` | Sweep MFT for orphaned BASE records (IN_USE=1 but unreachable from root) and clear them. Dry-run by default — pass `--confirm` to actually clean. `-v` for per-orphan name/parent details. Native equivalent of `ntfsfix` / `chkdsk /f` for orphan recovery. **Extension-record safe:** never frees a v0.5-migration extension record (a record holding a live file's migrated `$DATA` / `$INDEX_ALLOCATION`) — freeing one would corrupt the base file; leaked extensions are reported with a `chkdsk /f` recommendation, not auto-freed. |
 
-## Reformat (`mkntfs`)
+## Formatting — not provided (format on Windows)
 
-> NEW in v0.6 — self-contained NTFS reformat without Homebrew, macFUSE,
-> Linux VM, or Windows.
+`ntfsctl` operates on **existing** NTFS volumes; it does not create them.
+**Format the drive once on Windows** (right-click → Format → NTFS) or with
+`mkntfs-3g` on Linux, then use `ntfsctl` to read/write it.
 
-`ntfsctl mkntfs <device> --yes` creates a fresh, spec-correct NTFS volume
-on the target device or disk image. The output is byte-compatible with
-`mkntfs -Q` (Linux `ntfsprogs`): readable by macOS `livefiles_ntfs`,
-Linux `ntfs-3g`, and Windows.
-
-```bash
-# Format a 4 TB external drive (after unmounting first):
-diskutil unmountDisk /dev/disk10
-sudo ntfsctl mkntfs /dev/disk10s1 --label "MyData" --yes
-
-# Format a disk image for development/CI:
-dd if=/dev/zero of=fixture.img bs=1m count=256
-ntfsctl mkntfs fixture.img --label TEST --yes
-
-# Verify a fresh volume looks clean:
-ntfsctl info fixture.img
-ntfsctl verify --deep fixture.img    # expects 0 of everything
-```
-
-### Safety
-
-- `--yes` is REQUIRED. Without it, `mkntfs` prints the target device,
-  size, and label, then exits with an error and writes nothing.
-- The target is unconditionally overwritten — there is no backup or
-  undo. Always run against a disk image first if you're unsure.
-
-### Scope
-
-- Equivalent to `mkntfs -Q` (quick format): the bad-cluster sweep is
-  skipped; `$LogFile` is initialized to all-`0xFF` (Windows / `ntfs-3g`
-  re-initialize it on first mount); `$Secure` carries a minimal default
-  security descriptor (Everyone full control) — sufficient for data
-  volumes, but not for a bootable Windows install.
-- Compression, encryption, and Volume Shadow Copy setup are explicitly
-  out of scope.
-- The pure-Swift `$UpCase` table is generated from Unicode default case
-  mappings (`scripts/generate_upcase_table.swift` is the auditable
-  generator). The `$AttrDef` table follows the NTFS 3.1 spec verbatim.
-  Both have spec-conformance tests against hand-decoded references that
-  do not round-trip through our own decoder.
+A pure-Swift formatter (`ntfsctl mkntfs`) was prototyped in v0.6 and
+**removed in v0.7.2**: hardware testing showed the volumes it produced were
+read-only-mountable by NTFSCore's own reader but **rejected as corrupt by
+Windows and macOS `livefiles_ntfs`**. A spec-faithful NTFS formatter — correct
+BPB geometry, conventional `$MFT`/`$MFTMirr` placement, real boot code, and a
+valid `$Secure` with `$SDS`/`$SDH`/`$SII` B-trees and security-descriptor
+hashes — is an effort on the scale of `ntfsprogs`' `mkntfs.c` and out of scope
+for this tool. A half-correct formatter that yields "valid to us, corrupt to
+Windows" volumes is worse than none, so it was removed. (An internal,
+clearly-labelled NTFSCore-only fixture builder remains for the test suite; it
+is not user-accessible and is not a portable formatter.)
 
 ## Common task recipes
 
@@ -336,7 +312,7 @@ sudo ntfsctl cp -rTn ~/Desktop/s21fe-backup /dev/disk10s1 /gallery/s21fe-backup
 diskutil mount /dev/disk10s1
 ```
 
-**Per-leaf cap reminder:** v1's LARGE_INDEX support has no leaf split. If you're copying many files into a single fresh directory, expect ~30-50 files per directory before hitting `unsupportedFeature(...leaf full)`. Existing Windows-formatted volumes typically already have multi-leaf trees so this matters less for inserts into pre-existing folders.
+**Per-directory capacity:** there is no fixed cap. `create` / `cp` perform automatic leaf split, B-tree height growth, and `$ATTRIBUTE_LIST` migration as a directory grows, so a single directory is bounded only by free clusters + free MFT slots. Validated on real hardware: a **22,419-file** tree copied into one directory, `verify --deep` clean. (The old ~30-50-files-per-directory limit was a v1 leaf-split gap, lifted across v0.4–v0.7.1 — see [Constraints](#create-into-large_index-parents--per-directory-capacity).)
 
 ### Move instead of copy (`cp --move`) — cross-device cut
 
@@ -770,9 +746,9 @@ Something has files open on the volume. Common causes:
 
 Last resort: `diskutil unmount force /dev/diskN` — safe at this point since we're going to do read-only operations.
 
-### "unsupportedFeature: parent directory has LARGE_INDEX"
+### "would overflow record … type 0x80 / 0xA0" or other write-path `unsupportedFeature`
 
-Your parent dir has too many entries. Use a smaller subdirectory. See [Constraints](#constraints-and-known-limitations).
+LARGE_INDEX directories of any size are supported (auto leaf-split / height-grow / `$ATTRIBUTE_LIST` migration), so a full parent directory is no longer a limitation. If you still hit an `unsupportedFeature` on a write, capture the full message plus `ntfsctl dump <path>` / `ntfsctl info` output and open an issue — it likely points at a genuinely pathological on-disk shape, not a per-directory cap.
 
 ### `verify` reports errors
 
