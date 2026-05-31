@@ -1,6 +1,11 @@
 # Supervisor / autonomous loop state
 .supervisor/
 
+# Claude Code agent-memory store (machine-local runtime state, not project source).
+# Project-level Claude config (.claude/settings.json, .claude/commands/, .claude/agents/)
+# is intentionally NOT ignored — add it explicitly if you want it versioned.
+.claude/agent-memory/
+
 # Swift / Xcode
 .build/
 .swiftpm/
