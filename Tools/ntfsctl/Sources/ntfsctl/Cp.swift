@@ -55,6 +55,9 @@ struct Cp: AsyncParsableCommand {
     @Flag(name: [.short, .long], help: "Don't overwrite existing destination files.")
     var noClobber: Bool = false
 
+    @Flag(name: [.customLong("move"), .customLong("remove-source")], help: "Cross-device cut: delete each source file after its copy succeeds (skipped/failed sources are preserved). --remove-source is an alias.")
+    var move: Bool = false
+
     @Flag(name: [.customShort("T"), .long], help: "No-target-directory: when DEST is an existing directory, merge SOURCE's contents into it instead of nesting under DEST/<sourceBasename>.")
     var noTargetDirectory: Bool = false
 
@@ -173,6 +176,11 @@ struct Cp: AsyncParsableCommand {
 
         if dryRun {
             FileHandle.standardOutput.write(Data("DRY-RUN: would copy \(totalFiles) file(s), \(humanBytes(totalBytes)) total\n".utf8))
+            if move {
+                FileHandle.standardOutput.write(Data(
+                    "DRY-RUN: with --move, each successfully-copied source is then deleted (skipped sources preserved); nothing is written or deleted in dry-run\n".utf8
+                ))
+            }
             return
         }
 
@@ -183,6 +191,10 @@ struct Cp: AsyncParsableCommand {
         // Execute the copy.
         var copiedFiles = 0
         var copiedBytes: UInt64 = 0
+        // --move accounting: files whose source was actually deleted, and the
+        // sum of those sources' sizes (freed host bytes).
+        var movedFiles = 0
+        var freedBytes: UInt64 = 0
         // v0.4 perf measurement: capture start time so each progress line +
         // the final summary can report elapsed and throughput. Without this
         // it's impossible to tell whether Phase 1 / Phase 2 perf work
@@ -207,6 +219,8 @@ struct Cp: AsyncParsableCommand {
                 ntfsParent: mergeRoot,
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
+                movedFiles: &movedFiles,
+                freedBytes: &freedBytes,
                 totalFiles: totalFiles,
                 totalBytes: totalBytes,
                 startTime: cpStart
@@ -230,12 +244,14 @@ struct Cp: AsyncParsableCommand {
                     ntfsParent: dirRN,
                     copiedFiles: &copiedFiles,
                     copiedBytes: &copiedBytes,
+                    movedFiles: &movedFiles,
+                    freedBytes: &freedBytes,
                     totalFiles: totalFiles,
                     totalBytes: totalBytes,
                     startTime: cpStart
                 )
             } else {
-                try await copyOneFile(
+                let copied = try await copyOneFile(
                     volume: volume,
                     hostFile: source,
                     ntfsParent: destParent,
@@ -246,9 +262,24 @@ struct Cp: AsyncParsableCommand {
                     totalBytes: totalBytes,
                     startTime: cpStart
                 )
+                // --move single-file: delete source ONLY on a true (copied)
+                // return. A skip (-n collision / non-regular) returns false and
+                // a failure throws — both leave the source intact.
+                if move && copied {
+                    let size = (try? FileManager.default.attributesOfItem(atPath: source)[.size] as? UInt64) ?? 0
+                    try FileManager.default.removeItem(atPath: source)
+                    movedFiles += 1
+                    freedBytes += size
+                }
             }
         }
         try await volume.endWriteSession()
+
+        if move {
+            FileHandle.standardError.write(Data(
+                "moved: deleted \(movedFiles) source file(s), freed \(humanBytes(freedBytes))\n".utf8
+            ))
+        }
 
         if progress || verbose {
             let elapsed = Date().timeIntervalSince(cpStart)
@@ -271,15 +302,18 @@ struct Cp: AsyncParsableCommand {
     ) -> String {
         // Display path: "/" for the root/empty case, "/<requested>" otherwise.
         let displayPath = requested.isEmpty ? "/" : "/\(requested)"
+        // --move turns the copy into a cross-device cut: each source is deleted
+        // after its own copy succeeds. Surface that in the preflight line.
+        let moveSuffix = move ? " — moving (source deleted after each file copies)" : ""
         switch outcome {
         case .new:
-            return "→ creating \(displayPath) (new)"
+            return "→ creating \(displayPath) (new)\(moveSuffix)"
         case .nest:
             // Avoid a double slash when displayPath is the bare root "/".
             let nestPath = displayPath == "/" ? "/\(sourceBasename)" : "\(displayPath)/\(sourceBasename)"
-            return "→ nesting under \(nestPath) (dest exists; pass -T to merge)"
+            return "→ nesting under \(nestPath) (dest exists; pass -T to merge)\(moveSuffix)"
         case let .merge(conflict):
-            return "→ merging into \(displayPath) (existing dir; conflicts: \(conflict.rawValue))"
+            return "→ merging into \(displayPath) (existing dir; conflicts: \(conflict.rawValue))\(moveSuffix)"
         }
     }
 
@@ -360,6 +394,15 @@ struct Cp: AsyncParsableCommand {
         return try await volume.createFile(named: name, inDirectory: parent, isDirectory: true)
     }
 
+    /// Copy one host file into the volume.
+    ///
+    /// Returns `true` iff the destination write actually happened (the file was
+    /// copied). Returns `false` when the file was SKIPPED — either a non-regular
+    /// source or a `--no-clobber` collision with an existing destination. A
+    /// thrown error means the copy FAILED and propagates so the caller never
+    /// treats it as success. Callers gate the `--move` source-delete on a `true`
+    /// return only, which guarantees no source is ever deleted speculatively.
+    @discardableResult
     func copyOneFile(
         volume: NTFSCore.Volume,
         hostFile: String,
@@ -370,17 +413,17 @@ struct Cp: AsyncParsableCommand {
         totalFiles: Int,
         totalBytes: UInt64,
         startTime: Date
-    ) async throws {
+    ) async throws -> Bool {
         let url = URL(fileURLWithPath: hostFile)
         let attrs = try FileManager.default.attributesOfItem(atPath: hostFile)
         if let type = attrs[.type] as? FileAttributeType, type != .typeRegular {
             FileHandle.standardError.write(Data("skip \(hostFile): not a regular file (\(type.rawValue))\n".utf8))
-            return
+            return false
         }
         if let existing = try await childRecnum(volume: volume, parent: ntfsParent, name: name) {
             if noClobber {
                 if verbose { FileHandle.standardError.write(Data("skip \(hostFile) → already exists\n".utf8)) }
-                return
+                return false
             }
             try await volume.deleteFile(at: existing)
         }
@@ -402,18 +445,30 @@ struct Cp: AsyncParsableCommand {
                 "[\(copiedFiles)/\(totalFiles)] \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)) (\(String(format: "%.1f", pct))%) elapsed=\(String(format: "%.1f", elapsed))s rate=\(String(format: "%.1f", fileRate))/s - \(name)\n".utf8
             ))
         }
+        return true
     }
 
+    /// Copy a host directory tree into the volume.
+    ///
+    /// Returns `fullyMoved`: `true` iff EVERY child file was copied AND every
+    /// child subdir also returned `fullyMoved`. A directory that still holds a
+    /// skipped/failed child reports `false`, which propagates up so no ancestor
+    /// source directory is removed under `--move`. When `move` is set and this
+    /// directory ended up fully moved (hence empty), its emptied host source dir
+    /// is removed depth-first AFTER its children — never before.
+    @discardableResult
     func copyDirectoryRecursive(
         volume: NTFSCore.Volume,
         hostDir: String,
         ntfsParent: UInt64,
         copiedFiles: inout Int,
         copiedBytes: inout UInt64,
+        movedFiles: inout Int,
+        freedBytes: inout UInt64,
         totalFiles: Int,
         totalBytes: UInt64,
         startTime: Date
-    ) async throws {
+    ) async throws -> Bool {
         let fm = FileManager.default
         let entries = (try? fm.contentsOfDirectory(atPath: hostDir)) ?? []
 
@@ -436,21 +491,30 @@ struct Cp: AsyncParsableCommand {
             }
         }
 
+        // Track whether every child of THIS directory was fully moved. Any
+        // skip (or a subdir that itself wasn't fully moved) flips this false,
+        // which both blocks this dir's own removal and propagates to the
+        // caller so ancestor source dirs are also preserved.
+        var fullyMoved = true
+
         // 1) Recurse into subdirs first. Each recursion may open its own
         //    bulk-insert window at the child level — that's fine because
         //    THIS level's window is still closed.
         for (name, fullPath) in subdirs {
             let childRN = try await ensureDirectory(volume: volume, parent: ntfsParent, name: name)
-            try await copyDirectoryRecursive(
+            let childFullyMoved = try await copyDirectoryRecursive(
                 volume: volume,
                 hostDir: fullPath,
                 ntfsParent: childRN,
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
+                movedFiles: &movedFiles,
+                freedBytes: &freedBytes,
                 totalFiles: totalFiles,
                 totalBytes: totalBytes,
                 startTime: startTime
             )
+            if !childFullyMoved { fullyMoved = false }
         }
 
         // 2) Now copy this level's files inside one bulk-insert window.
@@ -458,33 +522,65 @@ struct Cp: AsyncParsableCommand {
         //    will show as 0 in Windows Explorer until a subsequent write
         //    or explicit hint-refresh updates them. File contents are
         //    byte-correct on disk.
-        guard !files.isEmpty else { return }
-        try await volume.beginBulkInsert(into: ntfsParent)
-        do {
-            for (name, fullPath) in files {
-                try await copyOneFile(
-                    volume: volume,
-                    hostFile: fullPath,
-                    ntfsParent: ntfsParent,
-                    name: name,
-                    copiedFiles: &copiedFiles,
-                    copiedBytes: &copiedBytes,
-                    totalFiles: totalFiles,
-                    totalBytes: totalBytes,
-                    startTime: startTime
-                )
+        if !files.isEmpty {
+            try await volume.beginBulkInsert(into: ntfsParent)
+            do {
+                for (name, fullPath) in files {
+                    let copied = try await copyOneFile(
+                        volume: volume,
+                        hostFile: fullPath,
+                        ntfsParent: ntfsParent,
+                        name: name,
+                        copiedFiles: &copiedFiles,
+                        copiedBytes: &copiedBytes,
+                        totalFiles: totalFiles,
+                        totalBytes: totalBytes,
+                        startTime: startTime
+                    )
+                    if copied {
+                        // --move: delete the source file ONLY after its copy
+                        // returned success. Per-file, AFTER the write — never
+                        // speculatively. A throw above would have propagated,
+                        // leaving the source intact.
+                        if move {
+                            let size = (try? FileManager.default.attributesOfItem(atPath: fullPath)[.size] as? UInt64) ?? 0
+                            try FileManager.default.removeItem(atPath: fullPath)
+                            movedFiles += 1
+                            freedBytes += size
+                        }
+                    } else {
+                        // Skipped (no-clobber collision or non-regular): source
+                        // preserved, and this dir is no longer fully moved.
+                        fullyMoved = false
+                    }
+                }
+                _ = try await volume.endBulkInsert()
+            } catch {
+                _ = try? await volume.endBulkInsert()
+                throw error
             }
-            _ = try await volume.endBulkInsert()
-        } catch {
-            _ = try? await volume.endBulkInsert()
-            throw error
         }
+
+        // 3) Depth-first dir cleanup: only remove the emptied source dir once
+        //    every child (files + subdirs) was moved. If anything was skipped
+        //    or a subdir wasn't fully moved, leave this dir in place.
+        if move && fullyMoved {
+            try FileManager.default.removeItem(atPath: hostDir)
+            if verbose {
+                FileHandle.standardError.write(Data("rm-dir \(hostDir) (emptied by --move)\n".utf8))
+            }
+        }
+        return fullyMoved
     }
 
     // MARK: - Volume → Host (--from-volume)
 
     private func runVolumeToHost() async throws {
-        let blockDevice = try FileHandleBlockDevice(openingFileAt: device)
+        // --move deletes from the volume after each pull, so the device must be
+        // opened writable in that case. Plain pulls stay read-only.
+        let blockDevice = move
+            ? try FileHandleBlockDevice(openingFileForUpdateAt: device)
+            : try FileHandleBlockDevice(openingFileAt: device)
         let volume = try await NTFSCore.Volume(device: blockDevice)
 
         guard let srcRN = try await volume.resolvePath(source) else {
@@ -540,11 +636,22 @@ struct Cp: AsyncParsableCommand {
 
         if dryRun {
             FileHandle.standardOutput.write(Data("DRY-RUN: would pull \(totalFiles) file(s), \(humanBytes(totalBytes)) total → \(finalHostPath)\n".utf8))
+            if move {
+                FileHandle.standardOutput.write(Data(
+                    "DRY-RUN: with --move, each successfully-pulled volume source is then deleted (skipped sources preserved); nothing is written or deleted in dry-run\n".utf8
+                ))
+            }
             return
         }
 
+        // --move on the volume→host path mutates the volume (deletes sources),
+        // so mark it dirty for the duration like the host→volume path does.
+        if move { try await volume.beginWriteSession() }
+
         var copiedFiles = 0
         var copiedBytes: UInt64 = 0
+        var movedFiles = 0
+        var freedBytes: UInt64 = 0
         let cpStart = Date()
         if srcIsDir {
             try fm.createDirectory(atPath: finalHostPath, withIntermediateDirectories: true)
@@ -554,12 +661,14 @@ struct Cp: AsyncParsableCommand {
                 hostDir: finalHostPath,
                 copiedFiles: &copiedFiles,
                 copiedBytes: &copiedBytes,
+                movedFiles: &movedFiles,
+                freedBytes: &freedBytes,
                 totalFiles: totalFiles,
                 totalBytes: totalBytes,
                 startTime: cpStart
             )
         } else {
-            try await pullOneFile(
+            let copied = try await pullOneFile(
                 volume: volume,
                 rn: srcRN,
                 hostPath: finalHostPath,
@@ -570,6 +679,20 @@ struct Cp: AsyncParsableCommand {
                 totalBytes: totalBytes,
                 startTime: cpStart
             )
+            // --move single-file: delete the volume source ONLY on a true
+            // (pulled) return. deleteFile is extension-record-aware (PR #24).
+            if move && copied {
+                try await volume.deleteFile(at: srcRN)
+                movedFiles += 1
+                freedBytes += totalBytes
+            }
+        }
+
+        if move {
+            try await volume.endWriteSession()
+            FileHandle.standardError.write(Data(
+                "moved: deleted \(movedFiles) volume source file(s), freed \(humanBytes(freedBytes))\n".utf8
+            ))
         }
 
         if progress || verbose {
@@ -597,6 +720,14 @@ struct Cp: AsyncParsableCommand {
         }
     }
 
+    /// Pull one volume file onto the host.
+    ///
+    /// Returns `true` iff the destination write actually happened. Returns
+    /// `false` when SKIPPED (`--no-clobber` and the host destination exists). A
+    /// thrown error means the pull FAILED and propagates so the caller never
+    /// treats it as success. Callers gate the `--move` volume-source delete on a
+    /// `true` return only — no source is ever deleted speculatively.
+    @discardableResult
     private func pullOneFile(
         volume: NTFSCore.Volume,
         rn: UInt64,
@@ -607,11 +738,11 @@ struct Cp: AsyncParsableCommand {
         totalFiles: Int,
         totalBytes: UInt64,
         startTime: Date
-    ) async throws {
+    ) async throws -> Bool {
         let fm = FileManager.default
         if noClobber && fm.fileExists(atPath: hostPath) {
             if verbose { FileHandle.standardError.write(Data("skip \(hostPath) → already exists\n".utf8)) }
-            return
+            return false
         }
         fm.createFile(atPath: hostPath, contents: nil)
         guard let handle = FileHandle(forWritingAtPath: hostPath) else {
@@ -643,36 +774,53 @@ struct Cp: AsyncParsableCommand {
                 "[\(copiedFiles)/\(totalFiles)] \(humanBytes(copiedBytes))/\(humanBytes(totalBytes)) (\(String(format: "%.1f", pct))%) elapsed=\(String(format: "%.1f", elapsed))s rate=\(String(format: "%.1f", fileRate))/s - \(fileName)\n".utf8
             ))
         }
+        return true
     }
 
+    /// Pull a volume directory tree onto the host.
+    ///
+    /// Returns `fullyMoved`: `true` iff every child file was pulled AND every
+    /// child subdir returned `fullyMoved`. Under `--move`, after children are
+    /// moved depth-first, an emptied volume source dir is deleted via
+    /// `volume.deleteFile` (which removes the dir record + its parent $I30
+    /// entry; children were already removed so nothing dangles). A subdir that
+    /// wasn't fully moved blocks its own and its ancestors' removal.
+    @discardableResult
     private func pullDirRecursive(
         volume: NTFSCore.Volume,
         volumeDirRN: UInt64,
         hostDir: String,
         copiedFiles: inout Int,
         copiedBytes: inout UInt64,
+        movedFiles: inout Int,
+        freedBytes: inout UInt64,
         totalFiles: Int,
         totalBytes: UInt64,
         startTime: Date
-    ) async throws {
+    ) async throws -> Bool {
         let fm = FileManager.default
         let entries = try await volume.enumerate(directory: volumeDirRN)
+        var fullyMoved = true
         for e in entries where e.fileName.namespace != .dos {
             let hostChild = (hostDir as NSString).appendingPathComponent(e.name)
             if e.isDirectory {
                 try fm.createDirectory(atPath: hostChild, withIntermediateDirectories: true)
-                try await pullDirRecursive(
+                let childFullyMoved = try await pullDirRecursive(
                     volume: volume,
                     volumeDirRN: e.recordNumber,
                     hostDir: hostChild,
                     copiedFiles: &copiedFiles,
                     copiedBytes: &copiedBytes,
+                    movedFiles: &movedFiles,
+                    freedBytes: &freedBytes,
                     totalFiles: totalFiles,
                     totalBytes: totalBytes,
                     startTime: startTime
                 )
+                if !childFullyMoved { fullyMoved = false }
             } else {
-                try await pullOneFile(
+                let size = e.fileName.realSize
+                let copied = try await pullOneFile(
                     volume: volume,
                     rn: e.recordNumber,
                     hostPath: hostChild,
@@ -683,8 +831,29 @@ struct Cp: AsyncParsableCommand {
                     totalBytes: totalBytes,
                     startTime: startTime
                 )
+                if copied {
+                    // --move: delete the volume source file ONLY after its pull
+                    // succeeded. deleteFile is extension-record-aware (PR #24).
+                    if move {
+                        try await volume.deleteFile(at: e.recordNumber)
+                        movedFiles += 1
+                        freedBytes += size
+                    }
+                } else {
+                    fullyMoved = false
+                }
             }
         }
+        // Depth-first dir cleanup: remove the emptied volume source dir only
+        // when every child moved. deleteFile works on a now-empty directory
+        // record (no empty-check required; children were removed above).
+        if move && fullyMoved {
+            try await volume.deleteFile(at: volumeDirRN)
+            if verbose {
+                FileHandle.standardError.write(Data("rm-dir volume recnum \(volumeDirRN) (emptied by --move)\n".utf8))
+            }
+        }
+        return fullyMoved
     }
 
     // MARK: - Helpers

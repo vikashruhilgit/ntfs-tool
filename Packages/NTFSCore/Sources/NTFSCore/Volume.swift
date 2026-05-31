@@ -150,6 +150,29 @@ public actor Volume {
         }
         return false
     }
+
+    /// v0.7 AUDIT-TODO(rename-i30-atomicity) test-only fault-injection seam.
+    /// Mirrors `CreateFileFaultPoint`. Lets `RenameAtomicityTests` force a
+    /// throw inside `rename`'s INSERT-BEFORE-REMOVE commit sequence and
+    /// observe that the post-abort on-disk state is verify-clean — the file
+    /// is NEVER "unreachable from both parents". Single-shot: fires at most
+    /// once, then auto-clears.
+    public enum RenameFaultPoint: Sendable, Equatable {
+        /// Throw AFTER the new $I30 entry has been committed under the target
+        /// parent but BEFORE the old entry is removed from the source parent.
+        /// Post-abort state must be reachable-from-BOTH (verify-clean), never
+        /// unreachable-from-both.
+        case afterInsertBeforeRemove
+    }
+    private var _renameFaultHook: RenameFaultPoint?
+    public func _setRenameFaultHook(_ point: RenameFaultPoint?) { _renameFaultHook = point }
+    private func _takeRenameFaultHook(if point: RenameFaultPoint) -> Bool {
+        if _renameFaultHook == point {
+            _renameFaultHook = nil
+            return true
+        }
+        return false
+    }
     #endif
 
     public init(device: any BlockDevice) async throws {
@@ -6510,10 +6533,43 @@ public actor Volume {
             throw NTFSError.unsupportedFeature(description: "rename: destination '\(newName)' already exists in parent \(targetParentRN)")
         }
 
-        // 1. Remove from old parent.
-        try await removeFromParentI30(parentRecordNumber: oldParentRN, childFileName: oldName)
+        // AUDIT-TODO(rename-i30-atomicity) — CLOSED. INSERT-BEFORE-REMOVE.
+        //
+        // The catastrophic failure mode of the old remove-then-insert
+        // ordering was: a throw between "remove old $I30 entry" and "insert
+        // new $I30 entry" left the file UNREACHABLE FROM BOTH parents — a
+        // silent orphan that `verify --deep` would flag (in-use base record
+        // not reachable from root's $I30 tree). To make that state
+        // structurally unreachable from any throw, we mirror `createFile`'s
+        // compute-first / commit-secondary-first discipline (see its big
+        // block comment): commit the NEW reachability edge BEFORE tearing
+        // down the OLD one.
+        //
+        //   compute-first:
+        //     Build the new $FILE_NAME body + the full serialized record
+        //     bytes in memory. Anything that would mis-validate (missing
+        //     end marker, attribute overflow) throws here, before any disk
+        //     mutation — the volume is untouched, still reachable from the
+        //     old parent. Clean.
+        //   commit ordering:
+        //     1) insert the new $I30 entry under the target parent
+        //     2) write the record with the updated $FILE_NAME
+        //     3) remove the old $I30 entry from the old parent
+        //
+        // Post-abort state matrix (every abort point is verify-clean —
+        // `verify --deep` defines clean as ZERO orphans + ZERO dangling,
+        // and does NOT cross-check a $I30 key against the target's
+        // $FILE_NAME, so a transient reachable-from-both state is clean):
+        //   • throw before step 1 → reachable from OLD parent only. Clean.
+        //   • throw after step 1, before step 3 completes → reachable from
+        //     BOTH parents (a transient hardlink-like state). The record is
+        //     never freed → no dangling; it is reachable → no orphan. Clean.
+        //   • success → reachable from TARGET parent only. Clean.
+        // The record's MFT slot is NEVER freed by rename, so dangling can
+        // never arise from this method.
 
-        // 2. Update the file's $FILE_NAME body with the new name + parent reference.
+        // compute-first: new $FILE_NAME body + serialized record bytes, no
+        // disk mutation yet.
         let parentRec = try await mft.record(at: targetParentRN)
         let newParentRef = (UInt64(parentRec.sequenceNumber) << 48) | (targetParentRN & 0x0000_FFFF_FFFF_FFFF)
         let newFileNameBody = buildRenamedFileNameBody(
@@ -6540,21 +6596,16 @@ public actor Volume {
         }
         var finalBytes = updatedRecordBytes
         MFTRecord.writeU32LE(into: &finalBytes, at: 24, value: UInt32(mark + 4))
-        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: finalBytes)
 
-        // 3. Insert new $I30 entry under the target parent.
-        //
-        // v0.5 Bug B: rename's atomicity contract is explicitly OUT OF
-        // SCOPE for this subtask (see the leaf-split-migration job brief
-        // risk table — rename/delete mutation atomicity audits are
-        // deferred). The flag is threaded for signature compatibility
-        // only; rename's existing rollback discipline (above) is
-        // unchanged. AUDIT-TODO(rename-i30-atomicity): rename should
-        // get the same compute-first/commit-secondary-first treatment
-        // as createFile — currently a throw between the source-side
-        // $I30 remove and the target-side $I30 insert could leave the
-        // file unreachable from both directories.
-        var _renameI30Dummy = false
+        // 1. Insert the new $I30 entry under the target parent. This is the
+        //    new reachability edge; it is committed BEFORE we remove the old
+        //    one. `newI30Committed` is the real commit flag (replacing the
+        //    former `_renameI30Dummy`): `insertIntoParentI30` flips it true
+        //    immediately before each on-disk write that could leave a durable
+        //    trace of the new entry. rename never frees the source record, so
+        //    this method needs no reclaim-on-throw branch — the flag is kept
+        //    so the seam below can reason about "after insert".
+        var newI30Committed = false
         try await insertIntoParentI30(
             parentRecordNumber: targetParentRN,
             childRecordNumber: recordNumber,
@@ -6562,8 +6613,29 @@ public actor Volume {
             childFileName: newName,
             isDirectory: record.isDirectory,
             nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
-            i30Committed: &_renameI30Dummy
+            i30Committed: &newI30Committed
         )
+
+        // 2. Write the record with the updated $FILE_NAME (newName,
+        //    newParentRef). Now the record itself reflects the new home.
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: finalBytes)
+
+        #if DEBUG
+        // Fault-injection point: throw in the dangerous window — AFTER the
+        // new $I30 entry is committed under the target parent and the record
+        // has been rewritten, but BEFORE the old entry is removed from the
+        // source parent. Under INSERT-BEFORE-REMOVE the file is reachable
+        // from BOTH parents here, never from neither — the test asserts the
+        // resulting volume is verify-clean (zero orphans, zero dangling).
+        _ = newI30Committed
+        if _takeRenameFaultHook(if: .afterInsertBeforeRemove) {
+            throw NTFSError.ioFailure(description: "rename fault-injection: afterInsertBeforeRemove")
+        }
+        #endif
+
+        // 3. Remove the old $I30 entry from the old parent. This tears down
+        //    the old reachability edge last, completing the move.
+        try await removeFromParentI30(parentRecordNumber: oldParentRN, childFileName: oldName)
     }
 
     /// Build a $FILE_NAME body with the same attributes as `from` but using
