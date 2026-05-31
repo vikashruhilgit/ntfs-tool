@@ -19,9 +19,11 @@ struct Mv: AsyncParsableCommand {
               ntfsctl mv /dev/disk10s1 /Backups/draft.txt /Archive/final.txt
 
             Limitations:
-              - Refuses to overwrite an existing destination.
-              - The same LARGE_INDEX leaf-full cap applies to the destination
-                parent's $I30.
+              - Refuses to overwrite an existing destination (no skip/replace
+                conflict policy yet — unlike `cp`).
+              - Move is within a single NTFS volume only (rename / relocate on
+                the same drive). Cross-device move (host <-> volume) is not yet
+                supported — use `cp` then `rm`/`delete`.
             """
     )
 

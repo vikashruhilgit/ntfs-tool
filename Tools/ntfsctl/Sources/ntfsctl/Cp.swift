@@ -26,13 +26,12 @@ struct Cp: AsyncParsableCommand {
               # Don't overwrite existing destination files, show progress:
               ntfsctl cp -r -n --progress ~/PhoneBackup /dev/disk10s1 /Backups/MyPhone
 
+            Conflict handling (existing destination files):
+              - default      : replace (overwrite the existing file)
+              - -n/--no-clobber : skip (leave the existing file untouched)
+
             Limitations:
               - Symlinks/hardlinks/devnodes in source are skipped (with warning).
-              - LARGE_INDEX leaf-split is not yet implemented: copying many
-                files into a single fresh directory caps at ~30-50 files per
-                directory before hitting `unsupportedFeature(leaf full)`.
-                Existing Windows-formatted dirs typically have multi-leaf
-                trees and accept many more inserts.
               - Free-space pre-check runs by default for recursive copies in
                 the host → volume direction (pass --no-free-check to skip).
             """
