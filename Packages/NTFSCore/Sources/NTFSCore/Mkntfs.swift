@@ -54,6 +54,13 @@ public enum Mkntfs {
         public var indexRecordSize: UInt32
         public var volumeSerial: UInt64?     // nil → random
         public var quick: Bool               // matches `mkntfs -Q`
+        /// TEST-ONLY: override the initial $MFT.$DATA size, in clusters. When
+        /// non-nil, `planGeometry` uses exactly this many clusters for $MFT
+        /// instead of the `max(16 MiB, 0.125%)` policy. Used to build fixtures
+        /// with a tight $MFT (e.g. 4 clusters = 16 records) that reproduce a
+        /// real Windows quick-format and force the MFT auto-grow path. NOT
+        /// used by any user-facing entry point.
+        public var mftInitialClustersOverride: UInt64?
 
         public init(
             label: String = "",
@@ -62,7 +69,8 @@ public enum Mkntfs {
             mftRecordSize: UInt32 = 1024,
             indexRecordSize: UInt32 = 4096,
             volumeSerial: UInt64? = nil,
-            quick: Bool = true
+            quick: Bool = true,
+            mftInitialClustersOverride: UInt64? = nil
         ) {
             self.label = label
             self.bytesPerSector = bytesPerSector
@@ -71,6 +79,7 @@ public enum Mkntfs {
             self.indexRecordSize = indexRecordSize
             self.volumeSerial = volumeSerial
             self.quick = quick
+            self.mftInitialClustersOverride = mftInitialClustersOverride
         }
     }
 
@@ -171,11 +180,18 @@ public enum Mkntfs {
         //  - $MFT initial size: max(16 MiB, 0.125% of volume) — rounded up
         //    to a whole cluster. Capped to a sane minimum so even a tiny
         //    image has ~16 records of headroom.
-        let mftInitialBytes = max(
-            UInt64(16 * 1024 * 1024),
-            (deviceSizeBytes / 800) // ~0.125%
-        )
-        let mftClusters = max(UInt64(4), (mftInitialBytes + clusterBytes - 1) / clusterBytes)
+        let mftClusters: UInt64
+        if let override = options.mftInitialClustersOverride {
+            // TEST-ONLY: build a tight $MFT (mirrors a real Windows quick
+            // format that starts $MFT at 16 records and grows on demand).
+            mftClusters = max(UInt64(4), override)
+        } else {
+            let mftInitialBytes = max(
+                UInt64(16 * 1024 * 1024),
+                (deviceSizeBytes / 800) // ~0.125%
+            )
+            mftClusters = max(UInt64(4), (mftInitialBytes + clusterBytes - 1) / clusterBytes)
+        }
 
         // Backup boot sector lives at LBA == totalSectors — i.e. the volume's
         // last sector, which is the last PHYSICAL sector of the partition
@@ -984,7 +1000,8 @@ extension Volume {
         deviceSizeBytes: UInt64,
         label: String = "",
         quick: Bool = true,
-        volumeSerial: UInt64? = nil
+        volumeSerial: UInt64? = nil,
+        mftInitialClustersOverride: UInt64? = nil
     ) async throws {
         try await Mkntfs.format(
             device: device,
@@ -992,7 +1009,8 @@ extension Volume {
             options: Mkntfs.Options(
                 label: label,
                 volumeSerial: volumeSerial,
-                quick: quick
+                quick: quick,
+                mftInitialClustersOverride: mftInitialClustersOverride
             )
         )
     }

@@ -625,32 +625,112 @@ public actor Volume {
     /// bitmap covers fewer slots than the user wants to allocate, the
     /// `unsupportedFeature` error nudges the user toward $MFT growth (which
     /// is a separate future feature; for now, full bitmaps are terminal).
-    public func allocateMFTRecord() async throws -> UInt64 {
-        var bm = try await mftBitmap()
-        for n in MFT.firstUserRecord..<bm.clusterCount {
-            if !bm.isAllocated(cluster: n) {
-                // Materialized check: only allocate slots within $MFT.$DATA's
-                // physical extent. Growth is implemented (growMFTDataByClusters)
-                // but NOT auto-invoked from this allocator in v0.2 — the
-                // grow + second-leaf-split interaction has a subtle
-                // corruption bug under investigation. Real Windows-
-                // formatted drives reserve 12.5% of the volume for $MFT
-                // growth, so on a 4 TB drive `allocatedSize` covers
-                // hundreds of millions of records — plenty for phone-
-                // backup workloads. The cap mainly bites tiny fixtures.
-                if try await isMFTRecordSlotMaterialized(n) {
-                    try bm.markAllocated(startLCN: n, count: 1)
-                    try await persistMFTBitmap(bm)
-                    _mftBitmap = bm
-                    try await bumpMFTDataRealSizeIfNeeded(toCoverSlot: n)
-                    return n
-                }
-                throw NTFSError.unsupportedFeature(
-                    description: "MFT slot \(n) is free in $MFT.$BITMAP but past $MFT.$DATA's allocatedSize; auto-grow is disabled in v0.2 (call growMFTDataByClusters() manually if needed)"
-                )
+    /// Clusters added to $MFT.$DATA per growth step. 64 clusters @ 4 KiB =
+    /// 256 KiB = 256 records of 1 KiB. Amortizes growth (a long `cp -r`
+    /// triggers it ~once per 256 files) and leaves a materialized runway so a
+    /// single createFile's base + any extension records find ready slots
+    /// without re-growing mid-transaction.
+    private static let mftGrowChunkClusters: UInt64 = 64
+
+    /// Allocate the next free MFT record (>= firstUserRecord). Marks the bit
+    /// in $MFT.$BITMAP and persists it before returning; the caller then
+    /// writes the record's content with IN_USE=1.
+    ///
+    /// `allowGrowth` controls whether the allocator may grow $MFT.$DATA /
+    /// $MFT.$BITMAP when it runs out of *materialized* slots (slots backed by
+    /// physical $MFT.$DATA, not just a free bitmap bit). A freshly Windows-
+    /// formatted volume starts $MFT.$DATA at just 16 records and grows it on
+    /// demand — so without growth, the first user-file allocation (slot 16)
+    /// fails immediately. Growth is enabled ONLY for the base-record
+    /// allocation at the START of `createFile`: a safe point, because nothing
+    /// transactional has been read or built yet and createFile re-reads the
+    /// parent afterward. It is left OFF (default) for extension-record
+    /// allocation MID-migration — growing there rewrites $MFT record 0 and
+    /// invalidates caches in the middle of a compute-first transaction (the
+    /// historical "grow + leaf-split interaction" corruption hazard). The base
+    /// allocation's 256-record runway means mid-transaction extension
+    /// allocations virtually always find a ready slot anyway.
+    ///
+    /// Ceiling: $MFT.$BITMAP growth is bounded by its existing allocatedSize
+    /// (no cascading bitmap-of-bitmap growth yet). On a typical volume
+    /// (4 KiB $BITMAP) that caps the MFT at ~32,768 records — far above the
+    /// previous 16-record wall, and adequate for large backups. Past that the
+    /// grow throws a clear `unsupportedFeature`.
+    public func allocateMFTRecord(allowGrowth: Bool = false) async throws -> UInt64 {
+        var growthRounds: UInt64 = 0
+        while true {
+            let bm = try await mftBitmap()
+            // First free bit in the user region of the currently-tracked range.
+            var freeSlot: UInt64? = nil
+            var n = MFT.firstUserRecord
+            while n < bm.clusterCount {
+                if !bm.isAllocated(cluster: n) { freeSlot = n; break }
+                n += 1
             }
+
+            // Fast path: a free slot that's already physically backed.
+            if let slot = freeSlot, try await isMFTRecordSlotMaterialized(slot) {
+                var bm2 = bm
+                try bm2.markAllocated(startLCN: slot, count: 1)
+                try await persistMFTBitmap(bm2)
+                _mftBitmap = bm2
+                try await bumpMFTDataRealSizeIfNeeded(toCoverSlot: slot)
+                return slot
+            }
+
+            // Need to grow: either a free bit exists past $MFT.$DATA's
+            // allocatedSize, or the whole tracked range is full.
+            guard allowGrowth else {
+                if let slot = freeSlot {
+                    throw NTFSError.unsupportedFeature(
+                        description: "MFT slot \(slot) is free in $MFT.$BITMAP but past $MFT.$DATA's allocatedSize; allocateMFTRecord(allowGrowth:false) — mid-transaction growth is disabled"
+                    )
+                }
+                throw NTFSError.outOfSpace(requestedClusters: 1, freeClusters: 0)
+            }
+
+            growthRounds += 1
+            guard growthRounds <= 1_000_000 else {
+                throw NTFSError.outOfSpace(requestedClusters: 1, freeClusters: 0)
+            }
+            let targetSlot = freeSlot ?? bm.clusterCount
+            let before = try await mftDataAllocatedRecords()
+            try await growMFTDataToCoverSlot(targetSlot)
+            let after = try await mftDataAllocatedRecords()
+            // No-progress guard (e.g. hit the $BITMAP allocatedSize ceiling and
+            // growMFTBitmapToCoverBytes silently capped) — fail rather than spin.
+            if after <= before {
+                throw NTFSError.outOfSpace(requestedClusters: 1, freeClusters: 0)
+            }
+            // Loop: re-read the (now larger) bitmap and retry.
         }
-        throw NTFSError.outOfSpace(requestedClusters: 1, freeClusters: 0)
+    }
+
+    /// Current $MFT.$DATA allocatedSize expressed in whole MFT records.
+    private func mftDataAllocatedRecords() async throws -> UInt64 {
+        let r0 = try await mft().record(at: 0)
+        let attrs = try r0.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+            return 0
+        }
+        let recBytes = UInt64(mftRecordSizeBytes)
+        switch dataAttr.value {
+        case let .resident(b, _):                    return UInt64(b.count) / recBytes
+        case let .nonResident(_, _, _, _, a, _, _, _): return a / recBytes
+        }
+    }
+
+    /// Grow $MFT.$DATA so its allocatedSize covers at least `slot`, plus a
+    /// runway chunk. Delegates to `growMFTDataByClusters`, which also extends
+    /// $MFT.$BITMAP's realSize so the new slots become visible to the
+    /// allocator's next bitmap read.
+    private func growMFTDataToCoverSlot(_ slot: UInt64) async throws {
+        let recBytes = UInt64(mftRecordSizeBytes)
+        let clusterBytes = UInt64(bytesPerCluster)
+        let neededClusters = ((slot + 1) * recBytes + clusterBytes - 1) / clusterBytes
+        let curClusters = try await mftDataAllocatedRecords() * recBytes / clusterBytes
+        let deficit = neededClusters > curClusters ? neededClusters - curClusters : 0
+        try await growMFTDataByClusters(max(deficit, Volume.mftGrowChunkClusters))
     }
 
     /// Grow $MFT itself by N more clusters. Allocates from $Bitmap, zeros
@@ -1107,7 +1187,12 @@ public actor Volume {
         // — shouldn't happen on real volumes).
         let recordNumber: UInt64
         do {
-            recordNumber = try await allocateMFTRecord()
+            // allowGrowth: this is the FIRST step of createFile — no
+            // transactional state has been read or built yet, and the parent
+            // is re-read below — so it is safe to grow $MFT here. Growth is
+            // what lets ntfsctl write to a freshly Windows-formatted volume
+            // whose $MFT starts at only 16 records.
+            recordNumber = try await allocateMFTRecord(allowGrowth: true)
         } catch NTFSError.corruptOnDisk {
             // No $BITMAP — degenerate; fall back to the legacy linear scan.
             recordNumber = try await mft.findFreeRecordNumber()

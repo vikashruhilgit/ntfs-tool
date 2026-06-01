@@ -106,13 +106,33 @@ enum IndexBuilder {
         return body
     }
 
-    /// NTFS COLLATION_FILENAME sort comparator. Returns true if `a` should
-    /// sort before `b`. NTFS uses uppercase Unicode comparison via the
-    /// volume's $UpCase table; Stage 3b approximates with Swift's
-    /// case-insensitive localized comparison. For ASCII names the result
-    /// is identical; non-ASCII may sort slightly differently than Windows
-    /// would. Either way the volume remains structurally valid.
+    /// NTFS `COLLATION_FILE_NAME` sort comparator. Returns true if `a` should
+    /// sort strictly before `b`.
+    ///
+    /// CRITICAL: this MUST match Windows / ntfs-3g exactly. Directory `$I30`
+    /// indexes are sorted B-trees that those drivers **binary-search** — if
+    /// our insertion orders entries differently, their search misses entries
+    /// (e.g. `$Secure`) and the volume reads as "corrupted".
+    ///
+    /// NTFS compares filenames as sequences of UTF-16 code units, each mapped
+    /// through the `$UpCase` table (case-insensitive), compared as unsigned
+    /// 16-bit values; a shorter name that is a prefix of a longer one sorts
+    /// first. This is NOT the same as Swift's `localizedCaseInsensitiveCompare`
+    /// — locale-aware collation reorders punctuation (it sorts `.` before `$`,
+    /// whereas NTFS sorts `$` (0x24) before `.` (0x2E)), which silently
+    /// corrupts the index ordering on real volumes. (Was the root cause of
+    /// ntfsctl-written volumes failing to mount on Windows/ntfs-3g.)
     static func collationFilenameSortsBefore(_ a: String, _ b: String) -> Bool {
-        a.localizedCaseInsensitiveCompare(b) == .orderedAscending
+        let ua = Array(a.utf16)
+        let ub = Array(b.utf16)
+        let n = min(ua.count, ub.count)
+        var i = 0
+        while i < n {
+            let ca = UpcaseTable.upcase(ua[i])
+            let cb = UpcaseTable.upcase(ub[i])
+            if ca != cb { return ca < cb }
+            i += 1
+        }
+        return ua.count < ub.count
     }
 }
