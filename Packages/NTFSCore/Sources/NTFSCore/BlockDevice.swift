@@ -112,28 +112,103 @@ public actor FileHandleBlockDevice: BlockDevice {
         try? handle.close()
     }
 
+    /// Chunk size for raw-device reads. Like writes, a single `read(2)` to a
+    /// raw character device (`/dev/rdiskN`) is capped at MAXPHYS (~1 MiB on
+    /// stock macOS); a larger read returns EINVAL ("Invalid argument") rather
+    /// than a short read. The volume `$Bitmap` on a 4 TB drive is ~122 MB, so
+    /// any reader that pulls it in one call (the allocator, `verify --deep`,
+    /// `dump`) failed on real hardware until this was chunked. Regular `.img`
+    /// files are fine with larger reads, but chunking is harmless there.
+    static let readChunkSize: Int = 1 * 1024 * 1024   // 1 MiB
+
+    /// Raw-device block size for read alignment, resolved lazily and cached.
+    /// `nil` = not yet probed; `.some(nil)` = a regular file (no alignment
+    /// needed); `.some(.some(bs))` = a raw device that requires `bs`-aligned
+    /// read offsets AND lengths. Raw character devices reject a `read(2)` whose
+    /// offset or length isn't a multiple of the block size with EINVAL.
+    private var _rawBlockSize: UInt32?? = nil
+
+    private func rawBlockSize() -> UInt32? {
+        if let cached = _rawBlockSize { return cached }
+        let fd = handle.fileDescriptor
+        var st = stat()
+        var result: UInt32? = nil
+        if fstat(fd, &st) == 0, (st.st_mode & S_IFMT) != S_IFREG {
+            // Block/character device — probe its block size (mirror size()).
+            let DKIOCGETBLOCKSIZE: UInt = 0x40046418
+            var bs: UInt32 = 0
+            if ioctl(fd, DKIOCGETBLOCKSIZE, &bs) == 0, bs > 0 {
+                result = bs
+            } else {
+                result = 512   // safe default for a raw device we couldn't probe
+            }
+        }
+        _rawBlockSize = .some(result)
+        return result
+    }
+
+    /// Test-only seam: force the raw-device block size so the block-alignment
+    /// read path and the sub-block read-modify-write path can be exercised
+    /// against a regular temp file (which `fstat` would otherwise classify as
+    /// needing no alignment). Pass `nil` to restore "regular file" behaviour.
+    /// Not used by production code.
+    internal func _forceBlockSizeForTesting(_ bs: UInt32?) {
+        _rawBlockSize = .some(bs)
+    }
+
     public func read(offset: UInt64, length: Int) async throws -> Data {
         guard length >= 0 else {
             throw NTFSError.ioFailure(description: "negative read length \(length)")
         }
         if length == 0 { return Data() }
 
+        // Regular files: chunked read of exactly the requested window — no
+        // alignment constraints. Raw devices: reads must be block-aligned in
+        // BOTH offset and length, so widen the window to block boundaries, read
+        // it (chunked under MAXPHYS), then slice out the requested bytes.
+        guard let blockSize = rawBlockSize() else {
+            return try readRange(offset: offset, length: length)
+        }
+        let bs = UInt64(blockSize)
+        let alignedStart = (offset / bs) * bs
+        let alignedEnd = ((offset + UInt64(length) + bs - 1) / bs) * bs
+        let alignedLen = Int(alignedEnd - alignedStart)
+        let raw = try readRange(offset: alignedStart, length: alignedLen)
+        let lead = Int(offset - alignedStart)
+        return raw.subdata(in: raw.startIndex.advanced(by: lead)
+                              ..< raw.startIndex.advanced(by: lead + length))
+    }
+
+    /// Seek to `offset` and read exactly `length` bytes, splitting each
+    /// `read(2)` to `readChunkSize` so a raw-device transfer never exceeds
+    /// MAXPHYS. Caller guarantees `offset`/`length` satisfy any device
+    /// alignment requirement.
+    private func readRange(offset: UInt64, length: Int) throws -> Data {
         do {
             try handle.seek(toOffset: offset)
         } catch {
             throw NTFSError.ioFailure(description: "seek to offset \(offset) failed: \(error)")
         }
-
-        let data: Data?
-        do {
-            data = try handle.read(upToCount: length)
-        } catch {
-            throw NTFSError.ioFailure(description: "read at offset \(offset) length \(length) failed: \(error)")
+        var result = Data()
+        result.reserveCapacity(length)
+        var remaining = length
+        while remaining > 0 {
+            let thisChunk = min(Self.readChunkSize, remaining)
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: thisChunk)
+            } catch {
+                throw NTFSError.ioFailure(
+                    description: "read at offset \(offset + UInt64(length - remaining)) length \(thisChunk) failed: \(error)"
+                )
+            }
+            guard let chunk, !chunk.isEmpty else {
+                throw NTFSError.shortRead(expected: length, got: length - remaining)
+            }
+            result.append(chunk)
+            remaining -= chunk.count
         }
-        guard let data, data.count == length else {
-            throw NTFSError.shortRead(expected: length, got: data?.count ?? 0)
-        }
-        return data
+        return result
     }
 
     /// Chunk size for raw-device writes. macOS's BSD block layer caps a
@@ -150,17 +225,49 @@ public actor FileHandleBlockDevice: BlockDevice {
     public func write(offset: UInt64, bytes: Data) async throws {
         guard isWritable else { throw NTFSError.readOnlyDevice }
         if bytes.isEmpty { return }
+
+        // Regular files: write the bytes directly (chunked only for MAXPHYS).
+        // Raw devices: a write(2) must be block-aligned in BOTH offset AND
+        // length, or it returns EINVAL ("Invalid argument") — e.g. an 8-byte
+        // $MFT $BITMAP update at a cluster offset. For an already-aligned
+        // window, write straight through; otherwise read-modify-write the
+        // surrounding block(s) so only the requested bytes change.
+        guard let blockSize = rawBlockSize() else {
+            try writeRangeChunked(offset: offset, bytes: bytes)
+            return
+        }
+        let bs = UInt64(blockSize)
+        let end = offset + UInt64(bytes.count)
+        if offset % bs == 0, end % bs == 0 {
+            try writeRangeChunked(offset: offset, bytes: bytes)
+            return
+        }
+        // Sub-block write: widen to block boundaries, patch, write back.
+        let alignedStart = (offset / bs) * bs
+        let alignedEnd = ((end + bs - 1) / bs) * bs
+        let alignedLen = Int(alignedEnd - alignedStart)
+        var window = try readRange(offset: alignedStart, length: alignedLen)
+        let lead = Int(offset - alignedStart)
+        window.replaceSubrange(
+            window.startIndex.advanced(by: lead)..<window.startIndex.advanced(by: lead + bytes.count),
+            with: bytes
+        )
+        try writeRangeChunked(offset: alignedStart, bytes: window)
+    }
+
+    /// Seek to `offset` and write `bytes`, splitting each `write(2)` to
+    /// `writeChunkSize` so a raw-device transfer never exceeds MAXPHYS. Caller
+    /// guarantees `offset`/`bytes.count` satisfy any device alignment.
+    private func writeRangeChunked(offset: UInt64, bytes: Data) throws {
         do {
             try handle.seek(toOffset: offset)
         } catch {
             throw NTFSError.ioFailure(description: "seek to offset \(offset) for write failed: \(error)")
         }
-        let chunkSize = Self.writeChunkSize
         let total = bytes.count
         var written = 0
         while written < total {
-            let remaining = total - written
-            let thisChunk = min(chunkSize, remaining)
+            let thisChunk = min(Self.writeChunkSize, total - written)
             let lo = bytes.index(bytes.startIndex, offsetBy: written)
             let hi = bytes.index(lo, offsetBy: thisChunk)
             // Data(...) copy ensures the slice is contiguous; FileHandle's

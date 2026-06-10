@@ -427,8 +427,10 @@ struct Cp: AsyncParsableCommand {
             }
             try await volume.deleteFile(at: existing)
         }
-        let rn = try await volume.createFile(named: name, inDirectory: ntfsParent, isDirectory: false)
         let size = attrs[.size] as? UInt64 ?? 0
+        // Pass the size so the $I30 index entry carries it — Windows Explorer
+        // reads file size from there (0 → shows 0 KB and refuses to open).
+        let rn = try await volume.createFile(named: name, inDirectory: ntfsParent, isDirectory: false, dataSize: size)
         if size > 0 {
             try await volume.writeFile(at: rn, fromFileAt: url, chunkSize: chunkSize)
         }

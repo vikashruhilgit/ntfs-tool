@@ -695,8 +695,15 @@ public actor Volume {
             }
             let targetSlot = freeSlot ?? bm.clusterCount
             let before = try await mftDataAllocatedRecords()
+            if ProcessInfo.processInfo.environment["NTFS_MFT_DEBUG"] != nil {
+                FileHandle.standardError.write(Data(
+                    "MFTGROW round=\(growthRounds) bmClusterCount=\(bm.clusterCount) freeSlot=\(freeSlot.map(String.init) ?? "nil") targetSlot=\(targetSlot) beforeRecords=\(before)\n".utf8))
+            }
             try await growMFTDataToCoverSlot(targetSlot)
             let after = try await mftDataAllocatedRecords()
+            if ProcessInfo.processInfo.environment["NTFS_MFT_DEBUG"] != nil {
+                FileHandle.standardError.write(Data("MFTGROW   -> afterRecords=\(after)\n".utf8))
+            }
             // No-progress guard (e.g. hit the $BITMAP allocatedSize ceiling and
             // growMFTBitmapToCoverBytes silently capped) — fail rather than spin.
             if after <= before {
@@ -754,13 +761,45 @@ public actor Volume {
     /// is granular, big enough that we're not paying overhead per record.
     public func growMFTDataByClusters(_ clusterCount: UInt64) async throws {
         guard clusterCount > 0 else { return }
+        let clusterBytes = UInt64(bytesPerCluster)
+        let mft = self.mft()
 
-        // 1. Allocate (volume bitmap).
-        let extent = try await allocateClusters(clusterCount)
+        // 0. Read the current $MFT.$DATA runlist BEFORE allocating, so we can
+        //    place the growth immediately after the runlist tail. Allocation
+        //    only touches the volume $Bitmap (and $Bitmap's own record), never
+        //    record 0's $DATA, so these extents stay valid across step 1.
+        let r0 = try await mft.record(at: 0)
+        let attrs = try r0.attributes()
+        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }),
+              case let .nonResident(svcn, _, dro, cu, oldAllocated, realSize, initSize, oldExtents) = dataAttr.value else {
+            throw NTFSError.unsupportedFeature(description: "growMFTDataByClusters: $MFT.$DATA must be non-resident")
+        }
+        // LCN one past the MFT's current last (non-sparse) extent — the
+        // preferred home for the growth.
+        let mftTailLCN: UInt64? = {
+            for ex in oldExtents.reversed() {
+                if let lcn = ex.startLCN { return lcn + ex.clusterCount }
+            }
+            return nil
+        }()
+
+        // 1. Allocate from the MFT lane — contiguous with the MFT tail when
+        //    possible. This is the root-cause fix for the over-grow + MFT/
+        //    file-data overlap on Windows-formatted volumes ($MFT at a high LCN
+        //    with a reserved MFT zone): the old code allocated from the global
+        //    low `_allocHint` shared with the $DATA front, so growth extents
+        //    landed far from the base, never merged, and the runlist
+        //    fragmented into the file-data region. Allocating after the tail
+        //    keeps the runlist coalesced and the MFT clear of file data —
+        //    mirroring ntfs-3g's MFT_ZONE policy (alloc at rl->lcn+length,
+        //    then merge) and our own per-directory index-lane allocator.
+        let extent = try await allocateMFTGrowthClusters(count: clusterCount, near: mftTailLCN)
         guard let newLCN = extent.startLCN else {
             throw NTFSError.corruptOnDisk(description: "growMFTDataByClusters: sparse extent")
         }
-        let clusterBytes = UInt64(bytesPerCluster)
+        if ProcessInfo.processInfo.environment["NTFS_MFT_DEBUG"] != nil {
+            FileHandle.standardError.write(Data("MFTGROWCLUST request=\(clusterCount) tail=\(mftTailLCN.map(String.init) ?? "nil") allocatedLCN=\(newLCN) merged=\(mftTailLCN == newLCN)\n".utf8))
+        }
 
         // 2. Zero the new clusters so they parse as "all-zero" empty MFT
         //    slots (magic=0x00000000 — our bitmap allocator already treats
@@ -770,14 +809,6 @@ public actor Volume {
             try await device.write(offset: deviceByteOffset(forLCN: newLCN &+ c), bytes: zeroChunk)
         }
 
-        // Now compute what the new sizes will be.
-        let mft = self.mft()
-        let r0 = try await mft.record(at: 0)
-        let attrs = try r0.attributes()
-        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }),
-              case let .nonResident(svcn, _, dro, cu, oldAllocated, realSize, initSize, oldExtents) = dataAttr.value else {
-            throw NTFSError.unsupportedFeature(description: "growMFTDataByClusters: $MFT.$DATA must be non-resident")
-        }
         // Merge with adjacent last extent if possible (keeps runlist short).
         var newExtents = oldExtents
         if let last = newExtents.last,
@@ -1176,10 +1207,51 @@ public actor Volume {
     /// - If the new entry would overflow the parent record, we roll back
     ///   the MFT allocation and throw `unsupportedFeature` rather than
     ///   leaving an orphan record.
+    /// The NTFS security info a record carries: a v3 `$STANDARD_INFORMATION`
+    /// `security_id` (a 4-byte index into the `$Secure` metafile) and/or an
+    /// inline `$SECURITY_DESCRIPTOR` (type 0x50 — the legacy NTFS 1.2 form).
+    /// Either may be nil.
+    struct InheritedSecurity { var securityID: UInt32?; var inlineSD: Data? }
+
+    /// Extract the inheritable security info from a record's attributes.
+    /// `securityID` is reported only when non-zero (0 means "no id").
+    private func securityInfo(of attrs: [Attribute]) -> InheritedSecurity {
+        var sid: UInt32? = nil
+        if let si = attrs.first(where: { $0.type == .standardInformation }),
+           case let .resident(b, _) = si.value,
+           let parsed = try? StandardInformation.parse(b),
+           let parsedSID = parsed.securityID, parsedSID != 0 {
+            sid = parsedSID
+        }
+        var inline: Data? = nil
+        if let sd = attrs.first(where: { $0.rawType == 0x50 && $0.nameOrEmpty == "" }),
+           case let .resident(b, _) = sd.value, !b.isEmpty {
+            inline = b
+        }
+        return InheritedSecurity(securityID: sid, inlineSD: inline)
+    }
+
+    /// Cached security info of the volume root (record 5). The root always
+    /// exists, and on a Windows-formatted volume always carries a valid
+    /// `security_id` — making it the deterministic "sane default SD inherited
+    /// from the volume root" the v1 non-goals call for (vs. borrowing an
+    /// arbitrary user file's id). Stable for the lifetime of the Volume.
+    private var _rootSecurity: InheritedSecurity?
+    private func rootSecurity() async -> InheritedSecurity {
+        if let cached = _rootSecurity { return cached }
+        var info = InheritedSecurity(securityID: nil, inlineSD: nil)
+        if let root = try? await mft().record(at: 5), let attrs = try? root.attributes() {
+            info = securityInfo(of: attrs)
+        }
+        _rootSecurity = info
+        return info
+    }
+
     public func createFile(
         named name: String,
         inDirectory parentRecordNumber: UInt64 = 5,
-        isDirectory: Bool = false
+        isDirectory: Bool = false,
+        dataSize: UInt64 = 0
     ) async throws -> UInt64 {
         let mft = self.mft()
         // T1.1: allocate via $MFT.$BITMAP (authoritative). Fall back to the
@@ -1246,6 +1318,49 @@ public actor Volume {
         //   (record present, $I30 present)     — success
         // and the (record absent, $I30 present) dangling state is now
         // structurally unreachable from any throw inside this function.
+        // Security: NTFS 3.x stores per-file security descriptors centrally in
+        // the $Secure metafile, referenced by a 4-byte security_id in the
+        // 72-byte v3 $STANDARD_INFORMATION. A file with a valid security_id is
+        // what makes Windows grant access; a file with none is access-denied
+        // ("you do not have permission to open this file") on a Windows volume.
+        //
+        // We do NOT maintain $Secure ($SDS/$SDH/$SII B-trees) — a v1 non-goal —
+        // so instead we INHERIT a security_id already on the volume:
+        //   1. the parent directory's (correct NT ACL-inheritance behaviour), then
+        //   2. the volume root's (record 5) — the "sane default SD inherited from
+        //      the volume root" the v1 non-goals prescribe; deterministic, and on
+        //      a Windows volume the root always carries a valid id.
+        //
+        // On volumes that use no security_ids at all (our own formatter, or an
+        // ntfs-3g v1.x image), there is no id to inherit. There we fall back to
+        // an inline $SECURITY_DESCRIPTOR (0x50, the legacy NTFS 1.2 form):
+        // inherit the parent's, else the root's, else a default Everyone-Full-
+        // Control SD so the file is at least openable. (Such volumes read inline
+        // SDs natively; we emit a security_id, never an inline SD, whenever one
+        // can be inherited, which is the modern-Windows path.)
+        let parentSec = securityInfo(of: (try? parent.attributes()) ?? [])
+        let securityID: UInt32?
+        let inheritedSD: Data?
+        if let sid = parentSec.securityID {
+            securityID = sid
+            inheritedSD = nil
+        } else {
+            let rootSec = await rootSecurity()
+            if let sid = rootSec.securityID {
+                securityID = sid
+                inheritedSD = nil
+            } else {
+                securityID = nil
+                inheritedSD = parentSec.inlineSD ?? rootSec.inlineSD ?? Data(MFTRecordBuilder.everyoneFullControlSD)
+            }
+        }
+        // Size hints stamped into BOTH $FILE_NAME copies (the file's own 0x30
+        // and the parent's $I30 entry below) so they agree with the eventual
+        // $DATA size. allocatedSize = real rounded up to a whole cluster (what
+        // a non-resident $DATA reports). For a directory or empty file these
+        // stay 0.
+        let clusterBytes = UInt64(bytesPerCluster)
+        let childAllocSize = dataSize == 0 ? 0 : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -1253,7 +1368,11 @@ public actor Volume {
             sequenceNumber: newSequence,
             isDirectory: isDirectory,
             fileName: name,
-            parentReference: parentRef
+            parentReference: parentRef,
+            securityID: securityID,
+            securityDescriptor: inheritedSD,
+            dataRealSize: isDirectory ? 0 : dataSize,
+            dataAllocatedSize: isDirectory ? 0 : childAllocSize
         )
         // Compute step: build the record bytes in memory. Builder is pure;
         // any failure here (impossible for current inputs but defensive)
@@ -1304,6 +1423,9 @@ public actor Volume {
         //    `true` and we will NOT free the MFT slot on throw.
         var i30Committed = false
         do {
+            // $I30 entry size hints — Windows Explorer reads file size from
+            // here, and these MUST match the file's own $FILE_NAME (stamped on
+            // the builder above) so chkdsk's cross-check passes.
             try await insertIntoParentI30(
                 parentRecordNumber: parentRecordNumber,
                 childRecordNumber: recordNumber,
@@ -1311,6 +1433,8 @@ public actor Volume {
                 childFileName: name,
                 isDirectory: isDirectory,
                 nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
+                childRealSize: isDirectory ? 0 : dataSize,
+                childAllocatedSize: isDirectory ? 0 : childAllocSize,
                 i30Committed: &i30Committed
             )
         } catch {
@@ -1368,6 +1492,8 @@ public actor Volume {
         childFileName: String,
         isDirectory: Bool,
         nowFiletime: UInt64,
+        childRealSize: UInt64 = 0,
+        childAllocatedSize: UInt64 = 0,
         i30Committed: inout Bool
     ) async throws {
         let mft = self.mft()
@@ -1409,7 +1535,9 @@ public actor Volume {
                 parentReference: parentRef,
                 fileName: childFileName,
                 isDirectory: isDirectory,
-                nowFiletime: nowFiletime
+                nowFiletime: nowFiletime,
+                realSize: childRealSize,
+                allocatedSize: childAllocatedSize
             )
             // v0.5 Bug B: `IndexAllocationWriter.insert` reads, descends,
             // and writes the leaf in one call — we cannot interpose a
@@ -1490,7 +1618,9 @@ public actor Volume {
             parentReference: parentRef,
             fileName: childFileName,
             isDirectory: isDirectory,
-            nowFiletime: nowFiletime
+            nowFiletime: nowFiletime,
+            realSize: childRealSize,
+            allocatedSize: childAllocatedSize
         )
         entries.append((childRef, childBody, childFileName))
 
@@ -4220,11 +4350,17 @@ public actor Volume {
     }
 
     /// Build a $FILE_NAME body for a brand-new entry being inserted into $I30.
+    /// `realSize`/`allocatedSize` populate the index entry's size hints —
+    /// **Windows Explorer reads the file size from the $I30 entry**, so leaving
+    /// them 0 makes every file show 0 KB and refuse to open (Windows treats it
+    /// as empty). Set them to the file's actual size.
     private func buildFileNameBody(
         parentReference: UInt64,
         fileName: String,
         isDirectory: Bool,
-        nowFiletime: UInt64
+        nowFiletime: UInt64,
+        realSize: UInt64 = 0,
+        allocatedSize: UInt64 = 0
     ) -> Data {
         let nameUTF16 = Array(fileName.utf16)
         let nameByteCount = nameUTF16.count * 2
@@ -4234,9 +4370,9 @@ public actor Volume {
         MFTRecord.writeU64LE(into: &data, at: 16, value: nowFiletime)
         MFTRecord.writeU64LE(into: &data, at: 24, value: nowFiletime)
         MFTRecord.writeU64LE(into: &data, at: 32, value: nowFiletime)
-        MFTRecord.writeU64LE(into: &data, at: 40, value: 0)
-        MFTRecord.writeU64LE(into: &data, at: 48, value: 0)
-        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0000 : 0)
+        MFTRecord.writeU64LE(into: &data, at: 40, value: allocatedSize)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: realSize)
+        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)  // DIR|ARCHIVE / ARCHIVE
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
         data[64] = UInt8(nameUTF16.count)
         data[65] = 1  // Win32 namespace
@@ -6373,6 +6509,39 @@ public actor Volume {
         bm.clearDirty()
         _bitmap = bm
         advanceAllocHint(after: extent, clusterCount: bm.clusterCount)
+        return extent
+    }
+
+    /// Allocate `count` contiguous clusters for **$MFT growth**, preferring the
+    /// run that starts immediately after the MFT's current runlist tail so the
+    /// $MFT.$DATA runlist stays coalesced and the MFT stays clear of the low
+    /// file-data front. This is the MFT analogue of `allocateIndexClusters`
+    /// (the per-directory index lane) and mirrors ntfs-3g's MFT_ZONE policy
+    /// (`ntfs_mft_data_extend_allocation`: prefer `lcn = rl->lcn + rl->length`,
+    /// then merge runs).
+    ///
+    /// `findFreeRun(startingAt: tail)` returns `tail` itself when the clusters
+    /// right after the MFT are free (the common case — that region is the
+    /// reserved "MFT zone" on a Windows volume), which makes `growMFTDataBy
+    /// Clusters`'s merge fire and the runlist stay a single extent. If the zone
+    /// is occupied it degrades to the next free run (wrapping to low clusters),
+    /// exactly like the global allocator — never failing while space exists.
+    ///
+    /// Deliberately does NOT advance the global `_allocHint`: the MFT lane is
+    /// separate from the `$DATA` lane (same rationale as the index lane).
+    private func allocateMFTGrowthClusters(count: UInt64, near tail: UInt64?) async throws -> Extent {
+        guard count > 0 else {
+            throw NTFSError.ioFailure(description: "allocateMFTGrowthClusters: count must be > 0")
+        }
+        var bm = try await bitmap()
+        let base = tail ?? _allocHint
+        guard let chosen = bm.findFreeRun(count: count, startingAt: base) else {
+            throw NTFSError.outOfSpace(requestedClusters: count, freeClusters: bm.freeClusterCount)
+        }
+        let extent = try bm.allocate(count, startingAt: chosen)
+        try await persistBitmap(bm)
+        bm.clearDirty()
+        _bitmap = bm
         return extent
     }
 
