@@ -61,6 +61,16 @@ public enum Mkntfs {
         /// real Windows quick-format and force the MFT auto-grow path. NOT
         /// used by any user-facing entry point.
         public var mftInitialClustersOverride: UInt64?
+        /// TEST-ONLY: place $MFT at this LCN instead of the default low spot,
+        /// leaving the clusters between the low system region and this LCN — and
+        /// the clusters AFTER $MFT — free. This reproduces a Windows-formatted
+        /// layout ($MFT at LCN 786432 = 3 GiB with a reserved MFT zone after
+        /// it), which is the only layout that triggers the MFT over-grow +
+        /// MFT/file-data overlap bug. The other system files (mirror, $MFT
+        /// bitmap, $LogFile, $AttrDef, $UpCase, $Bitmap) stay at their normal
+        /// low positions; only $MFT moves. NOT used by any user-facing entry
+        /// point.
+        public var mftStartLCNOverride: UInt64?
 
         public init(
             label: String = "",
@@ -70,7 +80,8 @@ public enum Mkntfs {
             indexRecordSize: UInt32 = 4096,
             volumeSerial: UInt64? = nil,
             quick: Bool = true,
-            mftInitialClustersOverride: UInt64? = nil
+            mftInitialClustersOverride: UInt64? = nil,
+            mftStartLCNOverride: UInt64? = nil
         ) {
             self.label = label
             self.bytesPerSector = bytesPerSector
@@ -80,6 +91,7 @@ public enum Mkntfs {
             self.volumeSerial = volumeSerial
             self.quick = quick
             self.mftInitialClustersOverride = mftInitialClustersOverride
+            self.mftStartLCNOverride = mftStartLCNOverride
         }
     }
 
@@ -255,6 +267,23 @@ public enum Mkntfs {
             )
         }
 
+        // TEST-ONLY: relocate $MFT to a high LCN to reproduce a Windows layout.
+        // Other system files keep their low positions (computed above as if
+        // $MFT sat low); the low [mftStart, mftStart+mftClusters) gap is simply
+        // left reserved/unused. The high region and the free zone after it
+        // recreate the conditions for the MFT over-grow/overlap bug.
+        let effectiveMftStart: UInt64
+        if let ovr = options.mftStartLCNOverride {
+            guard ovr >= nextLCN, ovr + mftClusters < backupBsCluster else {
+                throw NTFSError.unsupportedFeature(
+                    description: "mkntfs: mftStartLCNOverride \(ovr) doesn't fit (low system end \(nextLCN), needs \(mftClusters) clusters before backup BS \(backupBsCluster))"
+                )
+            }
+            effectiveMftStart = ovr
+        } else {
+            effectiveMftStart = mftStart
+        }
+
         // Volume serial: random unless overridden (for deterministic tests).
         let serial = options.volumeSerial ?? UInt64.random(in: 1...UInt64.max)
 
@@ -268,7 +297,7 @@ public enum Mkntfs {
             indexRecordSize: options.indexRecordSize,
             clustersPerMFTRecord: cmft,
             clustersPerIndexRecord: cidx,
-            mftStartLCN: mftStart,
+            mftStartLCN: effectiveMftStart,
             mftClusterCount: mftClusters,
             mftMirrorStartLCN: mftMirrorStart,
             mftMirrorClusterCount: mftMirrorClusters,
@@ -974,6 +1003,11 @@ public enum Mkntfs {
         // Mark cluster 0..bitmapStart+bitmapClusterCount (system region) as in-use.
         let systemEnd = geom.bitmapStartLCN + geom.bitmapClusterCount
         markRange(&d, start: 0, count: systemEnd)
+        // Mark the $MFT region in-use. Normally this is inside [0, systemEnd)
+        // already (idempotent); when $MFT is relocated to a high LCN (the
+        // test-only Windows-layout fixture) this is the only place it gets
+        // marked allocated.
+        markRange(&d, start: geom.mftStartLCN, count: geom.mftClusterCount)
         // Mark backup BS cluster as in-use.
         markRange(&d, start: geom.bootBackupStartLCN, count: 1)
         return d
@@ -1001,7 +1035,8 @@ extension Volume {
         label: String = "",
         quick: Bool = true,
         volumeSerial: UInt64? = nil,
-        mftInitialClustersOverride: UInt64? = nil
+        mftInitialClustersOverride: UInt64? = nil,
+        mftStartLCNOverride: UInt64? = nil
     ) async throws {
         try await Mkntfs.format(
             device: device,
@@ -1010,7 +1045,8 @@ extension Volume {
                 label: label,
                 volumeSerial: volumeSerial,
                 quick: quick,
-                mftInitialClustersOverride: mftInitialClustersOverride
+                mftInitialClustersOverride: mftInitialClustersOverride,
+                mftStartLCNOverride: mftStartLCNOverride
             )
         )
     }

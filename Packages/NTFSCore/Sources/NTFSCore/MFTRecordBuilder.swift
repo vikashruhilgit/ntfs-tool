@@ -14,6 +14,39 @@ import Foundation
 // rounds each attribute's `length` field up to the next multiple of 8.
 public struct MFTRecordBuilder {
 
+    /// Last-resort self-relative NTFS security descriptor: owner/group =
+    /// Administrators (S-1-5-32-544), DACL = a single inheritable
+    /// ACCESS_ALLOWED ACE granting **Everyone (S-1-1-0) Full Control**
+    /// (0x001F01FF).
+    ///
+    /// This is the legacy NTFS **1.2** representation — an inline
+    /// `$SECURITY_DESCRIPTOR` (type 0x50) on the file itself. Modern NTFS 3.x
+    /// (Windows 2000+) instead stores descriptors centrally in `$Secure` and
+    /// references them by a `security_id` in `$STANDARD_INFORMATION`; on a v3
+    /// volume ntfs-3g writes a `security_id` and removes any inline 0x50. We
+    /// therefore prefer inheriting a `security_id` (see `Volume.createFile`)
+    /// and only emit this inline SD as a fallback on volumes that carry NO
+    /// security_id anywhere to inherit (our own formatter's images, ntfs-3g
+    /// v1.x images). Such volumes read inline SDs natively; whether a modern
+    /// Windows volume would accept an inline-only file is unverified, so this
+    /// path is deliberately the last resort, not the default.
+    public static let everyoneFullControlSD: [UInt8] = [
+        0x01, 0x00, 0x04, 0x80,                         // rev 1, control 0x8004 (DACL_PRESENT|SELF_RELATIVE)
+        0x14, 0x00, 0x00, 0x00,                         // owner offset = 20
+        0x24, 0x00, 0x00, 0x00,                         // group offset = 36
+        0x00, 0x00, 0x00, 0x00,                         // SACL offset = 0 (none)
+        0x34, 0x00, 0x00, 0x00,                         // DACL offset = 52
+        0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // owner SID S-1-5-32-544
+        0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+        0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // group SID S-1-5-32-544
+        0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00,
+        0x02, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x00, // ACL rev 2, size 0x1C, 1 ACE
+        0x00, 0x03, 0x14, 0x00, 0xFF, 0x01, 0x1F, 0x00, // ACE: ALLOW, OI|CI, size 0x14, mask FULL
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // SID S-1-1-0 (Everyone)
+        0x00, 0x00, 0x00, 0x00,
+    ]
+
+
     public let recordSize: Int          // typically 1024
     public let sectorSize: Int          // typically 512
     public let recordNumber: UInt32     // self MFT number
@@ -23,6 +56,30 @@ public struct MFTRecordBuilder {
     public let fileName: String
     public let parentReference: UInt64  // (parentSeq << 48) | parentRecord
     public let nowFiletime: UInt64      // shared across all four timestamps
+    /// Inherited NTFS 3.x security id (indexes into $Secure). When non-nil the
+    /// $STANDARD_INFORMATION is emitted in the 72-byte v3.0 form carrying this
+    /// id, so Windows can resolve the file's ACL. nil → 48-byte v1.2 form (no
+    /// security id) — used on volumes whose own system files lack one (e.g.
+    /// ntfs-3g-formatted images). WITHOUT a valid security id on a Windows-
+    /// formatted volume, Windows denies all access ("you do not have
+    /// permission to open this file"), so `Volume.createFile` inherits the
+    /// parent directory's id (falling back to the volume root's).
+    public let securityID: UInt32?
+    /// Inline self-relative security descriptor (NTFS $SECURITY_DESCRIPTOR,
+    /// type 0x50) inherited from the parent or volume root — the legacy NTFS
+    /// 1.2 fallback used only when no `securityID` is available to inherit.
+    /// nil → no $SECURITY_DESCRIPTOR attribute emitted. Mutually exclusive with
+    /// `securityID` in practice (we set one or the other, never both).
+    public let securityDescriptor: Data?
+    /// Final data-stream sizes to stamp into the file's own $FILE_NAME (0x30)
+    /// size fields. chkdsk cross-checks the $FILE_NAME copy in the file's MFT
+    /// record against the copy in the parent's $I30 index entry (and against
+    /// $DATA), so these MUST match the size we put in the $I30 entry — leaving
+    /// them 0 while $DATA is non-empty is a mismatch chkdsk flags/"repairs".
+    /// For a file written via `writeFile` after creation, pass the eventual
+    /// $DATA size here. 0 for empty files and directories.
+    public let dataRealSize: UInt64
+    public let dataAllocatedSize: UInt64
 
     public init(
         recordSize: Int = 1024,
@@ -32,7 +89,11 @@ public struct MFTRecordBuilder {
         isDirectory: Bool,
         fileName: String,
         parentReference: UInt64,
-        nowFiletime: UInt64 = MFTRecordBuilder.windowsFiletimeNow()
+        nowFiletime: UInt64 = MFTRecordBuilder.windowsFiletimeNow(),
+        securityID: UInt32? = nil,
+        securityDescriptor: Data? = nil,
+        dataRealSize: UInt64 = 0,
+        dataAllocatedSize: UInt64 = 0
     ) {
         self.recordSize = recordSize
         self.sectorSize = sectorSize
@@ -42,6 +103,10 @@ public struct MFTRecordBuilder {
         self.fileName = fileName
         self.parentReference = parentReference
         self.nowFiletime = nowFiletime
+        self.securityID = securityID
+        self.securityDescriptor = securityDescriptor
+        self.dataRealSize = dataRealSize
+        self.dataAllocatedSize = dataAllocatedSize
     }
 
     /// Build the post-fix-up bytes (the form `MFTRecord.parse` consumes).
@@ -112,7 +177,23 @@ public struct MFTRecordBuilder {
             valueBytes: fileNameBody(fileNameUTF16: fileNameUTF16)
         )
 
-        // 3) Type-discriminated body attribute:
+        // 3) $SECURITY_DESCRIPTOR (type 0x50, resident) inherited from the
+        //    parent — emitted in ascending type order (after $FILE_NAME 0x30,
+        //    before $DATA 0x80 / $INDEX_ROOT 0x90). Required for Windows to
+        //    grant access on volumes whose root carries an inline SD.
+        var bodyAttrID: UInt16 = 2
+        if let sd = securityDescriptor, !sd.isEmpty {
+            cursor = try writeResidentAttribute(
+                into: &data,
+                at: cursor,
+                type: 0x50,
+                attrID: 2,
+                valueBytes: sd
+            )
+            bodyAttrID = 3
+        }
+
+        // 4) Type-discriminated body attribute:
         //    - File:      $DATA (0x80) resident, empty body.
         //    - Directory: $INDEX_ROOT (0x90) with attribute name $I30 and an
         //                 empty $I30 body (just the INDEX_ROOT preamble +
@@ -124,7 +205,7 @@ public struct MFTRecordBuilder {
                 into: &data,
                 at: cursor,
                 type: 0x90,
-                attrID: 2,
+                attrID: bodyAttrID,
                 attributeName: "$I30",
                 valueBytes: emptyIndexRootBody()
             )
@@ -133,7 +214,7 @@ public struct MFTRecordBuilder {
                 into: &data,
                 at: cursor,
                 type: 0x80,
-                attrID: 2,
+                attrID: bodyAttrID,
                 valueBytes: Data()
             )
         }
@@ -156,15 +237,24 @@ public struct MFTRecordBuilder {
     // MARK: — Attribute body builders
 
     private func standardInformationBody() -> Data {
-        var data = Data(count: 48)   // v1.2 body — fits NTFS 3.0+ as a subset
+        // 72-byte v3.0 form when we have a security id to carry (NTFS 3.x /
+        // Windows volumes); 48-byte v1.2 form otherwise.
+        let v3 = securityID != nil
+        var data = Data(count: v3 ? 72 : 48)
         MFTRecord.writeU64LE(into: &data, at: 0,  value: nowFiletime)   // creation
         MFTRecord.writeU64LE(into: &data, at: 8,  value: nowFiletime)   // modification
         MFTRecord.writeU64LE(into: &data, at: 16, value: nowFiletime)   // mft change
         MFTRecord.writeU64LE(into: &data, at: 24, value: nowFiletime)   // access
-        MFTRecord.writeU32LE(into: &data, at: 32, value: 0)             // fileAttributes
+        MFTRecord.writeU32LE(into: &data, at: 32, value: 0x20)         // fileAttributes = ARCHIVE (matches ntfs-3g; $STD_INFO has no dir bit)
         MFTRecord.writeU32LE(into: &data, at: 36, value: 0)             // maxVersions
         MFTRecord.writeU32LE(into: &data, at: 40, value: 0)             // version
         MFTRecord.writeU32LE(into: &data, at: 44, value: 0)             // classID
+        if v3 {
+            MFTRecord.writeU32LE(into: &data, at: 48, value: 0)              // ownerID
+            MFTRecord.writeU32LE(into: &data, at: 52, value: securityID!)    // securityID → $Secure
+            MFTRecord.writeU64LE(into: &data, at: 56, value: 0)             // quotaCharged
+            MFTRecord.writeU64LE(into: &data, at: 64, value: 0)             // USN
+        }
         return data
     }
 
@@ -176,9 +266,9 @@ public struct MFTRecordBuilder {
         MFTRecord.writeU64LE(into: &data, at: 16, value: nowFiletime)
         MFTRecord.writeU64LE(into: &data, at: 24, value: nowFiletime)
         MFTRecord.writeU64LE(into: &data, at: 32, value: nowFiletime)
-        MFTRecord.writeU64LE(into: &data, at: 40, value: 0)              // allocatedSize (stale by design)
-        MFTRecord.writeU64LE(into: &data, at: 48, value: 0)              // realSize (stale by design)
-        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0000 : 0)   // fileAttributes
+        MFTRecord.writeU64LE(into: &data, at: 40, value: dataAllocatedSize)  // allocatedSize (matches $I30 + $DATA)
+        MFTRecord.writeU64LE(into: &data, at: 48, value: dataRealSize)       // realSize (matches $I30 + $DATA)
+        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)   // fileAttributes: DIR|ARCHIVE / ARCHIVE
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)              // EA/reparse union
         data[64] = UInt8(fileNameUTF16.count)
         data[65] = 1                                                     // namespace = Win32

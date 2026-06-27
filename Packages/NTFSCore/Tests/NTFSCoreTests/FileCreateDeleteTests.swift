@@ -100,7 +100,14 @@ final class FileCreateDeleteTests: XCTestCase {
         XCTAssertEqual(created.mftRecordNumber, UInt32(recordNumber))
 
         let attrs = try created.attributes()
-        XCTAssertEqual(attrs.count, 3, "should have $STANDARD_INFO + $FILE_NAME + $DATA")
+        // Core attributes are always present: $STANDARD_INFORMATION + $FILE_NAME
+        // + $DATA. A 4th — an inline $SECURITY_DESCRIPTOR (0x50) — is added when
+        // the parent directory carries one (inherited so Windows grants access).
+        XCTAssertTrue(attrs.contains { $0.type == .standardInformation })
+        XCTAssertTrue(attrs.contains { $0.type == .fileName })
+        XCTAssertTrue(attrs.contains { $0.type == .data })
+        XCTAssertTrue((3...4).contains(attrs.count),
+            "expected $STANDARD_INFO + $FILE_NAME + $DATA (+ optional inherited $SECURITY_DESCRIPTOR); got \(attrs.map { $0.type })")
 
         guard let fnAttr = attrs.first(where: { $0.type == .fileName }),
               case let .resident(fnBytes, _) = fnAttr.value
