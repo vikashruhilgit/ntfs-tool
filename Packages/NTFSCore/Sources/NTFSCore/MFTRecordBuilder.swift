@@ -323,7 +323,15 @@ public struct MFTRecordBuilder {
         // Resident extension.
         MFTRecord.writeU32LE(into: &data, at: offset + 16, value: UInt32(bodyLength))
         MFTRecord.writeU16LE(into: &data, at: offset + 20, value: valueOffset)
-        data[data.startIndex + offset + 22] = 0                          // indexedFlag
+        // Resident "indexed" flag (RESIDENT_ATTR_IS_INDEXED, 0x01): set iff this
+        // attribute's value is duplicated in an index. $FILE_NAME (0x30) is
+        // indexed in the parent directory's $I30, so Windows/ntfs-3g set this to
+        // 1 for $FILE_NAME (and 0 for everything else). Leaving it 0 makes real
+        // Windows chkdsk reject the $FILE_NAME attribute record as corrupt and
+        // delete it ("Deleting corrupt attribute record (0x30)"), orphaning the
+        // file — even though ntfs-3g and our own reader accept it. Verified
+        // against ntfs-3g-authored records (Tests Fixtures/small.img).
+        data[data.startIndex + offset + 22] = (type == 0x30) ? 1 : 0     // indexedFlag
         data[data.startIndex + offset + 23] = 0                          // padding
 
         // Body bytes.

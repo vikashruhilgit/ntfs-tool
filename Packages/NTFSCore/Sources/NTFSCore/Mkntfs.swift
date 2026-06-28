@@ -850,7 +850,9 @@ public enum Mkntfs {
         MFTRecord.writeU16LE(into: &d, at: 14, value: attrID)
         MFTRecord.writeU32LE(into: &d, at: 16, value: UInt32(body.count))
         MFTRecord.writeU16LE(into: &d, at: 20, value: valueOffset)
-        d[22] = 0; d[23] = 0
+        // Resident "indexed" flag (0x16): $FILE_NAME (0x30) is indexed in $I30,
+        // so Windows/ntfs-3g set it to 1; chkdsk rejects $FILE_NAME without it.
+        d[22] = (type == 0x30) ? 1 : 0; d[23] = 0
         if nameByteCount > 0 {
             for (i, cu) in nameUTF16.enumerated() {
                 d[Int(nameOffset) + 2 * i]     = UInt8(cu & 0xFF)

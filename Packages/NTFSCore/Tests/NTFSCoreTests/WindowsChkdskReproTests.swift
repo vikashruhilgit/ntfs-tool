@@ -108,6 +108,10 @@ final class WindowsChkdskReproTests: XCTestCase {
                     if vlen != 66 + fnNameChars*2 { p.append("$FILE_NAME @\(o): vlen \(vlen) != 66+nameChars*2 (\(66+fnNameChars*2))") }
                     if ns > 3 { p.append("$FILE_NAME @\(o): namespace \(ns) > 3") }
                     if voff != 24 { p.append("$FILE_NAME @\(o): value offset \(voff) != 24") }
+                    // $FILE_NAME is indexed in $I30: resident "indexed" flag
+                    // (0x16) MUST be 1, or chkdsk deletes the attribute as
+                    // corrupt. Verified against ntfs-3g reference records.
+                    if indexedByte != 1 { p.append("$FILE_NAME @\(o): resident indexed flag (0x16) = \(indexedByte), must be 1 — chkdsk deletes $FILE_NAME without it") }
                 }
             } else {
                 extra = " NONRES sVCN=\(u32(b,o+16)) eVCN=\(u32(b,o+24)) runOff=\(u16(b,o+32))"
@@ -358,5 +362,98 @@ final class WindowsChkdskReproTests: XCTestCase {
 
         XCTAssertTrue(allProblems.isEmpty,
                       "Structural defects found that chkdsk would likely reject:\n" + allProblems.joined(separator: "\n"))
+    }
+
+    // MARK: - ntfs-3g reference comparison
+
+    /// Decode + print every attribute of a record in full, with special focus
+    /// on $STANDARD_INFORMATION.file_attributes and EACH $FILE_NAME (there may
+    /// be more than one: a WIN32 + a DOS companion). This is how we find the
+    /// field(s) chkdsk validates that our validator/ntfs-3g/our-reader all miss.
+    private func deepDump(_ b: Data, label: String) -> String {
+        func hex(_ start: Int, _ count: Int) -> String {
+            (0..<count).map { String(format: "%02x", b[b.startIndex + start + $0]) }.joined(separator: " ")
+        }
+        var d = "== \(label) ==\n"
+        d += "  hdr: flags=0x\(String(u16(b,22),radix:16)) hardLinks=\(u16(b,18)) used=\(u32(b,24)) nextAttrID=\(u16(b,40))\n"
+        var o = u16(b, 20)
+        var fnCount = 0
+        var guardC = 0
+        while o + 4 <= b.count {
+            guardC += 1; if guardC > 64 { break }
+            let t = u32(b, o)
+            if t == 0xFFFFFFFF { d += "  @\(o) END\n"; break }
+            let len = u32(b, o + 4); if len == 0 { break }
+            let nonres = b[b.startIndex + o + 8]
+            let attrFlags = u16(b, o + 12)
+            let id = u16(b, o + 14)
+            if nonres == 0 {
+                let vlen = u32(b, o + 16), voff = u16(b, o + 20)
+                let residentFlags = b[b.startIndex + o + 22]
+                d += "  @\(o) type=0x\(String(t,radix:16)) len=\(len) id=\(id) attrFlags=0x\(String(attrFlags,radix:16)) RES vlen=\(vlen) voff=\(voff) residentFlags(0x16)=\(residentFlags)\n"
+                let bd = o + voff
+                if t == 0x10 {
+                    d += "      STD_INFO file_attributes=0x\(String(u32(b, bd+32),radix:16))"
+                    d += vlen >= 72 ? " secID=\(u32(b, bd+52)) (v3 72B)\n" : " (v1.2 48B)\n"
+                }
+                if t == 0x30 {
+                    fnCount += 1
+                    let nameChars = Int(b[b.startIndex + bd + 64]); let ns = Int(b[b.startIndex + bd + 65])
+                    let nm = (0..<nameChars).map { i -> Character in
+                        Character(UnicodeScalar(u16(b, bd+66+i*2))!) }
+                    let nsName = ["POSIX","WIN32","DOS","WIN32&DOS"][min(ns,3)]
+                    d += "      FILE_NAME name='\(String(nm))' ns=\(ns)(\(nsName)) file_attributes=0x\(String(u32(b, bd+56),radix:16)) alloc=\(u32(b,bd+40)) real=\(u32(b,bd+48)) reparse=0x\(String(u32(b,bd+60),radix:16))\n"
+                    d += "      FILE_NAME full body hex: \(hex(bd, vlen))\n"
+                }
+            } else {
+                d += "  @\(o) type=0x\(String(t,radix:16)) len=\(len) id=\(id) NONRES\n"
+            }
+            o += len
+        }
+        d += "  => \(fnCount) $FILE_NAME attribute(s) in this record\n"
+        return d
+    }
+
+    func testNtfs3gReferenceFileNames() async throws {
+        // small.img is authored by REAL ntfs-3g (scripts/make_test_images.sh:
+        // mkntfs + ntfs-3g mount creating hello.txt, medium.txt, sub/, nested.txt).
+        // Those are chkdsk-clean reference $FILE_NAME records.
+        let here = URL(fileURLWithPath: #filePath)
+        let imgPath = here.deletingLastPathComponent()
+            .appendingPathComponent("Fixtures").appendingPathComponent("small.img").path
+        guard FileManager.default.fileExists(atPath: imgPath) else {
+            throw XCTSkip("small.img fixture missing; run scripts/make_test_images.sh")
+        }
+        let dev = try FileHandleBlockDevice(openingFileAt: imgPath)
+        let vol = try await Volume(device: dev)
+        let mft = await vol.mft()
+
+        var out = "\n\n########## ntfs-3g REFERENCE RECORDS (chkdsk-clean) ##########\n"
+        let root = try await vol.enumerate(directory: 5)
+        out += "root entries: \(root.map { "\($0.name)[rec \($0.recordNumber),ns \($0.fileName.namespace)]" }.joined(separator: ", "))\n\n"
+        for entry in root where entry.recordNumber >= 16 {
+            let rec = try await mft.record(at: entry.recordNumber)
+            out += deepDump(rec.bytes, label: "ntfs-3g rec \(entry.recordNumber): \(entry.name)")
+            // descend one level into directories
+            if rec.isDirectory {
+                if let kids = try? await vol.enumerate(directory: entry.recordNumber) {
+                    for k in kids where k.recordNumber >= 16 {
+                        let kr = try await mft.record(at: k.recordNumber)
+                        out += deepDump(kr.bytes, label: "ntfs-3g rec \(k.recordNumber): \(entry.name)/\(k.name)")
+                    }
+                }
+            }
+        }
+
+        // For contrast: what OUR builder produces for the same names (v3 path).
+        out += "\n---------- OUR BUILDER (v3) for the same names ----------\n"
+        for (name, isDir) in [("hello.txt", false), ("sub", true), ("nested.txt", false)] {
+            let builder = MFTRecordBuilder(
+                recordSize: 1024, sectorSize: 512, recordNumber: 40, sequenceNumber: 1,
+                isDirectory: isDir, fileName: name, parentReference: (UInt64(1) << 48) | 5,
+                securityID: 256, securityDescriptor: nil, dataRealSize: 0, dataAllocatedSize: 0)
+            out += deepDump(try builder.build(), label: "OURS: \(name)")
+        }
+        print(out)
     }
 }

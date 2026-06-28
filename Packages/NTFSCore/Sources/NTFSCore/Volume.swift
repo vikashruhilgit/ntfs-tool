@@ -4602,6 +4602,11 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &data, at: 16, value: UInt32(bodyLen))
         let valueOffset: UInt16 = UInt16(24 + nameByteCount)
         MFTRecord.writeU16LE(into: &data, at: 20, value: valueOffset)
+        // Resident "indexed" flag (0x16): $FILE_NAME (0x30) is indexed in the
+        // parent's $I30, so Windows/ntfs-3g set it to 1; chkdsk rejects a
+        // $FILE_NAME attribute record without it. Covers the rename path, which
+        // re-serializes $FILE_NAME via this helper.
+        data[data.startIndex + 22] = (type == AttributeType.fileName.rawValue) ? 1 : 0
         for (i, codeUnit) in attributeName.utf16.enumerated() {
             data[data.startIndex + 24 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[data.startIndex + 24 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
