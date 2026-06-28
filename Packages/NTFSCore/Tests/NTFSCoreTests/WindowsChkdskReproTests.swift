@@ -158,6 +158,144 @@ final class WindowsChkdskReproTests: XCTestCase {
                       "v3 builder structural defects chkdsk would reject:\n" + problems.joined(separator: "\n"))
     }
 
+    /// Rewrite a record's $STD_INFO into the 72-byte v3 form carrying
+    /// `securityID`, so `createFile` in that directory takes the v3 path
+    /// (no inline 0x50) — matching a real Windows-formatted volume. This is the
+    /// path the real-drive catastrophe uses and that the other tests never
+    /// exercised end-to-end.
+    private func patchToV3(_ vol: Volume, record rn: UInt64, securityID: UInt32) async throws {
+        let mft = await vol.mft()
+        let rec = try await mft.record(at: rn)
+        var b = rec.bytes
+        let recordSize = b.count
+        let firstAttr = u16(b, 20)
+        // STD_INFO is the first attribute.
+        let stdOff = firstAttr
+        precondition(u32(b, stdOff) == 0x10, "first attr must be $STD_INFO")
+        let stdLen = u32(b, stdOff + 4)
+        let stdValOff = u16(b, stdOff + 20)
+        let stdValLen = u32(b, stdOff + 16)
+        if stdValLen >= 72 {
+            // already v3: just stamp securityID at body+52
+            MFTRecord.writeU32LE(into: &b, at: stdOff + stdValOff + 52, value: securityID)
+            try await mft.writeRawRecord(at: rn, postFixupBytes: b)
+            return
+        }
+        // Build a fresh record with STD_INFO expanded to a 72-byte v3 body.
+        let newStdLen = ((24 + 72) + 7) & ~7   // 96
+        let delta = newStdLen - stdLen
+        let oldUsed = u32(b, 24)
+        var out = Data(count: recordSize)
+        // header + USA + everything up to STD_INFO
+        for i in 0..<stdOff { out[out.startIndex + i] = b[b.startIndex + i] }
+        // STD_INFO common+resident header (24 bytes) copied, then patched
+        for i in 0..<24 { out[out.startIndex + stdOff + i] = b[b.startIndex + stdOff + i] }
+        MFTRecord.writeU32LE(into: &out, at: stdOff + 4,  value: UInt32(newStdLen))   // attr length
+        MFTRecord.writeU32LE(into: &out, at: stdOff + 16, value: 72)                  // value length
+        // body: copy old (48) bytes, zero-extend to 72, stamp securityID @ body+52
+        for i in 0..<stdValLen { out[out.startIndex + stdOff + 24 + i] = b[b.startIndex + stdOff + stdValOff + i] }
+        MFTRecord.writeU32LE(into: &out, at: stdOff + 24 + 52, value: securityID)
+        // shift the rest (other attrs + end marker) by delta
+        let restStart = stdOff + stdLen
+        for i in 0..<(oldUsed - restStart) {
+            out[out.startIndex + restStart + delta + i] = b[b.startIndex + restStart + i]
+        }
+        // recompute used_size from the (now shifted) end marker
+        var o = firstAttr
+        while o + 4 <= recordSize {
+            if u32(out, o) == 0xFFFFFFFF { break }
+            let l = u32(out, o + 4); if l == 0 { break }; o += l
+        }
+        MFTRecord.writeU32LE(into: &out, at: 24, value: MFTRecord.align8UsedSize(o + 4))
+        try await mft.writeRawRecord(at: rn, postFixupBytes: out)
+    }
+
+    func testV3CpPathReproduction() async throws {
+        let path = try makeBlankImage()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        do {
+            let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+            let size = try await dev.size()
+            try await Volume.formatNTFS(device: dev, deviceSizeBytes: size, label: "REPROV3", volumeSerial: 0xBEEF)
+        }
+        let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let vol = try await Volume(device: dev)
+        let root: UInt64 = 5
+        // Force the v3 path: give root a security_id so children inherit it
+        // (no inline 0x50, 72-byte $STD_INFO — exactly like a Windows volume).
+        try await patchToV3(vol, record: root, securityID: 256)
+
+        func cpFile(_ name: String, into parent: UInt64, _ payload: Data) async throws -> UInt64 {
+            let rn = try await vol.createFile(named: name, inDirectory: parent,
+                                              isDirectory: false, dataSize: UInt64(payload.count))
+            var pending: Data? = payload
+            try await vol.writeFile(at: rn, totalSize: UInt64(payload.count)) { defer { pending = nil }; return pending ?? Data() }
+            return rn
+        }
+        let f1 = try await cpFile("doc_resident.txt", into: root, Data("hello resident\n".utf8))
+        let f2 = try await cpFile("big_nonresident.bin", into: root, Data(repeating: 0x41, count: 1_048_576))
+        let d1 = try await vol.createFile(named: "subdir", inDirectory: root, isDirectory: true)
+        let f3 = try await cpFile("nested.txt", into: d1, Data("nested\n".utf8))
+
+        let mft = await vol.mft()
+
+        // Cross-check each child's $FILE_NAME.parentReference against the
+        // parent record's ACTUAL (recordNumber, sequenceNumber). chkdsk
+        // validates this; a wrong parent sequence makes the name look
+        // orphaned/corrupt. My structural validator does NOT check it, and a
+        // fresh file image's trivial sequences would hide a bug — so check it
+        // explicitly here.
+        func u64(_ b: Data, _ o: Int) -> UInt64 {
+            var v: UInt64 = 0; for i in 0..<8 { v |= UInt64(b[b.startIndex + o + i]) << (8 * i) }; return v
+        }
+        func fnParentRef(_ rn: UInt64) async throws -> (rec: UInt64, seq: UInt16) {
+            let rec = try await mft.record(at: rn)
+            let b = rec.bytes
+            var o = u16(b, 20)
+            while o + 4 <= b.count {
+                let t = u32(b, o); if t == 0xFFFFFFFF { break }
+                let l = u32(b, o + 4); if l == 0 { break }
+                if t == 0x30 {
+                    let voff = u16(b, o + 20)
+                    let pr = u64(b, o + voff + 0)
+                    return (pr & 0x0000_FFFF_FFFF_FFFF, UInt16(pr >> 48))
+                }
+                o += l
+            }
+            throw XCTSkip("no $FILE_NAME")
+        }
+        var refProblems: [String] = []
+        for (childRN, parentRN, label) in [(f1, root, "doc_resident.txt"), (f2, root, "big_nonresident.bin"),
+                                           (d1, root, "subdir"), (f3, d1, "nested.txt")] {
+            let parent = try await mft.record(at: parentRN)
+            let got = try await fnParentRef(childRN)
+            if got.rec != parentRN || got.seq != parent.sequenceNumber {
+                refProblems.append("[\(label)] $FILE_NAME parentRef = (rec \(got.rec), seq \(got.seq)) but parent is (rec \(parentRN), seq \(parent.sequenceNumber))")
+            }
+        }
+        if !refProblems.isEmpty { print("PARENT-REF MISMATCHES:\n" + refProblems.joined(separator: "\n")) }
+
+        let targets: [(UInt64, String)] = [
+            (f1, "doc_resident.txt (v3 resident)"),
+            (f2, "big_nonresident.bin (v3 non-resident)"),
+            (d1, "subdir (v3 directory)"),
+            (f3, "nested.txt (v3 file in subdir)"),
+        ]
+        var allProblems: [String] = []
+        var dump = "\n\n########## v3 CP-PATH REPRODUCTION ##########\n"
+        for (rn, name) in targets {
+            let rec = try await mft.record(at: rn)
+            let (probs, d) = validate(rec.bytes, label: "rec \(rn): \(name)")
+            dump += d
+            if probs.isEmpty { dump += "  ✅ no structural complaints\n\n" }
+            else { dump += "  ❌ PROBLEMS:\n" + probs.map { "     - \($0)\n" }.joined() + "\n"
+                   allProblems.append(contentsOf: probs.map { "[\(name)] \($0)" }) }
+        }
+        print(dump)
+        XCTAssertTrue(allProblems.isEmpty && refProblems.isEmpty,
+                      "v3 cp-path defects:\n" + (allProblems + refProblems).joined(separator: "\n"))
+    }
+
     func testDumpAndValidateCreatedRecords() async throws {
         let path = try makeBlankImage()
         defer { try? FileManager.default.removeItem(atPath: path) }
