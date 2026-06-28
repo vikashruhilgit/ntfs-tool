@@ -4542,7 +4542,7 @@ public actor Volume {
         MFTRecord.writeU64LE(into: &data, at: 32, value: nowFiletime)
         MFTRecord.writeU64LE(into: &data, at: 40, value: allocatedSize)
         MFTRecord.writeU64LE(into: &data, at: 48, value: realSize)
-        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)  // DIR|ARCHIVE / ARCHIVE
+        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0000 : 0x20)  // DIRECTORY (no ARCHIVE) / ARCHIVE — must match the file's own $FILE_NAME
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
         data[64] = UInt8(nameUTF16.count)
         data[65] = 0  // POSIX namespace — matches the file's own $FILE_NAME (see MFTRecordBuilder)

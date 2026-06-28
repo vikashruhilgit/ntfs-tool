@@ -227,6 +227,51 @@ final class WindowsChkdskReproTests: XCTestCase {
             let ns = try await namespaceOf(rn)
             XCTAssertEqual(ns, 0, "\(name): $FILE_NAME namespace \(ns) must be 0 (POSIX) — Win32(1) without a DOS alias is what chkdsk flags")
         }
+
+        // Directory attributes must match Windows-authored dirs byte-for-byte:
+        // $STD_INFO fileAttributes = 0, $FILE_NAME fileAttributes = 0x10000000
+        // (DIRECTORY, no ARCHIVE 0x20). Both the file record and the parent
+        // $I30 entry are checked.
+        let dirRN = try await vol.createFile(named: "adir", inDirectory: root, isDirectory: true)
+        func attrAt(_ rn: UInt64, type: UInt32, field: Int) async throws -> UInt32 {
+            let b = try await mft.record(at: rn).bytes
+            var o = u16(b, 20)
+            while o + 4 <= b.count {
+                let t = UInt32(u32(b, o)); if t == 0xFFFFFFFF { break }
+                let l = u32(b, o + 4); if l == 0 { break }
+                if t == type { return UInt32(u32(b, o + u16(b, o + 20) + field)) }
+                o += l
+            }
+            return 0xDEAD
+        }
+        let dirStd = try await attrAt(dirRN, type: 0x10, field: 32)
+        let dirFN  = try await attrAt(dirRN, type: 0x30, field: 56)
+        XCTAssertEqual(dirStd, 0, "directory $STD_INFO fileAttributes must be 0 (got 0x\(String(dirStd, radix: 16)))")
+        XCTAssertEqual(dirFN, 0x10000000, "directory $FILE_NAME fileAttributes must be 0x10000000 / DIRECTORY-no-ARCHIVE (got 0x\(String(dirFN, radix: 16)))")
+        // And the parent $I30 entry's $FILE_NAME flags must match.
+        let dirIdxFlags = try await { () async throws -> UInt32 in
+            let b = try await mft.record(at: root).bytes
+            var o = u16(b, 20)
+            while o + 4 <= b.count {
+                let t = u32(b, o); if t == 0xFFFFFFFF { break }
+                let l = u32(b, o + 4); if l == 0 { break }
+                if t == 0x90 {
+                    let body = o + u16(b, o + 20)
+                    var e = body + 16 + u32(b, body + 16)
+                    while e + 16 <= b.count {
+                        let fl = u16(b, e + 12); let el = u16(b, e + 8)
+                        if fl & 2 != 0 { break }
+                        let k = e + 16; let nl = Int(b[b.startIndex + k + 64])
+                        var units = [UInt16](); for i in 0..<nl { units.append(UInt16(u16(b, k + 66 + 2*i))) }
+                        if String(decoding: units, as: UTF16.self) == "adir" { return UInt32(u32(b, k + 56)) }
+                        if el == 0 { break }; e += el
+                    }
+                }
+                o += l
+            }
+            return 0xDEAD
+        }()
+        XCTAssertEqual(dirIdxFlags, 0x10000000, "directory $I30 entry $FILE_NAME flags must match the record (got 0x\(String(dirIdxFlags, radix: 16)))")
     }
 
     /// The EXACT bytes the real Windows drive received at creation: the v3
