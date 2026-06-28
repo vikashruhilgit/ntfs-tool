@@ -281,7 +281,15 @@ public struct MFTRecordBuilder {
         MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)   // fileAttributes: DIR|ARCHIVE / ARCHIVE
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)              // EA/reparse union
         data[64] = UInt8(fileNameUTF16.count)
-        data[65] = 1                                                     // namespace = Win32
+        // namespace = POSIX (0). A Win32 (1) name on a volume with 8.3
+        // generation disabled (the common case for data drives, incl. real
+        // WD/Windows-formatted ones) has no required DOS (ns=2) companion, and
+        // Windows' online self-healing REWRITES such a name to POSIX on access
+        // — which is exactly the "minor file name errors"/"index entry is
+        // incorrect" chkdsk reported. Windows-authored files on such volumes,
+        // and ntfs-3g universally, write POSIX. Matching them is byte-for-byte
+        // chkdsk-clean and sidesteps DOS short-name generation entirely.
+        data[65] = 0                                                     // namespace = POSIX
         for (i, codeUnit) in fileNameUTF16.enumerated() {
             data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)

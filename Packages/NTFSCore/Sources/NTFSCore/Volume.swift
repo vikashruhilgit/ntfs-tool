@@ -4545,7 +4545,7 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)  // DIR|ARCHIVE / ARCHIVE
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
         data[64] = UInt8(nameUTF16.count)
-        data[65] = 1  // Win32 namespace
+        data[65] = 0  // POSIX namespace — matches the file's own $FILE_NAME (see MFTRecordBuilder)
         for (i, codeUnit) in nameUTF16.enumerated() {
             data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
@@ -7100,7 +7100,7 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &data, at: 56, value: fn.fileAttributes)
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
         data[64] = UInt8(nameUTF16.count)
-        data[65] = 1   // Win32 namespace
+        data[65] = 0   // POSIX namespace — matches our created-file policy (chkdsk-clean, no DOS alias)
         for (i, codeUnit) in nameUTF16.enumerated() {
             data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)

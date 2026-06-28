@@ -202,6 +202,21 @@ final class WindowsChkdskReproTests: XCTestCase {
             return []
         }
 
+        // Namespace must be POSIX (0). A Win32 (1) name with no DOS alias is
+        // what Windows self-healing rewrites to POSIX, i.e. the "minor file
+        // name errors" chkdsk reported. Created files must match Windows here.
+        func namespaceOf(_ rn: UInt64) async throws -> Int {
+            let b = try await mft.record(at: rn).bytes
+            var o = u16(b, 20)
+            while o + 4 <= b.count {
+                let t = u32(b, o); if t == 0xFFFFFFFF { break }
+                let l = u32(b, o + 4); if l == 0 { break }
+                if t == 0x30 { return Int(b[b.startIndex + o + u16(b, o + 20) + 65]) }
+                o += l
+            }
+            return -1
+        }
+
         for (rn, name) in [(resident, "resident.txt"), (nonresident, "big.bin")] {
             let own = try await ownFN(rn)
             let idx = try await indexFN(name)
@@ -209,6 +224,8 @@ final class WindowsChkdskReproTests: XCTestCase {
             XCTAssertFalse(idx.isEmpty, "\(name): no $I30 entry")
             XCTAssertEqual(own, idx,
                 "\(name): file $FILE_NAME [cre,mod,mftChg,acc,alloc,real]=\(own) != $I30 index entry \(idx) — chkdsk flags 'index entry is incorrect'")
+            let ns = try await namespaceOf(rn)
+            XCTAssertEqual(ns, 0, "\(name): $FILE_NAME namespace \(ns) must be 0 (POSIX) — Win32(1) without a DOS alias is what chkdsk flags")
         }
     }
 
@@ -480,6 +497,22 @@ final class WindowsChkdskReproTests: XCTestCase {
         print(dump)
         XCTAssertTrue(allProblems.isEmpty && refProblems.isEmpty,
                       "v3 cp-path defects:\n" + (allProblems + refProblems).joined(separator: "\n"))
+    }
+
+
+    func testReferenceNamespaces() async throws {
+        let here = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures").appendingPathComponent("small.img").path
+        guard FileManager.default.fileExists(atPath: here) else { throw XCTSkip("no small.img") }
+        let dev = try FileHandleBlockDevice(openingFileAt: here)
+        let vol = try await Volume(device: dev)
+        func dump(_ dir: UInt64, _ label: String) async throws {
+            let entries = try await vol.enumerate(directory: dir)
+            for e in entries {
+                print("REFNS \(label)/\(e.name)  namespace=\(e.fileName.namespace) (\(e.fileName.namespace.rawValue))")
+            }
+        }
+        try await dump(5, "root")
     }
 
     func testDumpAndValidateCreatedRecords() async throws {
