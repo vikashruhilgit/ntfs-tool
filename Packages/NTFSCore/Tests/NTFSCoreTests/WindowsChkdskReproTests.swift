@@ -214,6 +214,103 @@ final class WindowsChkdskReproTests: XCTestCase {
         try await mft.writeRawRecord(at: rn, postFixupBytes: out)
     }
 
+    /// Helper: decode a record's $STD_INFO (v1.2 vs v3 + securityID) and whether
+    /// it carries an inline $SECURITY_DESCRIPTOR (0x50).
+    private func securityShape(_ b: Data) -> (stdValLen: Int, securityID: Int?, hasInline0x50: Bool) {
+        var o = u16(b, 20)
+        var stdValLen = 0
+        var sid: Int? = nil
+        var has50 = false
+        var guardC = 0
+        while o + 4 <= b.count {
+            guardC += 1; if guardC > 64 { break }
+            let t = u32(b, o)
+            if t == 0xFFFFFFFF { break }
+            let len = u32(b, o + 4); if len == 0 { break }
+            let nonres = b[b.startIndex + o + 8]
+            if t == 0x10, nonres == 0 {
+                let vlen = u32(b, o + 16), voff = u16(b, o + 20)
+                stdValLen = vlen
+                if vlen >= 72 { sid = u32(b, o + voff + 52) }
+            }
+            if t == 0x50 { has50 = true }
+            o += len
+        }
+        return (stdValLen, sid, has50)
+    }
+
+    /// REGRESSION: on a v3 volume (root carries a security_id), `createFile`
+    /// MUST emit the v3 record form — a 72-byte $STD_INFO carrying the inherited
+    /// security_id and NO inline $SECURITY_DESCRIPTOR (0x50). The real-drive
+    /// catastrophe wrote v1.2 records (48-byte $STD_INFO + inherited 0x50) here.
+    func testCreateFileInheritsV3SecurityID() async throws {
+        let path = try makeBlankImage()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        do {
+            let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+            let size = try await dev.size()
+            try await Volume.formatNTFS(device: dev, deviceSizeBytes: size, label: "V3SEC", volumeSerial: 0xBEEF)
+        }
+        let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let vol = try await Volume(device: dev)
+        let root: UInt64 = 5
+        try await patchToV3(vol, record: root, securityID: 256)
+
+        let f1 = try await vol.createFile(named: "v3child.txt", inDirectory: root,
+                                          isDirectory: false, dataSize: 12)
+        let mft = await vol.mft()
+        let rec = try await mft.record(at: f1)
+        let shape = securityShape(rec.bytes)
+        print("created v3child.txt: stdValLen=\(shape.stdValLen) securityID=\(String(describing: shape.securityID)) hasInline0x50=\(shape.hasInline0x50)")
+        XCTAssertEqual(shape.stdValLen, 72, "child $STD_INFO must be 72-byte v3 form")
+        XCTAssertEqual(shape.securityID, 256, "child must inherit root's security_id 256")
+        XCTAssertFalse(shape.hasInline0x50, "child must NOT carry an inline 0x50 on a v3 volume")
+    }
+
+    /// REGRESSION (the 4TB-drive bug): a REAL ntfs-3g/Windows root keeps its SD
+    /// as an inline $SECURITY_DESCRIPTOR (0x50) — here NON-resident — alongside a
+    /// v1.2 (48-byte) $STD_INFO with NO security_id. The pre-fix `createFile`
+    /// read neither (it only looked at a resident 0x50 + the v3 $STD_INFO id), so
+    /// it stamped a default inline SD and emitted v1.2 records. The fix reads the
+    /// (non-resident) root 0x50 and resolves it through $Secure:$SDS to recover
+    /// the registered security_id, so children come out v3 (72-byte $STD_INFO +
+    /// that id, NO inline 0x50) — and the id is one chkdsk finds in $Secure.
+    func testCreateFileResolvesRealRootSDToV3SecurityID() async throws {
+        let here = URL(fileURLWithPath: #filePath)
+        let src = here.deletingLastPathComponent()
+            .appendingPathComponent("Fixtures").appendingPathComponent("small.img").path
+        guard FileManager.default.fileExists(atPath: src) else {
+            throw XCTSkip("small.img fixture missing; run scripts/make_test_images.sh")
+        }
+        // Work on a writable copy — createFile mutates the volume.
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("small-rw-\(UUID().uuidString).img").path
+        try FileManager.default.copyItem(atPath: src, toPath: path)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let vol = try await Volume(device: dev)
+        let mft = await vol.mft()
+
+        // Confirm the fixture really is the hard case: v1.2 root, no STD_INFO id.
+        let rootShape = securityShape(try await mft.record(at: 5).bytes)
+        print("REAL ntfs-3g ROOT (rec 5): stdValLen=\(rootShape.stdValLen) securityID=\(String(describing: rootShape.securityID)) hasInline0x50=\(rootShape.hasInline0x50)")
+        XCTAssertEqual(rootShape.stdValLen, 48, "fixture root must be v1.2 (no STD_INFO id) for this to test the real path")
+
+        // The exact path the 4TB cp took: createFile into root.
+        let f1 = try await vol.createFile(named: "frombug.txt", inDirectory: 5,
+                                          isDirectory: false, dataSize: 9)
+        let shape = securityShape(try await mft.record(at: f1).bytes)
+        print("created frombug.txt: stdValLen=\(shape.stdValLen) securityID=\(String(describing: shape.securityID)) hasInline0x50=\(shape.hasInline0x50)")
+        XCTAssertEqual(shape.stdValLen, 72, "child must be v3 (72-byte $STD_INFO)")
+        XCTAssertNotNil(shape.securityID, "child must carry an inherited security_id")
+        XCTAssertNotEqual(shape.securityID, 0, "inherited security_id must be non-zero")
+        XCTAssertFalse(shape.hasInline0x50, "child must NOT carry an inline 0x50 — the id replaces it")
+        // And that id must actually resolve in $Secure:$SDS (what chkdsk checks).
+        let resolved = await vol.securityIDIsRegistered(UInt32(shape.securityID!))
+        XCTAssertTrue(resolved, "inherited security_id \(shape.securityID!) must exist in $Secure:$SDS")
+    }
+
     func testV3CpPathReproduction() async throws {
         let path = try makeBlankImage()
         defer { try? FileManager.default.removeItem(atPath: path) }

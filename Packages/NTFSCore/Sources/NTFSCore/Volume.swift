@@ -1213,38 +1213,202 @@ public actor Volume {
     /// Either may be nil.
     struct InheritedSecurity { var securityID: UInt32?; var inlineSD: Data? }
 
-    /// Extract the inheritable security info from a record's attributes.
-    /// `securityID` is reported only when non-zero (0 means "no id").
-    private func securityInfo(of attrs: [Attribute]) -> InheritedSecurity {
-        var sid: UInt32? = nil
+    /// What a single record can lend a new child for security inheritance, in
+    /// preference order: a registered `security_id` (→ emit v3, no inline 0x50),
+    /// an inline descriptor we could NOT resolve to an id (→ inline 0x50 last
+    /// resort), or nothing.
+    private enum SecuritySource { case id(UInt32); case descriptor(Data); case none }
+
+    /// Read an attribute's full value bytes, whether it is resident or
+    /// non-resident. A real Windows/ntfs-3g volume root keeps its inline
+    /// `$SECURITY_DESCRIPTOR` (0x50) **non-resident** — the resident-only read
+    /// the old `securityInfo` did silently missed it, which is why inheritance
+    /// fell through to the Everyone-Full-Control default on real hardware.
+    func readAttributeValueBytes(_ attr: Attribute) async throws -> Data {
+        switch attr.value {
+        case let .resident(b, _):
+            return b
+        case let .nonResident(_, lastVCN, _, _, _, realSize, _, extents):
+            return try await readNonResidentData(extents: extents, realSize: realSize, lastVCN: lastVCN)
+        }
+    }
+
+    /// Cached `$Secure:$SDS` stream bytes (record 9, named `$DATA` "$SDS").
+    /// `nil` once we've tried and found no `$Secure` (our own minimal fixtures);
+    /// `.some` once read. Stable for the Volume's lifetime.
+    private var _sdsStream: Data??
+    private func sdsStream() async -> Data? {
+        if let cached = _sdsStream { return cached }
+        var stream: Data? = nil
+        if let sds = try? await resolveAttribute(recordNumber: 9, type: .data, name: "$SDS"),
+           let bytes = try? await readAttributeValueBytes(sds), !bytes.isEmpty {
+            stream = bytes
+        }
+        _sdsStream = .some(stream)
+        return stream
+    }
+
+    /// Resolve a self-relative security descriptor to its registered
+    /// `security_id` by scanning `$Secure:$SDS`. Each `$SDS` entry is a 20-byte
+    /// header — hash(4), security_id(4), stream offset(8), length(4) — followed
+    /// by the descriptor bytes; entries are 16-byte aligned and never straddle a
+    /// 256 KiB ($SDS block) boundary (padding fills the gap, which reads back as
+    /// a zero length / zero id). Returns the id of the entry whose descriptor
+    /// bytes equal `sd`, or `nil` if `$Secure` is absent or has no match —
+    /// in which case the caller keeps the inline descriptor as a last resort.
+    func resolveSecurityID(forDescriptor sd: Data) async -> UInt32? {
+        guard !sd.isEmpty, let stream = await sdsStream() else { return nil }
+        let target = Data(sd)
+        let n = stream.count
+        var pos = 0
+        var guardCount = 0
+        while pos + 20 <= n {
+            guardCount += 1
+            if guardCount > 1 << 20 { break }   // runaway backstop
+            guard let secID = try? stream.readU32LE(at: pos + 4),
+                  let lengthRaw = try? stream.readU32LE(at: pos + 16) else { break }
+            let length = Int(lengthRaw)
+            // Zero/short length or id 0 ⇒ inter-block padding: jump to the next
+            // 256 KiB boundary, where the next entry (if any) begins.
+            if length < 20 || secID == 0 {
+                let nextBlock = (pos & ~0x3FFFF) + 0x40000
+                if nextBlock <= pos { break }
+                pos = nextBlock
+                continue
+            }
+            let sdLen = length - 20
+            let bodyStart = pos + 20
+            if sdLen > 0, bodyStart + sdLen <= n {
+                if stream.subdata(in: (stream.startIndex + bodyStart)..<(stream.startIndex + bodyStart + sdLen)) == target {
+                    return secID
+                }
+            }
+            let advanced = (length + 15) & ~15   // 16-byte align next entry
+            if advanced <= 0 { break }
+            pos += advanced
+        }
+        return nil
+    }
+
+    /// Whether `id` is a registered `security_id` in `$Secure:$SDS`. Used to
+    /// assert the ids we inherit/emit are ones chkdsk's security-descriptor
+    /// verification will find. Returns `false` if `$Secure` is absent.
+    func securityIDIsRegistered(_ id: UInt32) async -> Bool {
+        guard id != 0, let stream = await sdsStream() else { return false }
+        let n = stream.count
+        var pos = 0
+        var guardCount = 0
+        while pos + 20 <= n {
+            guardCount += 1
+            if guardCount > 1 << 20 { break }
+            guard let secID = try? stream.readU32LE(at: pos + 4),
+                  let lengthRaw = try? stream.readU32LE(at: pos + 16) else { break }
+            let length = Int(lengthRaw)
+            if length < 20 || secID == 0 {
+                let nextBlock = (pos & ~0x3FFFF) + 0x40000
+                if nextBlock <= pos { break }
+                pos = nextBlock
+                continue
+            }
+            if secID == id { return true }
+            pos += (length + 15) & ~15
+        }
+        return false
+    }
+
+    /// What `record` can lend a new child: a v3 `$STANDARD_INFORMATION`
+    /// `security_id` (already registered in `$Secure`, trusted directly), else
+    /// an inline `$SECURITY_DESCRIPTOR` (0x50) resolved through `$Secure:$SDS`
+    /// to its registered id, else the inline descriptor itself, else nothing.
+    private func securitySource(ofRecord recordNumber: UInt64) async -> SecuritySource {
+        guard let attrs = try? await allAttributesOf(recordNumber: recordNumber) else { return .none }
         if let si = attrs.first(where: { $0.type == .standardInformation }),
            case let .resident(b, _) = si.value,
            let parsed = try? StandardInformation.parse(b),
            let parsedSID = parsed.securityID, parsedSID != 0 {
-            sid = parsedSID
+            return .id(parsedSID)
         }
-        var inline: Data? = nil
-        if let sd = attrs.first(where: { $0.rawType == 0x50 && $0.nameOrEmpty == "" }),
-           case let .resident(b, _) = sd.value, !b.isEmpty {
-            inline = b
+        if let sdAttr = try? await resolveAttribute(recordNumber: recordNumber, type: .securityDescriptor, name: ""),
+           let sd = try? await readAttributeValueBytes(sdAttr), !sd.isEmpty {
+            if let id = await resolveSecurityID(forDescriptor: sd) { return .id(id) }
+            return .descriptor(sd)
         }
-        return InheritedSecurity(securityID: sid, inlineSD: inline)
+        return .none
     }
 
-    /// Cached security info of the volume root (record 5). The root always
-    /// exists, and on a Windows-formatted volume always carries a valid
-    /// `security_id` — making it the deterministic "sane default SD inherited
-    /// from the volume root" the v1 non-goals call for (vs. borrowing an
-    /// arbitrary user file's id). Stable for the lifetime of the Volume.
-    private var _rootSecurity: InheritedSecurity?
-    private func rootSecurity() async -> InheritedSecurity {
-        if let cached = _rootSecurity { return cached }
-        var info = InheritedSecurity(securityID: nil, inlineSD: nil)
-        if let root = try? await mft().record(at: 5), let attrs = try? root.attributes() {
-            info = securityInfo(of: attrs)
+    /// The lowest registered `security_id` in `$Secure:$SDS` — the volume's
+    /// primary/default descriptor (Windows reserves 0x100/0x101/… for the
+    /// built-ins, 0x100 first). Cached. `nil` if `$Secure` is absent.
+    ///
+    /// Used as the "sane default SD inherited from the volume root" (a v1
+    /// non-goal) when we cannot match a parent/root inline descriptor to its own
+    /// id: emitting THIS registered id still yields a v3 record whose id chkdsk
+    /// finds in `$Secure`, instead of stamping an unregistered inline SD.
+    private var _defaultSecurityID: UInt32??
+    private func defaultRegisteredSecurityID() async -> UInt32? {
+        if let cached = _defaultSecurityID { return cached }
+        var result: UInt32? = nil
+        if let stream = await sdsStream() {
+            let n = stream.count
+            var pos = 0
+            var guardCount = 0
+            while pos + 20 <= n {
+                guardCount += 1
+                if guardCount > 1 << 20 { break }
+                guard let secID = try? stream.readU32LE(at: pos + 4),
+                      let lengthRaw = try? stream.readU32LE(at: pos + 16) else { break }
+                let length = Int(lengthRaw)
+                if length < 20 || secID == 0 {
+                    let nextBlock = (pos & ~0x3FFFF) + 0x40000
+                    if nextBlock <= pos { break }
+                    pos = nextBlock
+                    continue
+                }
+                if result == nil || secID < result! { result = secID }
+                pos += (length + 15) & ~15
+            }
         }
-        _rootSecurity = info
-        return info
+        _defaultSecurityID = .some(result)
+        return result
+    }
+
+    /// Resolve the security a new child in `parentRecordNumber` should inherit,
+    /// preferring a registered `security_id` (→ v3 record, no inline 0x50) over
+    /// an inline descriptor. In order:
+    ///   1. parent's, then root's (record 5), v3 `$STD_INFO` `security_id`, or an
+    ///      inline `$SECURITY_DESCRIPTOR` (0x50) we can byte-match to its id in
+    ///      `$Secure:$SDS` — exact inheritance;
+    ///   2. else, if `$Secure` exists, the volume's default registered id — the
+    ///      "sane default SD inherited from the volume root" (v1 non-goal). This
+    ///      is the path real Windows/ntfs-3g roots take: a v1.2 `$STD_INFO` plus
+    ///      an inline 0x50 that isn't itself a registered `$SDS` descriptor;
+    ///   3. else (no `$Secure` at all — our own minimal formatter), a default
+    ///      inline SD, inheriting the parent/root inline descriptor if present.
+    ///
+    /// Returns `(securityID, inlineSD)` with exactly one non-nil (or a default
+    /// inline SD as the true last resort).
+    private func inheritedSecurity(parentRecordNumber: UInt64) async -> InheritedSecurity {
+        var fallbackDescriptor: Data? = nil
+        // Parent first (NT ACL inheritance), then root — unless parent IS root.
+        let sources: [UInt64] = parentRecordNumber == 5 ? [5] : [parentRecordNumber, 5]
+        for source in sources {
+            switch await securitySource(ofRecord: source) {
+            case let .id(sid):
+                return InheritedSecurity(securityID: sid, inlineSD: nil)
+            case let .descriptor(sd):
+                if fallbackDescriptor == nil { fallbackDescriptor = sd }
+            case .none:
+                continue
+            }
+        }
+        // No directly-inheritable id, but if the volume HAS a $Secure we still
+        // emit v3 with its default registered id — chkdsk-clean and Windows-
+        // shaped — rather than an unregistered inline SD.
+        if let defaultID = await defaultRegisteredSecurityID() {
+            return InheritedSecurity(securityID: defaultID, inlineSD: nil)
+        }
+        return InheritedSecurity(securityID: nil,
+                                 inlineSD: fallbackDescriptor ?? Data(MFTRecordBuilder.everyoneFullControlSD))
     }
 
     public func createFile(
@@ -1324,36 +1488,25 @@ public actor Volume {
         // what makes Windows grant access; a file with none is access-denied
         // ("you do not have permission to open this file") on a Windows volume.
         //
-        // We do NOT maintain $Secure ($SDS/$SDH/$SII B-trees) — a v1 non-goal —
-        // so instead we INHERIT a security_id already on the volume:
+        // We do NOT WRITE $Secure ($SDS/$SDH/$SII B-trees) — a v1 non-goal — so
+        // instead we INHERIT a security_id already on the volume, READING $Secure
+        // only to resolve a descriptor back to its registered id (see
+        // `inheritedSecurity`):
         //   1. the parent directory's (correct NT ACL-inheritance behaviour), then
         //   2. the volume root's (record 5) — the "sane default SD inherited from
-        //      the volume root" the v1 non-goals prescribe; deterministic, and on
-        //      a Windows volume the root always carries a valid id.
-        //
-        // On volumes that use no security_ids at all (our own formatter, or an
-        // ntfs-3g v1.x image), there is no id to inherit. There we fall back to
-        // an inline $SECURITY_DESCRIPTOR (0x50, the legacy NTFS 1.2 form):
-        // inherit the parent's, else the root's, else a default Everyone-Full-
-        // Control SD so the file is at least openable. (Such volumes read inline
-        // SDs natively; we emit a security_id, never an inline SD, whenever one
-        // can be inherited, which is the modern-Windows path.)
-        let parentSec = securityInfo(of: (try? parent.attributes()) ?? [])
-        let securityID: UInt32?
-        let inheritedSD: Data?
-        if let sid = parentSec.securityID {
-            securityID = sid
-            inheritedSD = nil
-        } else {
-            let rootSec = await rootSecurity()
-            if let sid = rootSec.securityID {
-                securityID = sid
-                inheritedSD = nil
-            } else {
-                securityID = nil
-                inheritedSD = parentSec.inlineSD ?? rootSec.inlineSD ?? Data(MFTRecordBuilder.everyoneFullControlSD)
-            }
-        }
+        //      the volume root" the v1 non-goals prescribe.
+        // A real Windows/ntfs-3g root often carries its SD as an inline
+        // $SECURITY_DESCRIPTOR (0x50, frequently NON-resident) with a v1.2
+        // $STD_INFO that has no security_id; `inheritedSecurity` reads that
+        // descriptor and looks it up in $Secure:$SDS to recover the id, so we
+        // STILL emit the v3 form (72-byte $STD_INFO + id, no inline 0x50) that
+        // matches what Windows writes — and whose id chkdsk's security-descriptor
+        // verification finds already registered. Only a volume with no
+        // security_id AND no inline SD anywhere (our own minimal formatter) falls
+        // back to emitting a default Everyone-Full-Control inline SD.
+        let inherited = await inheritedSecurity(parentRecordNumber: parentRecordNumber)
+        let securityID: UInt32? = inherited.securityID
+        let inheritedSD: Data? = inherited.securityID == nil ? inherited.inlineSD : nil
         // Size hints stamped into BOTH $FILE_NAME copies (the file's own 0x30
         // and the parent's $I30 entry below) so they agree with the eventual
         // $DATA. They MUST reflect actual cluster usage or real Windows chkdsk
