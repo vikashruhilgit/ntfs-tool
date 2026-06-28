@@ -728,7 +728,7 @@ public enum Mkntfs {
         }
         MFTRecord.writeU32LE(into: &data, at: cursor, value: 0xFFFF_FFFF)
         cursor += 4
-        MFTRecord.writeU32LE(into: &data, at: 24, value: UInt32(cursor))
+        MFTRecord.writeU32LE(into: &data, at: 24, value: MFTRecord.align8UsedSize(cursor))
 
         // Apply USA reverse-fixup so the produced bytes are ON-DISK form.
         return try UpdateSequenceArray.reverseFixup(

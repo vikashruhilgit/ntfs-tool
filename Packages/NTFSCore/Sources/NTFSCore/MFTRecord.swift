@@ -251,10 +251,22 @@ public struct MFTRecord: Equatable, Sendable {
         let endMarkerPos = Int(firstAttrOffset) + attributesBytes.count
         Self.writeU32LE(into: &data, at: endMarkerPos, value: 0xFFFF_FFFF)
 
-        // usedSize = bytes through and including the end marker.
-        Self.writeU32LE(into: &data, at: 24, value: UInt32(endMarkerPos + 4))
+        // usedSize = bytes through and including the end marker, 8-byte aligned
+        // (Windows/mkntfs convention; chkdsk corrects unaligned values).
+        Self.writeU32LE(into: &data, at: 24, value: Self.align8UsedSize(endMarkerPos + 4))
 
         return data
+    }
+
+    /// The MFT record-header `used_size` (bytes_in_use, offset 24) Windows and
+    /// mkntfs write: `align8(endMarkerOffset + 4)`. Real Windows `chkdsk`
+    /// reports an unaligned value as *"First free byte offset corrected in file
+    /// record segment N"*. The 0..3 padding bytes between the end marker and the
+    /// aligned boundary are always zero, so widening `used_size` to cover them
+    /// is safe — attribute iteration still stops at the 0xFFFFFFFF end marker.
+    /// Pass `endMarkerOffset + 4` (i.e. the first byte past the end marker).
+    static func align8UsedSize(_ firstFreeByteOffset: Int) -> UInt32 {
+        UInt32((firstFreeByteOffset + 7) & ~7)
     }
 
     // MARK: — Little-endian writers (mirror of Endian.swift's readers)

@@ -856,7 +856,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "growMFTDataByClusters: rewritten $MFT has no end marker")
         }
         var updated = newRecord
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
         _ = oldAllocated
         // Invalidate both caches so next reads pick up the new extents +
@@ -934,7 +934,7 @@ public actor Volume {
                 throw NTFSError.corruptOnDisk(description: "growMFTBitmap: rewritten $MFT has no end marker")
             }
             var updated = newRec
-            MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+            MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
             try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
             _mftBitmap = nil
         }
@@ -1030,7 +1030,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "bumpMFTDataRealSize: rewritten $MFT has no end marker")
         }
         var updated = newRecordBytes
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
     }
 
@@ -1153,7 +1153,7 @@ public actor Volume {
                 throw NTFSError.corruptOnDisk(description: "persistMFTBitmap: rewritten $MFT has no end marker")
             }
             var updated = newRecordBytes
-            MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+            MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
             try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
         case let .nonResident(_, _, _, _, _, _, _, extents):
             let clusterBytes = UInt64(bytesPerCluster)
@@ -1356,11 +1356,20 @@ public actor Volume {
         }
         // Size hints stamped into BOTH $FILE_NAME copies (the file's own 0x30
         // and the parent's $I30 entry below) so they agree with the eventual
-        // $DATA size. allocatedSize = real rounded up to a whole cluster (what
-        // a non-resident $DATA reports). For a directory or empty file these
-        // stay 0.
+        // $DATA. They MUST reflect actual cluster usage or real Windows chkdsk
+        // flags them:
+        //   - directory or empty file → 0/0
+        //   - RESIDENT $DATA (size <= residentDataThreshold) → 0/0, because
+        //     resident data occupies ZERO clusters (authoritative same-volume
+        //     diff vs a Windows-authored record: Windows stamps 0/0 here).
+        //   - NON-resident → real=dataSize, allocated=real rounded up to a cluster.
+        // `refreshParentI30Size` keeps the parent copy in sync after writes.
         let clusterBytes = UInt64(bytesPerCluster)
-        let childAllocSize = dataSize == 0 ? 0 : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
+        let willBeResident = !isDirectory && dataSize <= UInt64(Self.residentDataThreshold)
+        let fnRealSize: UInt64 = (isDirectory || willBeResident) ? 0 : dataSize
+        let fnAllocSize: UInt64 = (isDirectory || willBeResident)
+            ? 0
+            : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -1371,8 +1380,8 @@ public actor Volume {
             parentReference: parentRef,
             securityID: securityID,
             securityDescriptor: inheritedSD,
-            dataRealSize: isDirectory ? 0 : dataSize,
-            dataAllocatedSize: isDirectory ? 0 : childAllocSize
+            dataRealSize: fnRealSize,
+            dataAllocatedSize: fnAllocSize
         )
         // Compute step: build the record bytes in memory. Builder is pure;
         // any failure here (impossible for current inputs but defensive)
@@ -1433,8 +1442,8 @@ public actor Volume {
                 childFileName: name,
                 isDirectory: isDirectory,
                 nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
-                childRealSize: isDirectory ? 0 : dataSize,
-                childAllocatedSize: isDirectory ? 0 : childAllocSize,
+                childRealSize: fnRealSize,
+                childAllocatedSize: fnAllocSize,
                 i30Committed: &i30Committed
             )
         } catch {
@@ -1653,7 +1662,7 @@ public actor Volume {
                 throw NTFSError.corruptOnDisk(description: "rewritten parent record has no end marker")
             }
             var updatedBytes = newParentBytes
-            MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+            MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
             // v0.5 Bug B: mark the $I30 entry as durable IMMEDIATELY
             // before the on-disk parent rewrite. Any throw from
             // `writeRawRecord` itself or anything later in this branch
@@ -1829,7 +1838,7 @@ public actor Volume {
                 newParent[newParent.startIndex + i] = 0
             }
         }
-        MFTRecord.writeU32LE(into: &newParent, at: 24, value: UInt32(usedAfter))
+        MFTRecord.writeU32LE(into: &newParent, at: 24, value: MFTRecord.align8UsedSize(usedAfter))
         // Bump nextAttributeID by 2 (we consumed two IDs).
         MFTRecord.writeU16LE(into: &newParent, at: 40, value: parent.nextAttributeID &+ 2)
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParent)
@@ -3670,7 +3679,7 @@ public actor Volume {
             newValueBytes: newRootBody
         )
         var usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+        MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
 
         // Does the base record itself still hold $INDEX_ALLOCATION:$I30? If the
         // attribute has migrated, the base instead carries a $ATTRIBUTE_LIST
@@ -3699,7 +3708,7 @@ public actor Volume {
                 replacementBytes: newIndexAllocAttrBytes
             )
             usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-            MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+            MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
 
             // Step C: replace $BITMAP attribute.
             bytes = try rewriteEntireAttribute(
@@ -3712,7 +3721,7 @@ public actor Volume {
                 replacementBytes: newBitmapAttrBytes
             )
             usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-            MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+            MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
             return ParentRewrite(baseBytes: bytes, extensionWrites: [])
         }
 
@@ -3774,7 +3783,7 @@ public actor Volume {
                     replacementBytes: newBitmapAttrBytes
                 )
                 usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-                MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+                MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
             }
         }
 
@@ -3861,7 +3870,7 @@ public actor Volume {
             replacementBytes: replacementBytes
         )
         let newUsed = (locateEndMarker(in: out, fromOffset: firstAttrOffset) ?? 0) + 4
-        MFTRecord.writeU32LE(into: &out, at: 24, value: UInt32(newUsed))
+        MFTRecord.writeU32LE(into: &out, at: 24, value: MFTRecord.align8UsedSize(newUsed))
         return out
     }
 
@@ -4181,7 +4190,7 @@ public actor Volume {
         }
 
         var updatedBytes = newParentBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
 
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: updatedBytes)
     }
@@ -4564,7 +4573,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "setDirty: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: Self.volumeRecordNumber, postFixupBytes: updatedBytes)
     }
 
@@ -4760,7 +4769,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "write: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
 
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
         // Refresh size hints + mtime on both this record's $STANDARD_INFORMATION
@@ -4814,7 +4823,7 @@ public actor Volume {
             return
         }
         var updated = newRecordBytes
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updated)
     }
 
@@ -4832,6 +4841,20 @@ public actor Volume {
               let fn = try? FileName.parse(fnBytes) else {
             return
         }
+        // Mirror the file's ACTUAL cluster usage into the size hints, matching
+        // what `createFile` stamped: resident $DATA occupies zero clusters, so
+        // both fields are 0/0 (Windows convention; chkdsk cross-checks the
+        // parent $I30 copy against the file's own $FILE_NAME). Non-resident
+        // carries real size + cluster-rounded allocated.
+        let dataResident: Bool = {
+            guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else { return true }
+            if case .resident = dataAttr.value { return true }
+            return false
+        }()
+        let effRealSize: UInt64 = dataResident ? 0 : newRealSize
+        let effAllocSize: UInt64 = dataResident
+            ? 0
+            : ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
         let parentRN = fn.parentRecordNumber
         // v0.4 Phase 1: skip during bulk insert into this parent. Size
         // hints in $I30 are cosmetic; the file's actual content is
@@ -4863,9 +4886,8 @@ public actor Volume {
             // Build the new $FILE_NAME body with bumped sizes — same length
             // as the existing one (only size hints change).
             var newBody = reserializeFileNameBody(fn)
-            let allocSize = ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
-            MFTRecord.writeU64LE(into: &newBody, at: 40, value: allocSize)
-            MFTRecord.writeU64LE(into: &newBody, at: 48, value: newRealSize)
+            MFTRecord.writeU64LE(into: &newBody, at: 40, value: effAllocSize)
+            MFTRecord.writeU64LE(into: &newBody, at: 48, value: effRealSize)
             _ = try await IndexAllocationWriter.updateEntry(
                 rootBody: rootBytes,
                 allocationExtents: allocExtents,
@@ -4884,9 +4906,8 @@ public actor Volume {
             guard !entry.isLast, let efn = entry.fileName else { continue }
             if efn.name == fn.name && efn.namespace != .dos {
                 var body = reserializeFileNameBody(efn)
-                let allocSize = ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
-                MFTRecord.writeU64LE(into: &body, at: 40, value: allocSize)
-                MFTRecord.writeU64LE(into: &body, at: 48, value: newRealSize)
+                MFTRecord.writeU64LE(into: &body, at: 40, value: effAllocSize)
+                MFTRecord.writeU64LE(into: &body, at: 48, value: effRealSize)
                 entries.append((entry.fileReference, body, efn.name))
             } else {
                 entries.append((entry.fileReference, reserializeFileNameBody(efn), efn.name))
@@ -4909,7 +4930,7 @@ public actor Volume {
         )
         guard let mark = locateEndMarker(in: newParentBytes, fromOffset: Int(parent.firstAttributeOffset)) else { return }
         var updated = newParentBytes
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: parentRN, postFixupBytes: updated)
     }
 
@@ -5118,7 +5139,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "writeFile: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
         try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
         try? await bumpMTimeOnWrite(recordNumber: recordNumber)
@@ -5409,7 +5430,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "truncate: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
     }
 
@@ -5476,7 +5497,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "truncate: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
     }
 
@@ -6849,7 +6870,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "rename: rewritten record missing end marker")
         }
         var finalBytes = updatedRecordBytes
-        MFTRecord.writeU32LE(into: &finalBytes, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &finalBytes, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
 
         // 1. Insert the new $I30 entry under the target parent. This is the
         //    new reachability edge; it is committed BEFORE we remove the old

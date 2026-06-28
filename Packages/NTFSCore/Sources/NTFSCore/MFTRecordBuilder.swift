@@ -148,7 +148,12 @@ public struct MFTRecordBuilder {
         // 24: usedSize — filled in after we know how much we consumed
         MFTRecord.writeU32LE(into: &data, at: 28, value: UInt32(recordSize))             // allocatedSize
         MFTRecord.writeU64LE(into: &data, at: 32, value: 0)                              // baseFileReference (base record)
-        MFTRecord.writeU16LE(into: &data, at: 40, value: 3)                              // nextAttributeID (after the 3 we write)
+        // nextAttributeID ("first available attribute identifier") is written
+        // below, AFTER the attributes — it must be (highest assigned id + 1).
+        // A hardcoded 3 was correct only for the 3-attribute v3 layout; on the
+        // 4-attribute v1.2 inline-SD layout (ids 0,1,2,3) it left an attribute
+        // whose id == first-available, which real Windows chkdsk deletes as a
+        // "corrupt attribute record".
         MFTRecord.writeU32LE(into: &data, at: 44, value: recordNumber)
 
         // USA[0] sentinel — pick 1 (NTFS uses any non-zero; the reverseFixup
@@ -228,8 +233,13 @@ public struct MFTRecordBuilder {
         MFTRecord.writeU32LE(into: &data, at: cursor, value: 0xFFFF_FFFF)
         cursor += 4
 
-        // Fill in usedSize now that we know it.
-        MFTRecord.writeU32LE(into: &data, at: 24, value: UInt32(cursor))
+        // nextAttributeID = highest assigned id + 1. `bodyAttrID` is the id of
+        // the last attribute written ($DATA/$INDEX_ROOT), so it is the maximum.
+        MFTRecord.writeU16LE(into: &data, at: 40, value: bodyAttrID + 1)
+
+        // Fill in usedSize now that we know it — 8-byte aligned (Windows/mkntfs
+        // convention; chkdsk corrects an unaligned "first free byte offset").
+        MFTRecord.writeU32LE(into: &data, at: 24, value: MFTRecord.align8UsedSize(cursor))
 
         return data
     }
