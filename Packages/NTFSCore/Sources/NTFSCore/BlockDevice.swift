@@ -31,6 +31,13 @@ public protocol BlockDevice: Sendable {
     /// Default impl is a no-op so existing in-memory test backings don't
     /// need to opt in — only real block-device backings need it.
     func synchronize() async throws
+
+    /// Release any advisory (`flock`) lock held on the underlying file WITHOUT
+    /// closing it. Lets a writer deterministically hand the device off to a
+    /// fresh handle (e.g. a caller that re-opens the volume right after
+    /// `formatNTFS`) instead of waiting on non-deterministic actor/ARC deinit
+    /// to drop the lock. Default no-op for backings that take no lock.
+    func releaseAdvisoryLock() async
 }
 
 public extension BlockDevice {
@@ -40,6 +47,10 @@ public extension BlockDevice {
 
     func synchronize() async throws {
         // No-op default for read-only / in-memory backings.
+    }
+
+    func releaseAdvisoryLock() async {
+        // No-op default — only file-backed devices take an flock.
     }
 }
 
@@ -110,6 +121,14 @@ public actor FileHandleBlockDevice: BlockDevice {
 
     deinit {
         try? handle.close()
+    }
+
+    /// Drop the exclusive `flock` taken in `openingFileForUpdateAt` without
+    /// closing the handle. Safe to call when this writer is done mutating the
+    /// device but the object may still be retained briefly (e.g. by a Volume
+    /// actor awaiting deinit).
+    public func releaseAdvisoryLock() {
+        if isWritable { _ = flock(handle.fileDescriptor, LOCK_UN) }
     }
 
     /// Chunk size for raw-device reads. Like writes, a single `read(2)` to a

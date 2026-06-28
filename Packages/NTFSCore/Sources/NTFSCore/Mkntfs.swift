@@ -120,6 +120,8 @@ public enum Mkntfs {
         public let attrDefClusterCount: UInt64
         public let upcaseStartLCN: UInt64
         public let upcaseClusterCount: UInt64
+        public let sdsStartLCN: UInt64                 // $Secure:$SDS data region
+        public let sdsClusterCount: UInt64
         public let bootBackupStartLCN: UInt64          // 1-cluster region for backup BS
         public let bootBackupSectorLBA: UInt64         // device offset = last sector
         public let bitmapStartLCN: UInt64
@@ -253,6 +255,12 @@ public enum Mkntfs {
         let upcaseStart = nextLCN
         let upcaseClusters: UInt64 = (131_072 + clusterBytes - 1) / clusterBytes
         nextLCN += upcaseClusters
+        // $Secure:$SDS — descriptor stream + its 0x40000 mirror (real size
+        // 0x400fc). Placed before $Bitmap so the system-region bitmap mark
+        // (cluster 0 .. bitmapEnd) covers it automatically.
+        let sdsStart = nextLCN
+        let sdsClusters: UInt64 = (Mkntfs.sdsRealSize + clusterBytes - 1) / clusterBytes
+        nextLCN += sdsClusters
         // $Bitmap: 1 bit per cluster → totalClusters / 8 bytes, rounded
         // up to whole clusters.
         let bitmapBytes = (totalClusters + 7) / 8
@@ -308,6 +316,8 @@ public enum Mkntfs {
             attrDefClusterCount: attrDefClusters,
             upcaseStartLCN: upcaseStart,
             upcaseClusterCount: upcaseClusters,
+            sdsStartLCN: sdsStart,
+            sdsClusterCount: sdsClusters,
             bootBackupStartLCN: backupBsCluster,
             bootBackupSectorLBA: backupBsLBA,
             bitmapStartLCN: bitmapStart,
@@ -394,6 +404,11 @@ public enum Mkntfs {
             offset: UInt64(geom.bytesPerCluster) * geom.upcaseStartLCN,
             bytes: UpcaseTable.data
         )
+        // $Secure:$SDS — security descriptor stream (with 0x40000 mirror).
+        try await device.write(
+            offset: UInt64(geom.bytesPerCluster) * geom.sdsStartLCN,
+            bytes: makeSecureSDSStream(allocBytes: Int(geom.sdsClusterCount) * Int(geom.bytesPerCluster))
+        )
         try await device.write(
             offset: UInt64(geom.bytesPerCluster) * geom.logFileStartLCN,
             bytes: logFile
@@ -432,7 +447,8 @@ public enum Mkntfs {
             recordNumber: UInt64,
             fileName: String,
             isDirectory: Bool,
-            extraAttributes: [Data]
+            extraAttributes: [Data],
+            recordFlags: UInt16 = 0
         ) throws -> Data {
             try buildSystemMFTRecord(
                 geom: geom,
@@ -441,7 +457,8 @@ public enum Mkntfs {
                 isDirectory: isDirectory,
                 parentReference: packMFTReference(rn: 5, seq: 1),  // root parent
                 extraAttributes: extraAttributes,
-                now: now
+                now: now,
+                recordFlags: recordFlags
             )
         }
 
@@ -605,16 +622,27 @@ public enum Mkntfs {
             extraAttributes: [badClusUnnamed, badClusBad]
         )
 
-        // Record 9: $Secure — minimal stub. For v0.6, we ship an empty
-        // $SDS (security descriptor stream) and stub $SDH/$SII indexes.
-        // Data volumes mounted by livefiles_ntfs/ntfs-3g tolerate this
-        // (security descriptors fall through to the volume default).
-        let secSDS = serializeResidentAttribute(
-            type: AttributeType.data.rawValue, attrID: 3, attrName: "$SDS", body: Data()
+        // Record 9: $Secure — spec-valid VIEW_INDEX metafile. ntfs-3g/Windows
+        // require this to mount a v3.x volume. $SDS (non-resident, with the
+        // 0x40000 mirror) holds the default descriptors; $SDH/$SII index them.
+        // The record carries the VIEW_INDEX flag (0x08). See MkntfsSecure.swift.
+        let secSDS = serializeNonResidentDataAttribute(
+            attrID: 2, flags: 0, attrName: "$SDS",
+            realSize: Mkntfs.sdsRealSize,
+            allocatedSize: geom.sdsClusterCount * UInt64(geom.bytesPerCluster),
+            extents: [Extent(startLCN: geom.sdsStartLCN, clusterCount: geom.sdsClusterCount)],
+            typeOverride: AttributeType.data.rawValue
+        )
+        let secSDH = serializeResidentAttribute(
+            type: 0x90, attrID: 3, attrName: "$SDH", body: Data(Mkntfs.sdhIndexRootBody)
+        )
+        let secSII = serializeResidentAttribute(
+            type: 0x90, attrID: 4, attrName: "$SII", body: Data(Mkntfs.siiIndexRootBody)
         )
         out[9] = try sysRecord(
             recordNumber: 9, fileName: "$Secure", isDirectory: false,
-            extraAttributes: [secSDS]
+            extraAttributes: [secSDS, secSDH, secSII],
+            recordFlags: 0x0008   // VIEW_INDEX
         )
 
         // Record 10: $UpCase — $DATA points at the upcase clusters.
@@ -663,7 +691,8 @@ public enum Mkntfs {
         isDirectory: Bool,
         parentReference: UInt64,
         extraAttributes: [Data],
-        now: UInt64
+        now: UInt64,
+        recordFlags: UInt16 = 0
     ) throws -> Data {
         let recordSize = Int(geom.mftRecordSize)
         let sectorSize = Int(geom.bytesPerSector)
@@ -691,7 +720,7 @@ public enum Mkntfs {
         MFTRecord.writeU16LE(into: &data, at: 16, value: seq)
         MFTRecord.writeU16LE(into: &data, at: 18, value: 1)
         MFTRecord.writeU16LE(into: &data, at: 20, value: firstAttrOffset)
-        let flags: UInt16 = isDirectory ? 0x0003 : 0x0001
+        let flags: UInt16 = (isDirectory ? 0x0003 : 0x0001) | recordFlags
         MFTRecord.writeU16LE(into: &data, at: 22, value: flags)
         MFTRecord.writeU32LE(into: &data, at: 28, value: UInt32(recordSize))
         MFTRecord.writeU64LE(into: &data, at: 32, value: 0)
@@ -706,7 +735,7 @@ public enum Mkntfs {
         // $STANDARD_INFORMATION (attrID 0)
         let siAttr = serializeResidentAttribute(
             type: 0x10, attrID: 0, attrName: nil,
-            body: standardInformationBody(now: now)
+            body: standardInformationBody(now: now, securityID: Mkntfs.defaultSecurityID)
         )
         try splice(&data, &cursor, siAttr, recordSize: recordSize)
 
@@ -751,14 +780,24 @@ public enum Mkntfs {
 
     // MARK: — Attribute body helpers
 
-    static func standardInformationBody(now: UInt64) -> Data {
-        var d = Data(count: 48)
+    static func standardInformationBody(now: UInt64, securityID: UInt32? = nil) -> Data {
+        // 72-byte NTFS 3.x form when a security_id is supplied (so files created
+        // in a directory can inherit a resolvable descriptor from $Secure — both
+        // ntfs-3g and Windows need this to create/write files), else 48-byte v1.2.
+        let v3 = securityID != nil
+        var d = Data(count: v3 ? 72 : 48)
         MFTRecord.writeU64LE(into: &d, at: 0,  value: now)
         MFTRecord.writeU64LE(into: &d, at: 8,  value: now)
         MFTRecord.writeU64LE(into: &d, at: 16, value: now)
         MFTRecord.writeU64LE(into: &d, at: 24, value: now)
         // 32: fileAttributes — set HIDDEN+SYSTEM (0x06) for system files.
         MFTRecord.writeU32LE(into: &d, at: 32, value: 0x06)
+        if let sid = securityID {
+            MFTRecord.writeU32LE(into: &d, at: 48, value: 0)     // ownerID
+            MFTRecord.writeU32LE(into: &d, at: 52, value: sid)   // security_id → $Secure
+            MFTRecord.writeU64LE(into: &d, at: 56, value: 0)     // quotaCharged
+            MFTRecord.writeU64LE(into: &d, at: 64, value: 0)     // USN
+        }
         return d
     }
 
@@ -1051,6 +1090,18 @@ extension Volume {
                 mftStartLCNOverride: mftStartLCNOverride
             )
         )
+        // The raw volume has an empty root index. Real NTFS lists every system
+        // metafile in root's $I30, and ntfs-3g/Windows resolve $Secure (etc.)
+        // BY NAME through it at mount — so populate it now. Re-open the freshly
+        // written volume and link records 0..11 into root via the standard
+        // (chkdsk-clean) insert path.
+        let vol = try await Volume(device: device)
+        try await vol.linkSystemFilesIntoRoot(nowFiletime: MFTRecordBuilder.windowsFiletimeNow())
+        // The linking Volume's actor may outlive this call by ARC timing and
+        // keep the device's exclusive flock held. Drop it deterministically so
+        // a caller that re-opens the freshly formatted volume doesn't hit
+        // "device is already locked".
+        await device.releaseAdvisoryLock()
     }
 }
 

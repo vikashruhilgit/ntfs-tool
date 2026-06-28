@@ -143,7 +143,12 @@ final class WindowsChkdskReproTests: XCTestCase {
         }
         let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
         let vol = try await Volume(device: dev)
-        let root: UInt64 = 5
+        // Use a fresh subdirectory as the parent: its $I30 starts as a small
+        // (resident) $INDEX_ROOT, so the resident-only index reader below sees
+        // the new entries. (Real root is now pre-populated with the 11 system
+        // metafiles and is therefore a LARGE_INDEX — its entries live in
+        // $INDEX_ALLOCATION, which this test's reader intentionally doesn't walk.)
+        let root = try await vol.createFile(named: "fnidx_parent", inDirectory: 5, isDirectory: true)
 
         func cpFile(_ name: String, _ payload: Data) async throws -> UInt64 {
             let rn = try await vol.createFile(named: name, inDirectory: root,

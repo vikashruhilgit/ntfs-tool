@@ -1655,6 +1655,34 @@ public actor Volume {
     /// set, the caller must NOT free the child's MFT slot — doing so
     /// would create a dangling $I30 entry. See the big block comment in
     /// `createFile` for the post-abort state matrix.
+    /// Populate the root directory's `$I30` index with the system metafiles
+    /// (records 0..11 except root 5; reserved 12..15 are not listed). Real NTFS
+    /// lists every metafile in the root index, and ntfs-3g/Windows resolve
+    /// `$Secure` (and other metafiles) BY NAME through it at mount time — so an
+    /// empty root index makes mounting fail with "Failed to open $Secure".
+    /// Called once by `formatNTFS` right after the raw volume is written. Reuses
+    /// the same (chkdsk-clean) insert path as `createFile`, auto-promoting the
+    /// root index to LARGE_INDEX once the entries no longer fit resident.
+    func linkSystemFilesIntoRoot(nowFiletime: UInt64) async throws {
+        let mft = self.mft()
+        for rn in [UInt64(0), 1, 2, 3, 4, 6, 7, 8, 9, 10, 11] {
+            let rec = try await mft.record(at: rn)
+            guard let fnAttr = try rec.attributes().first(where: { $0.type == .fileName }),
+                  case let .resident(fnBytes, _) = fnAttr.value,
+                  let fn = try? FileName.parse(fnBytes) else { continue }
+            var committed = false
+            try await insertIntoParentI30(
+                parentRecordNumber: 5,
+                childRecordNumber: rn,
+                childSequence: rec.sequenceNumber,
+                childFileName: fn.name,
+                isDirectory: rec.isDirectory,
+                nowFiletime: nowFiletime,
+                i30Committed: &committed
+            )
+        }
+    }
+
     private func insertIntoParentI30(
         parentRecordNumber: UInt64,
         childRecordNumber: UInt64,
