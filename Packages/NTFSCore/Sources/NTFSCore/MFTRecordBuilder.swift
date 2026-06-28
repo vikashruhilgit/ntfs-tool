@@ -255,7 +255,11 @@ public struct MFTRecordBuilder {
         MFTRecord.writeU64LE(into: &data, at: 8,  value: nowFiletime)   // modification
         MFTRecord.writeU64LE(into: &data, at: 16, value: nowFiletime)   // mft change
         MFTRecord.writeU64LE(into: &data, at: 24, value: nowFiletime)   // access
-        MFTRecord.writeU32LE(into: &data, at: 32, value: 0x20)         // fileAttributes = ARCHIVE (matches ntfs-3g; $STD_INFO has no dir bit)
+        // $STD_INFO fileAttributes: files = ARCHIVE (0x20); directories = 0
+        // (no bits). Matches Windows-authored records byte-for-byte (a real
+        // Windows dir's $STD_INFO carries no attributes — the dir-ness lives in
+        // the record header flags + $FILE_NAME's 0x10000000 bit).
+        MFTRecord.writeU32LE(into: &data, at: 32, value: isDirectory ? 0x0 : 0x20)
         MFTRecord.writeU32LE(into: &data, at: 36, value: 0)             // maxVersions
         MFTRecord.writeU32LE(into: &data, at: 40, value: 0)             // version
         MFTRecord.writeU32LE(into: &data, at: 44, value: 0)             // classID
@@ -278,7 +282,7 @@ public struct MFTRecordBuilder {
         MFTRecord.writeU64LE(into: &data, at: 32, value: nowFiletime)
         MFTRecord.writeU64LE(into: &data, at: 40, value: dataAllocatedSize)  // allocatedSize (matches $I30 + $DATA)
         MFTRecord.writeU64LE(into: &data, at: 48, value: dataRealSize)       // realSize (matches $I30 + $DATA)
-        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)   // fileAttributes: DIR|ARCHIVE / ARCHIVE
+        MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0000 : 0x20)   // fileAttributes: DIRECTORY (no ARCHIVE) / ARCHIVE — matches Windows
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)              // EA/reparse union
         data[64] = UInt8(fileNameUTF16.count)
         // namespace = POSIX (0). A Win32 (1) name on a volume with 8.3
