@@ -1523,6 +1523,13 @@ public actor Volume {
         let fnAllocSize: UInt64 = (isDirectory || willBeResident)
             ? 0
             : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
+        // One creation timestamp shared by BOTH the file's own $FILE_NAME
+        // (stamped into the builder below) and the parent's $I30 index entry
+        // (inserted further down). chkdsk requires the two $FILE_NAME copies to
+        // be byte-identical; taking two separate `windowsFiletimeNow()` reads
+        // microseconds apart makes their timestamps disagree, which chkdsk
+        // flags as "index entry … is incorrect" / "minor file name errors".
+        let createdAt = MFTRecordBuilder.windowsFiletimeNow()
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -1531,6 +1538,7 @@ public actor Volume {
             isDirectory: isDirectory,
             fileName: name,
             parentReference: parentRef,
+            nowFiletime: createdAt,
             securityID: securityID,
             securityDescriptor: inheritedSD,
             dataRealSize: fnRealSize,
@@ -1594,7 +1602,7 @@ public actor Volume {
                 childSequence: newSequence,
                 childFileName: name,
                 isDirectory: isDirectory,
-                nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
+                nowFiletime: createdAt,
                 childRealSize: fnRealSize,
                 childAllocatedSize: fnAllocSize,
                 i30Committed: &i30Committed
@@ -4537,7 +4545,7 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &data, at: 56, value: isDirectory ? 0x1000_0020 : 0x20)  // DIR|ARCHIVE / ARCHIVE
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
         data[64] = UInt8(nameUTF16.count)
-        data[65] = 1  // Win32 namespace
+        data[65] = 0  // POSIX namespace — matches the file's own $FILE_NAME (see MFTRecordBuilder)
         for (i, codeUnit) in nameUTF16.enumerated() {
             data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
@@ -7092,7 +7100,7 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &data, at: 56, value: fn.fileAttributes)
         MFTRecord.writeU32LE(into: &data, at: 60, value: 0)
         data[64] = UInt8(nameUTF16.count)
-        data[65] = 1   // Win32 namespace
+        data[65] = 0   // POSIX namespace — matches our created-file policy (chkdsk-clean, no DOS alias)
         for (i, codeUnit) in nameUTF16.enumerated() {
             data[66 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[66 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
