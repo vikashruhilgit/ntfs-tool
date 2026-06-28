@@ -148,7 +148,12 @@ public struct MFTRecordBuilder {
         // 24: usedSize — filled in after we know how much we consumed
         MFTRecord.writeU32LE(into: &data, at: 28, value: UInt32(recordSize))             // allocatedSize
         MFTRecord.writeU64LE(into: &data, at: 32, value: 0)                              // baseFileReference (base record)
-        MFTRecord.writeU16LE(into: &data, at: 40, value: 3)                              // nextAttributeID (after the 3 we write)
+        // nextAttributeID ("first available attribute identifier") is written
+        // below, AFTER the attributes — it must be (highest assigned id + 1).
+        // A hardcoded 3 was correct only for the 3-attribute v3 layout; on the
+        // 4-attribute v1.2 inline-SD layout (ids 0,1,2,3) it left an attribute
+        // whose id == first-available, which real Windows chkdsk deletes as a
+        // "corrupt attribute record".
         MFTRecord.writeU32LE(into: &data, at: 44, value: recordNumber)
 
         // USA[0] sentinel — pick 1 (NTFS uses any non-zero; the reverseFixup
@@ -228,8 +233,13 @@ public struct MFTRecordBuilder {
         MFTRecord.writeU32LE(into: &data, at: cursor, value: 0xFFFF_FFFF)
         cursor += 4
 
-        // Fill in usedSize now that we know it.
-        MFTRecord.writeU32LE(into: &data, at: 24, value: UInt32(cursor))
+        // nextAttributeID = highest assigned id + 1. `bodyAttrID` is the id of
+        // the last attribute written ($DATA/$INDEX_ROOT), so it is the maximum.
+        MFTRecord.writeU16LE(into: &data, at: 40, value: bodyAttrID + 1)
+
+        // Fill in usedSize now that we know it — 8-byte aligned (Windows/mkntfs
+        // convention; chkdsk corrects an unaligned "first free byte offset").
+        MFTRecord.writeU32LE(into: &data, at: 24, value: MFTRecord.align8UsedSize(cursor))
 
         return data
     }
@@ -313,7 +323,15 @@ public struct MFTRecordBuilder {
         // Resident extension.
         MFTRecord.writeU32LE(into: &data, at: offset + 16, value: UInt32(bodyLength))
         MFTRecord.writeU16LE(into: &data, at: offset + 20, value: valueOffset)
-        data[data.startIndex + offset + 22] = 0                          // indexedFlag
+        // Resident "indexed" flag (RESIDENT_ATTR_IS_INDEXED, 0x01): set iff this
+        // attribute's value is duplicated in an index. $FILE_NAME (0x30) is
+        // indexed in the parent directory's $I30, so Windows/ntfs-3g set this to
+        // 1 for $FILE_NAME (and 0 for everything else). Leaving it 0 makes real
+        // Windows chkdsk reject the $FILE_NAME attribute record as corrupt and
+        // delete it ("Deleting corrupt attribute record (0x30)"), orphaning the
+        // file — even though ntfs-3g and our own reader accept it. Verified
+        // against ntfs-3g-authored records (Tests Fixtures/small.img).
+        data[data.startIndex + offset + 22] = (type == 0x30) ? 1 : 0     // indexedFlag
         data[data.startIndex + offset + 23] = 0                          // padding
 
         // Body bytes.

@@ -856,7 +856,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "growMFTDataByClusters: rewritten $MFT has no end marker")
         }
         var updated = newRecord
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
         _ = oldAllocated
         // Invalidate both caches so next reads pick up the new extents +
@@ -934,7 +934,7 @@ public actor Volume {
                 throw NTFSError.corruptOnDisk(description: "growMFTBitmap: rewritten $MFT has no end marker")
             }
             var updated = newRec
-            MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+            MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
             try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
             _mftBitmap = nil
         }
@@ -1030,7 +1030,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "bumpMFTDataRealSize: rewritten $MFT has no end marker")
         }
         var updated = newRecordBytes
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
     }
 
@@ -1153,7 +1153,7 @@ public actor Volume {
                 throw NTFSError.corruptOnDisk(description: "persistMFTBitmap: rewritten $MFT has no end marker")
             }
             var updated = newRecordBytes
-            MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+            MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
             try await mft.writeRawRecord(at: 0, postFixupBytes: updated)
         case let .nonResident(_, _, _, _, _, _, _, extents):
             let clusterBytes = UInt64(bytesPerCluster)
@@ -1213,38 +1213,202 @@ public actor Volume {
     /// Either may be nil.
     struct InheritedSecurity { var securityID: UInt32?; var inlineSD: Data? }
 
-    /// Extract the inheritable security info from a record's attributes.
-    /// `securityID` is reported only when non-zero (0 means "no id").
-    private func securityInfo(of attrs: [Attribute]) -> InheritedSecurity {
-        var sid: UInt32? = nil
+    /// What a single record can lend a new child for security inheritance, in
+    /// preference order: a registered `security_id` (→ emit v3, no inline 0x50),
+    /// an inline descriptor we could NOT resolve to an id (→ inline 0x50 last
+    /// resort), or nothing.
+    private enum SecuritySource { case id(UInt32); case descriptor(Data); case none }
+
+    /// Read an attribute's full value bytes, whether it is resident or
+    /// non-resident. A real Windows/ntfs-3g volume root keeps its inline
+    /// `$SECURITY_DESCRIPTOR` (0x50) **non-resident** — the resident-only read
+    /// the old `securityInfo` did silently missed it, which is why inheritance
+    /// fell through to the Everyone-Full-Control default on real hardware.
+    func readAttributeValueBytes(_ attr: Attribute) async throws -> Data {
+        switch attr.value {
+        case let .resident(b, _):
+            return b
+        case let .nonResident(_, lastVCN, _, _, _, realSize, _, extents):
+            return try await readNonResidentData(extents: extents, realSize: realSize, lastVCN: lastVCN)
+        }
+    }
+
+    /// Cached `$Secure:$SDS` stream bytes (record 9, named `$DATA` "$SDS").
+    /// `nil` once we've tried and found no `$Secure` (our own minimal fixtures);
+    /// `.some` once read. Stable for the Volume's lifetime.
+    private var _sdsStream: Data??
+    private func sdsStream() async -> Data? {
+        if let cached = _sdsStream { return cached }
+        var stream: Data? = nil
+        if let sds = try? await resolveAttribute(recordNumber: 9, type: .data, name: "$SDS"),
+           let bytes = try? await readAttributeValueBytes(sds), !bytes.isEmpty {
+            stream = bytes
+        }
+        _sdsStream = .some(stream)
+        return stream
+    }
+
+    /// Resolve a self-relative security descriptor to its registered
+    /// `security_id` by scanning `$Secure:$SDS`. Each `$SDS` entry is a 20-byte
+    /// header — hash(4), security_id(4), stream offset(8), length(4) — followed
+    /// by the descriptor bytes; entries are 16-byte aligned and never straddle a
+    /// 256 KiB ($SDS block) boundary (padding fills the gap, which reads back as
+    /// a zero length / zero id). Returns the id of the entry whose descriptor
+    /// bytes equal `sd`, or `nil` if `$Secure` is absent or has no match —
+    /// in which case the caller keeps the inline descriptor as a last resort.
+    func resolveSecurityID(forDescriptor sd: Data) async -> UInt32? {
+        guard !sd.isEmpty, let stream = await sdsStream() else { return nil }
+        let target = Data(sd)
+        let n = stream.count
+        var pos = 0
+        var guardCount = 0
+        while pos + 20 <= n {
+            guardCount += 1
+            if guardCount > 1 << 20 { break }   // runaway backstop
+            guard let secID = try? stream.readU32LE(at: pos + 4),
+                  let lengthRaw = try? stream.readU32LE(at: pos + 16) else { break }
+            let length = Int(lengthRaw)
+            // Zero/short length or id 0 ⇒ inter-block padding: jump to the next
+            // 256 KiB boundary, where the next entry (if any) begins.
+            if length < 20 || secID == 0 {
+                let nextBlock = (pos & ~0x3FFFF) + 0x40000
+                if nextBlock <= pos { break }
+                pos = nextBlock
+                continue
+            }
+            let sdLen = length - 20
+            let bodyStart = pos + 20
+            if sdLen > 0, bodyStart + sdLen <= n {
+                if stream.subdata(in: (stream.startIndex + bodyStart)..<(stream.startIndex + bodyStart + sdLen)) == target {
+                    return secID
+                }
+            }
+            let advanced = (length + 15) & ~15   // 16-byte align next entry
+            if advanced <= 0 { break }
+            pos += advanced
+        }
+        return nil
+    }
+
+    /// Whether `id` is a registered `security_id` in `$Secure:$SDS`. Used to
+    /// assert the ids we inherit/emit are ones chkdsk's security-descriptor
+    /// verification will find. Returns `false` if `$Secure` is absent.
+    func securityIDIsRegistered(_ id: UInt32) async -> Bool {
+        guard id != 0, let stream = await sdsStream() else { return false }
+        let n = stream.count
+        var pos = 0
+        var guardCount = 0
+        while pos + 20 <= n {
+            guardCount += 1
+            if guardCount > 1 << 20 { break }
+            guard let secID = try? stream.readU32LE(at: pos + 4),
+                  let lengthRaw = try? stream.readU32LE(at: pos + 16) else { break }
+            let length = Int(lengthRaw)
+            if length < 20 || secID == 0 {
+                let nextBlock = (pos & ~0x3FFFF) + 0x40000
+                if nextBlock <= pos { break }
+                pos = nextBlock
+                continue
+            }
+            if secID == id { return true }
+            pos += (length + 15) & ~15
+        }
+        return false
+    }
+
+    /// What `record` can lend a new child: a v3 `$STANDARD_INFORMATION`
+    /// `security_id` (already registered in `$Secure`, trusted directly), else
+    /// an inline `$SECURITY_DESCRIPTOR` (0x50) resolved through `$Secure:$SDS`
+    /// to its registered id, else the inline descriptor itself, else nothing.
+    private func securitySource(ofRecord recordNumber: UInt64) async -> SecuritySource {
+        guard let attrs = try? await allAttributesOf(recordNumber: recordNumber) else { return .none }
         if let si = attrs.first(where: { $0.type == .standardInformation }),
            case let .resident(b, _) = si.value,
            let parsed = try? StandardInformation.parse(b),
            let parsedSID = parsed.securityID, parsedSID != 0 {
-            sid = parsedSID
+            return .id(parsedSID)
         }
-        var inline: Data? = nil
-        if let sd = attrs.first(where: { $0.rawType == 0x50 && $0.nameOrEmpty == "" }),
-           case let .resident(b, _) = sd.value, !b.isEmpty {
-            inline = b
+        if let sdAttr = try? await resolveAttribute(recordNumber: recordNumber, type: .securityDescriptor, name: ""),
+           let sd = try? await readAttributeValueBytes(sdAttr), !sd.isEmpty {
+            if let id = await resolveSecurityID(forDescriptor: sd) { return .id(id) }
+            return .descriptor(sd)
         }
-        return InheritedSecurity(securityID: sid, inlineSD: inline)
+        return .none
     }
 
-    /// Cached security info of the volume root (record 5). The root always
-    /// exists, and on a Windows-formatted volume always carries a valid
-    /// `security_id` — making it the deterministic "sane default SD inherited
-    /// from the volume root" the v1 non-goals call for (vs. borrowing an
-    /// arbitrary user file's id). Stable for the lifetime of the Volume.
-    private var _rootSecurity: InheritedSecurity?
-    private func rootSecurity() async -> InheritedSecurity {
-        if let cached = _rootSecurity { return cached }
-        var info = InheritedSecurity(securityID: nil, inlineSD: nil)
-        if let root = try? await mft().record(at: 5), let attrs = try? root.attributes() {
-            info = securityInfo(of: attrs)
+    /// The lowest registered `security_id` in `$Secure:$SDS` — the volume's
+    /// primary/default descriptor (Windows reserves 0x100/0x101/… for the
+    /// built-ins, 0x100 first). Cached. `nil` if `$Secure` is absent.
+    ///
+    /// Used as the "sane default SD inherited from the volume root" (a v1
+    /// non-goal) when we cannot match a parent/root inline descriptor to its own
+    /// id: emitting THIS registered id still yields a v3 record whose id chkdsk
+    /// finds in `$Secure`, instead of stamping an unregistered inline SD.
+    private var _defaultSecurityID: UInt32??
+    private func defaultRegisteredSecurityID() async -> UInt32? {
+        if let cached = _defaultSecurityID { return cached }
+        var result: UInt32? = nil
+        if let stream = await sdsStream() {
+            let n = stream.count
+            var pos = 0
+            var guardCount = 0
+            while pos + 20 <= n {
+                guardCount += 1
+                if guardCount > 1 << 20 { break }
+                guard let secID = try? stream.readU32LE(at: pos + 4),
+                      let lengthRaw = try? stream.readU32LE(at: pos + 16) else { break }
+                let length = Int(lengthRaw)
+                if length < 20 || secID == 0 {
+                    let nextBlock = (pos & ~0x3FFFF) + 0x40000
+                    if nextBlock <= pos { break }
+                    pos = nextBlock
+                    continue
+                }
+                if result == nil || secID < result! { result = secID }
+                pos += (length + 15) & ~15
+            }
         }
-        _rootSecurity = info
-        return info
+        _defaultSecurityID = .some(result)
+        return result
+    }
+
+    /// Resolve the security a new child in `parentRecordNumber` should inherit,
+    /// preferring a registered `security_id` (→ v3 record, no inline 0x50) over
+    /// an inline descriptor. In order:
+    ///   1. parent's, then root's (record 5), v3 `$STD_INFO` `security_id`, or an
+    ///      inline `$SECURITY_DESCRIPTOR` (0x50) we can byte-match to its id in
+    ///      `$Secure:$SDS` — exact inheritance;
+    ///   2. else, if `$Secure` exists, the volume's default registered id — the
+    ///      "sane default SD inherited from the volume root" (v1 non-goal). This
+    ///      is the path real Windows/ntfs-3g roots take: a v1.2 `$STD_INFO` plus
+    ///      an inline 0x50 that isn't itself a registered `$SDS` descriptor;
+    ///   3. else (no `$Secure` at all — our own minimal formatter), a default
+    ///      inline SD, inheriting the parent/root inline descriptor if present.
+    ///
+    /// Returns `(securityID, inlineSD)` with exactly one non-nil (or a default
+    /// inline SD as the true last resort).
+    private func inheritedSecurity(parentRecordNumber: UInt64) async -> InheritedSecurity {
+        var fallbackDescriptor: Data? = nil
+        // Parent first (NT ACL inheritance), then root — unless parent IS root.
+        let sources: [UInt64] = parentRecordNumber == 5 ? [5] : [parentRecordNumber, 5]
+        for source in sources {
+            switch await securitySource(ofRecord: source) {
+            case let .id(sid):
+                return InheritedSecurity(securityID: sid, inlineSD: nil)
+            case let .descriptor(sd):
+                if fallbackDescriptor == nil { fallbackDescriptor = sd }
+            case .none:
+                continue
+            }
+        }
+        // No directly-inheritable id, but if the volume HAS a $Secure we still
+        // emit v3 with its default registered id — chkdsk-clean and Windows-
+        // shaped — rather than an unregistered inline SD.
+        if let defaultID = await defaultRegisteredSecurityID() {
+            return InheritedSecurity(securityID: defaultID, inlineSD: nil)
+        }
+        return InheritedSecurity(securityID: nil,
+                                 inlineSD: fallbackDescriptor ?? Data(MFTRecordBuilder.everyoneFullControlSD))
     }
 
     public func createFile(
@@ -1324,43 +1488,41 @@ public actor Volume {
         // what makes Windows grant access; a file with none is access-denied
         // ("you do not have permission to open this file") on a Windows volume.
         //
-        // We do NOT maintain $Secure ($SDS/$SDH/$SII B-trees) — a v1 non-goal —
-        // so instead we INHERIT a security_id already on the volume:
+        // We do NOT WRITE $Secure ($SDS/$SDH/$SII B-trees) — a v1 non-goal — so
+        // instead we INHERIT a security_id already on the volume, READING $Secure
+        // only to resolve a descriptor back to its registered id (see
+        // `inheritedSecurity`):
         //   1. the parent directory's (correct NT ACL-inheritance behaviour), then
         //   2. the volume root's (record 5) — the "sane default SD inherited from
-        //      the volume root" the v1 non-goals prescribe; deterministic, and on
-        //      a Windows volume the root always carries a valid id.
-        //
-        // On volumes that use no security_ids at all (our own formatter, or an
-        // ntfs-3g v1.x image), there is no id to inherit. There we fall back to
-        // an inline $SECURITY_DESCRIPTOR (0x50, the legacy NTFS 1.2 form):
-        // inherit the parent's, else the root's, else a default Everyone-Full-
-        // Control SD so the file is at least openable. (Such volumes read inline
-        // SDs natively; we emit a security_id, never an inline SD, whenever one
-        // can be inherited, which is the modern-Windows path.)
-        let parentSec = securityInfo(of: (try? parent.attributes()) ?? [])
-        let securityID: UInt32?
-        let inheritedSD: Data?
-        if let sid = parentSec.securityID {
-            securityID = sid
-            inheritedSD = nil
-        } else {
-            let rootSec = await rootSecurity()
-            if let sid = rootSec.securityID {
-                securityID = sid
-                inheritedSD = nil
-            } else {
-                securityID = nil
-                inheritedSD = parentSec.inlineSD ?? rootSec.inlineSD ?? Data(MFTRecordBuilder.everyoneFullControlSD)
-            }
-        }
+        //      the volume root" the v1 non-goals prescribe.
+        // A real Windows/ntfs-3g root often carries its SD as an inline
+        // $SECURITY_DESCRIPTOR (0x50, frequently NON-resident) with a v1.2
+        // $STD_INFO that has no security_id; `inheritedSecurity` reads that
+        // descriptor and looks it up in $Secure:$SDS to recover the id, so we
+        // STILL emit the v3 form (72-byte $STD_INFO + id, no inline 0x50) that
+        // matches what Windows writes — and whose id chkdsk's security-descriptor
+        // verification finds already registered. Only a volume with no
+        // security_id AND no inline SD anywhere (our own minimal formatter) falls
+        // back to emitting a default Everyone-Full-Control inline SD.
+        let inherited = await inheritedSecurity(parentRecordNumber: parentRecordNumber)
+        let securityID: UInt32? = inherited.securityID
+        let inheritedSD: Data? = inherited.securityID == nil ? inherited.inlineSD : nil
         // Size hints stamped into BOTH $FILE_NAME copies (the file's own 0x30
         // and the parent's $I30 entry below) so they agree with the eventual
-        // $DATA size. allocatedSize = real rounded up to a whole cluster (what
-        // a non-resident $DATA reports). For a directory or empty file these
-        // stay 0.
+        // $DATA. They MUST reflect actual cluster usage or real Windows chkdsk
+        // flags them:
+        //   - directory or empty file → 0/0
+        //   - RESIDENT $DATA (size <= residentDataThreshold) → 0/0, because
+        //     resident data occupies ZERO clusters (authoritative same-volume
+        //     diff vs a Windows-authored record: Windows stamps 0/0 here).
+        //   - NON-resident → real=dataSize, allocated=real rounded up to a cluster.
+        // `refreshParentI30Size` keeps the parent copy in sync after writes.
         let clusterBytes = UInt64(bytesPerCluster)
-        let childAllocSize = dataSize == 0 ? 0 : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
+        let willBeResident = !isDirectory && dataSize <= UInt64(Self.residentDataThreshold)
+        let fnRealSize: UInt64 = (isDirectory || willBeResident) ? 0 : dataSize
+        let fnAllocSize: UInt64 = (isDirectory || willBeResident)
+            ? 0
+            : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -1371,8 +1533,8 @@ public actor Volume {
             parentReference: parentRef,
             securityID: securityID,
             securityDescriptor: inheritedSD,
-            dataRealSize: isDirectory ? 0 : dataSize,
-            dataAllocatedSize: isDirectory ? 0 : childAllocSize
+            dataRealSize: fnRealSize,
+            dataAllocatedSize: fnAllocSize
         )
         // Compute step: build the record bytes in memory. Builder is pure;
         // any failure here (impossible for current inputs but defensive)
@@ -1433,8 +1595,8 @@ public actor Volume {
                 childFileName: name,
                 isDirectory: isDirectory,
                 nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
-                childRealSize: isDirectory ? 0 : dataSize,
-                childAllocatedSize: isDirectory ? 0 : childAllocSize,
+                childRealSize: fnRealSize,
+                childAllocatedSize: fnAllocSize,
                 i30Committed: &i30Committed
             )
         } catch {
@@ -1653,7 +1815,7 @@ public actor Volume {
                 throw NTFSError.corruptOnDisk(description: "rewritten parent record has no end marker")
             }
             var updatedBytes = newParentBytes
-            MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+            MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
             // v0.5 Bug B: mark the $I30 entry as durable IMMEDIATELY
             // before the on-disk parent rewrite. Any throw from
             // `writeRawRecord` itself or anything later in this branch
@@ -1829,7 +1991,7 @@ public actor Volume {
                 newParent[newParent.startIndex + i] = 0
             }
         }
-        MFTRecord.writeU32LE(into: &newParent, at: 24, value: UInt32(usedAfter))
+        MFTRecord.writeU32LE(into: &newParent, at: 24, value: MFTRecord.align8UsedSize(usedAfter))
         // Bump nextAttributeID by 2 (we consumed two IDs).
         MFTRecord.writeU16LE(into: &newParent, at: 40, value: parent.nextAttributeID &+ 2)
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: newParent)
@@ -3670,7 +3832,7 @@ public actor Volume {
             newValueBytes: newRootBody
         )
         var usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-        MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+        MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
 
         // Does the base record itself still hold $INDEX_ALLOCATION:$I30? If the
         // attribute has migrated, the base instead carries a $ATTRIBUTE_LIST
@@ -3699,7 +3861,7 @@ public actor Volume {
                 replacementBytes: newIndexAllocAttrBytes
             )
             usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-            MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+            MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
 
             // Step C: replace $BITMAP attribute.
             bytes = try rewriteEntireAttribute(
@@ -3712,7 +3874,7 @@ public actor Volume {
                 replacementBytes: newBitmapAttrBytes
             )
             usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-            MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+            MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
             return ParentRewrite(baseBytes: bytes, extensionWrites: [])
         }
 
@@ -3774,7 +3936,7 @@ public actor Volume {
                     replacementBytes: newBitmapAttrBytes
                 )
                 usedSize = (locateEndMarker(in: bytes, fromOffset: Int(parent.firstAttributeOffset)) ?? 0) + 4
-                MFTRecord.writeU32LE(into: &bytes, at: 24, value: UInt32(usedSize))
+                MFTRecord.writeU32LE(into: &bytes, at: 24, value: MFTRecord.align8UsedSize(usedSize))
             }
         }
 
@@ -3861,7 +4023,7 @@ public actor Volume {
             replacementBytes: replacementBytes
         )
         let newUsed = (locateEndMarker(in: out, fromOffset: firstAttrOffset) ?? 0) + 4
-        MFTRecord.writeU32LE(into: &out, at: 24, value: UInt32(newUsed))
+        MFTRecord.writeU32LE(into: &out, at: 24, value: MFTRecord.align8UsedSize(newUsed))
         return out
     }
 
@@ -4181,7 +4343,7 @@ public actor Volume {
         }
 
         var updatedBytes = newParentBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
 
         try await mft.writeRawRecord(at: parentRecordNumber, postFixupBytes: updatedBytes)
     }
@@ -4564,7 +4726,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "setDirty: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: Self.volumeRecordNumber, postFixupBytes: updatedBytes)
     }
 
@@ -4593,6 +4755,11 @@ public actor Volume {
         MFTRecord.writeU32LE(into: &data, at: 16, value: UInt32(bodyLen))
         let valueOffset: UInt16 = UInt16(24 + nameByteCount)
         MFTRecord.writeU16LE(into: &data, at: 20, value: valueOffset)
+        // Resident "indexed" flag (0x16): $FILE_NAME (0x30) is indexed in the
+        // parent's $I30, so Windows/ntfs-3g set it to 1; chkdsk rejects a
+        // $FILE_NAME attribute record without it. Covers the rename path, which
+        // re-serializes $FILE_NAME via this helper.
+        data[data.startIndex + 22] = (type == AttributeType.fileName.rawValue) ? 1 : 0
         for (i, codeUnit) in attributeName.utf16.enumerated() {
             data[data.startIndex + 24 + 2 * i]     = UInt8(codeUnit & 0xFF)
             data[data.startIndex + 24 + 2 * i + 1] = UInt8((codeUnit >> 8) & 0xFF)
@@ -4760,7 +4927,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "write: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
 
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
         // Refresh size hints + mtime on both this record's $STANDARD_INFORMATION
@@ -4814,7 +4981,7 @@ public actor Volume {
             return
         }
         var updated = newRecordBytes
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updated)
     }
 
@@ -4832,6 +4999,20 @@ public actor Volume {
               let fn = try? FileName.parse(fnBytes) else {
             return
         }
+        // Mirror the file's ACTUAL cluster usage into the size hints, matching
+        // what `createFile` stamped: resident $DATA occupies zero clusters, so
+        // both fields are 0/0 (Windows convention; chkdsk cross-checks the
+        // parent $I30 copy against the file's own $FILE_NAME). Non-resident
+        // carries real size + cluster-rounded allocated.
+        let dataResident: Bool = {
+            guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else { return true }
+            if case .resident = dataAttr.value { return true }
+            return false
+        }()
+        let effRealSize: UInt64 = dataResident ? 0 : newRealSize
+        let effAllocSize: UInt64 = dataResident
+            ? 0
+            : ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
         let parentRN = fn.parentRecordNumber
         // v0.4 Phase 1: skip during bulk insert into this parent. Size
         // hints in $I30 are cosmetic; the file's actual content is
@@ -4863,9 +5044,8 @@ public actor Volume {
             // Build the new $FILE_NAME body with bumped sizes — same length
             // as the existing one (only size hints change).
             var newBody = reserializeFileNameBody(fn)
-            let allocSize = ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
-            MFTRecord.writeU64LE(into: &newBody, at: 40, value: allocSize)
-            MFTRecord.writeU64LE(into: &newBody, at: 48, value: newRealSize)
+            MFTRecord.writeU64LE(into: &newBody, at: 40, value: effAllocSize)
+            MFTRecord.writeU64LE(into: &newBody, at: 48, value: effRealSize)
             _ = try await IndexAllocationWriter.updateEntry(
                 rootBody: rootBytes,
                 allocationExtents: allocExtents,
@@ -4884,9 +5064,8 @@ public actor Volume {
             guard !entry.isLast, let efn = entry.fileName else { continue }
             if efn.name == fn.name && efn.namespace != .dos {
                 var body = reserializeFileNameBody(efn)
-                let allocSize = ((newRealSize + UInt64(bytesPerCluster) - 1) / UInt64(bytesPerCluster)) * UInt64(bytesPerCluster)
-                MFTRecord.writeU64LE(into: &body, at: 40, value: allocSize)
-                MFTRecord.writeU64LE(into: &body, at: 48, value: newRealSize)
+                MFTRecord.writeU64LE(into: &body, at: 40, value: effAllocSize)
+                MFTRecord.writeU64LE(into: &body, at: 48, value: effRealSize)
                 entries.append((entry.fileReference, body, efn.name))
             } else {
                 entries.append((entry.fileReference, reserializeFileNameBody(efn), efn.name))
@@ -4909,7 +5088,7 @@ public actor Volume {
         )
         guard let mark = locateEndMarker(in: newParentBytes, fromOffset: Int(parent.firstAttributeOffset)) else { return }
         var updated = newParentBytes
-        MFTRecord.writeU32LE(into: &updated, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
         try await mft.writeRawRecord(at: parentRN, postFixupBytes: updated)
     }
 
@@ -5118,7 +5297,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "writeFile: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
         try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
         try? await bumpMTimeOnWrite(recordNumber: recordNumber)
@@ -5409,7 +5588,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "truncate: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
     }
 
@@ -5476,7 +5655,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "truncate: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
-        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: UInt32(newUsedSize + 4))
+        MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
     }
 
@@ -6849,7 +7028,7 @@ public actor Volume {
             throw NTFSError.corruptOnDisk(description: "rename: rewritten record missing end marker")
         }
         var finalBytes = updatedRecordBytes
-        MFTRecord.writeU32LE(into: &finalBytes, at: 24, value: UInt32(mark + 4))
+        MFTRecord.writeU32LE(into: &finalBytes, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
 
         // 1. Insert the new $I30 entry under the target parent. This is the
         //    new reachability edge; it is committed BEFORE we remove the old

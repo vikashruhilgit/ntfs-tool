@@ -238,7 +238,7 @@ public enum AttributeMigration {
         // End marker.
         MFTRecord.writeU32LE(into: &newBase, at: attrsStart + newAttrs.count, value: AttributeType.endMarker)
         // Updated header fields.
-        MFTRecord.writeU32LE(into: &newBase, at: 24, value: UInt32(newUsedSize))
+        MFTRecord.writeU32LE(into: &newBase, at: 24, value: MFTRecord.align8UsedSize(newUsedSize))
         MFTRecord.writeU16LE(into: &newBase, at: 40, value: nextAttrID &+ 1)
 
         // Build the extension record holding the migrated attribute. By
@@ -470,7 +470,7 @@ public enum AttributeMigration {
             newBase[newBase.startIndex + attrsStart + i] = byte
         }
         MFTRecord.writeU32LE(into: &newBase, at: attrsStart + newAttrs.count, value: AttributeType.endMarker)
-        MFTRecord.writeU32LE(into: &newBase, at: 24, value: UInt32(newUsedSize))
+        MFTRecord.writeU32LE(into: &newBase, at: 24, value: MFTRecord.align8UsedSize(newUsedSize))
         // nextAttributeID doesn't need to bump: the new $ATTRIBUTE_LIST reuses
         // the existing attribute ID; the new extension reuses the migrant's
         // attribute ID (multi-extent attributes share IDs across extents).
