@@ -127,6 +127,91 @@ final class WindowsChkdskReproTests: XCTestCase {
         return (p, d)
     }
 
+    /// chkdsk Stage-2 cross-check: a file's own $FILE_NAME (in its MFT record)
+    /// must be byte-identical to the copy in the parent directory's $I30 index
+    /// entry. A real Windows `chkdsk E:` reported "index entry … is incorrect" /
+    /// "minor file name errors" because createFile stamped the two copies from
+    /// two separate `windowsFiletimeNow()` reads microseconds apart. This test
+    /// asserts the timestamps + sizes agree.
+    func testFileNameMatchesParentIndexEntry() async throws {
+        let path = try makeBlankImage()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        do {
+            let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+            let size = try await dev.size()
+            try await Volume.formatNTFS(device: dev, deviceSizeBytes: size, label: "FNIDX", volumeSerial: 0xF00D)
+        }
+        let dev = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let vol = try await Volume(device: dev)
+        let root: UInt64 = 5
+
+        func cpFile(_ name: String, _ payload: Data) async throws -> UInt64 {
+            let rn = try await vol.createFile(named: name, inDirectory: root,
+                                              isDirectory: false, dataSize: UInt64(payload.count))
+            var pending: Data? = payload
+            try await vol.writeFile(at: rn, totalSize: UInt64(payload.count)) { defer { pending = nil }; return pending ?? Data() }
+            return rn
+        }
+        let resident = try await cpFile("resident.txt", Data("hi\n".utf8))
+        let nonresident = try await cpFile("big.bin", Data(repeating: 0x42, count: 8192))
+
+        let mft = await vol.mft()
+
+        func u64(_ b: Data, _ o: Int) -> UInt64 {
+            var v: UInt64 = 0; for i in 0..<8 { v |= UInt64(b[b.startIndex + o + i]) << (8 * i) }; return v
+        }
+        // Extract the file's own $FILE_NAME body (cre,mod,mftChg,acc,alloc,real).
+        func ownFN(_ rn: UInt64) async throws -> [UInt64] {
+            let b = try await mft.record(at: rn).bytes
+            var o = u16(b, 20)
+            while o + 4 <= b.count {
+                let t = u32(b, o); if t == 0xFFFFFFFF { break }
+                let l = u32(b, o + 4); if l == 0 { break }
+                if t == 0x30 { let k = o + u16(b, o + 20)
+                    return [u64(b,k+8), u64(b,k+16), u64(b,k+24), u64(b,k+32), u64(b,k+40), u64(b,k+48)] }
+                o += l
+            }
+            return []
+        }
+        // Extract the $I30 index-entry $FILE_NAME body for `name` from root's $INDEX_ROOT.
+        func indexFN(_ name: String) async throws -> [UInt64] {
+            let b = try await mft.record(at: root).bytes
+            var o = u16(b, 20)
+            while o + 4 <= b.count {
+                let t = u32(b, o); if t == 0xFFFFFFFF { break }
+                let l = u32(b, o + 4); if l == 0 { break }
+                if t == 0x90 {
+                    let body = o + u16(b, o + 20)
+                    let entriesOff = u32(b, body + 16)         // rel to INDEX_HEADER at body+16
+                    var e = body + 16 + entriesOff
+                    while e + 16 <= b.count {
+                        let flags = u16(b, e + 12); let elen = u16(b, e + 8)
+                        if flags & 2 != 0 { break }            // LAST
+                        let k = e + 16
+                        let nl = Int(b[b.startIndex + k + 64])
+                        var units = [UInt16](); for i in 0..<nl { units.append(UInt16(u16(b, k + 66 + 2*i))) }
+                        let nm = String(decoding: units, as: UTF16.self)
+                        if nm == name {
+                            return [u64(b,k+8), u64(b,k+16), u64(b,k+24), u64(b,k+32), u64(b,k+40), u64(b,k+48)]
+                        }
+                        if elen == 0 { break }; e += elen
+                    }
+                }
+                o += l
+            }
+            return []
+        }
+
+        for (rn, name) in [(resident, "resident.txt"), (nonresident, "big.bin")] {
+            let own = try await ownFN(rn)
+            let idx = try await indexFN(name)
+            XCTAssertFalse(own.isEmpty, "\(name): no own $FILE_NAME")
+            XCTAssertFalse(idx.isEmpty, "\(name): no $I30 entry")
+            XCTAssertEqual(own, idx,
+                "\(name): file $FILE_NAME [cre,mod,mftChg,acc,alloc,real]=\(own) != $I30 index entry \(idx) — chkdsk flags 'index entry is incorrect'")
+        }
+    }
+
     /// The EXACT bytes the real Windows drive received at creation: the v3
     /// builder path (securityID inherited → 72-byte $STD_INFO, NO inline 0x50),
     /// with dataSize stamped the way `cp` does (createFile(dataSize:)).

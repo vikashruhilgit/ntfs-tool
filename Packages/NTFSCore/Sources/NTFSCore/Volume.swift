@@ -1523,6 +1523,13 @@ public actor Volume {
         let fnAllocSize: UInt64 = (isDirectory || willBeResident)
             ? 0
             : ((dataSize + clusterBytes - 1) / clusterBytes) * clusterBytes
+        // One creation timestamp shared by BOTH the file's own $FILE_NAME
+        // (stamped into the builder below) and the parent's $I30 index entry
+        // (inserted further down). chkdsk requires the two $FILE_NAME copies to
+        // be byte-identical; taking two separate `windowsFiletimeNow()` reads
+        // microseconds apart makes their timestamps disagree, which chkdsk
+        // flags as "index entry … is incorrect" / "minor file name errors".
+        let createdAt = MFTRecordBuilder.windowsFiletimeNow()
         let builder = MFTRecordBuilder(
             recordSize: Int(mftRecordSizeBytes),
             sectorSize: Int(boot.bytesPerSector),
@@ -1531,6 +1538,7 @@ public actor Volume {
             isDirectory: isDirectory,
             fileName: name,
             parentReference: parentRef,
+            nowFiletime: createdAt,
             securityID: securityID,
             securityDescriptor: inheritedSD,
             dataRealSize: fnRealSize,
@@ -1594,7 +1602,7 @@ public actor Volume {
                 childSequence: newSequence,
                 childFileName: name,
                 isDirectory: isDirectory,
-                nowFiletime: MFTRecordBuilder.windowsFiletimeNow(),
+                nowFiletime: createdAt,
                 childRealSize: fnRealSize,
                 childAllocatedSize: fnAllocSize,
                 i30Committed: &i30Committed
