@@ -578,6 +578,15 @@ public actor Volume {
 
     private var _mftBitmap: Bitmap?
 
+    /// Next-fit search hint for `allocateMFTRecord`, mirroring `_allocHint` for
+    /// the cluster bitmap. Without it, every createFile rescanned the $MFT
+    /// $BITMAP from `firstUserRecord`, so the Kth file scanned ~K bits — O(N²)
+    /// over a bulk `cp -r` (the dominant CPU cost once thousands of records are
+    /// in use). Slots fill roughly sequentially, so starting the scan here
+    /// makes it ~O(1) amortized; deletes reset it downward so freed slots below
+    /// the hint are still reused (and the scan wraps to cover them anyway).
+    private var _mftAllocHint: UInt64 = MFT.firstUserRecord
+
     /// Read (and cache) the $MFT $BITMAP attribute. Returns a Bitmap whose
     /// `clusterCount` is actually "record count" (the abstraction is bit-
     /// indexed; semantics are the caller's problem).
@@ -660,12 +669,23 @@ public actor Volume {
         var growthRounds: UInt64 = 0
         while true {
             let bm = try await mftBitmap()
-            // First free bit in the user region of the currently-tracked range.
+            // First free bit in the user region — next-fit from `_mftAllocHint`
+            // with wrap-around, so a bulk run doesn't rescan from the start
+            // each time (O(N²)) while still reusing freed slots below the hint.
             var freeSlot: UInt64? = nil
-            var n = MFT.firstUserRecord
+            let hint = max(_mftAllocHint, MFT.firstUserRecord)
+            var n = hint
             while n < bm.clusterCount {
                 if !bm.isAllocated(cluster: n) { freeSlot = n; break }
                 n += 1
+            }
+            if freeSlot == nil && hint > MFT.firstUserRecord {
+                // Wrap: scan [firstUserRecord, hint) for slots freed by deletes.
+                var m = MFT.firstUserRecord
+                while m < hint && m < bm.clusterCount {
+                    if !bm.isAllocated(cluster: m) { freeSlot = m; break }
+                    m += 1
+                }
             }
 
             // Fast path: a free slot that's already physically backed.
@@ -674,6 +694,7 @@ public actor Volume {
                 try bm2.markAllocated(startLCN: slot, count: 1)
                 try await persistMFTBitmap(bm2)
                 _mftBitmap = bm2
+                _mftAllocHint = slot + 1
                 try await bumpMFTDataRealSizeIfNeeded(toCoverSlot: slot)
                 return slot
             }
@@ -1085,6 +1106,9 @@ public actor Volume {
         try bm.markFree(startLCN: recordNumber, count: 1)
         try await persistMFTBitmap(bm)
         _mftBitmap = bm
+        // Reuse this freed slot: pull the next-fit hint down to it so the
+        // allocator finds it without relying solely on the wrap-around scan.
+        if recordNumber >= MFT.firstUserRecord { _mftAllocHint = min(_mftAllocHint, recordNumber) }
     }
 
     /// Mark a record as allocated in the $BITMAP. Mirror of freeMFTRecord;
@@ -5355,7 +5379,12 @@ public actor Volume {
         try await writeFile(at: recordNumber, totalSize: fileSize) {
             if remaining == 0 { return Data() }
             let take = Int(min(UInt64(chunkSize), remaining))
-            let chunk = (try? handle.read(upToCount: take)) ?? Data()
+            // Drain the autorelease pool around each host read. Without it, a
+            // multi-GB `cp -r` accumulates one autoreleased NSData per 1 MiB
+            // chunk for the whole process — the OOM-mid-copy failure mode. The
+            // returned `chunk` is strongly held by the caller, so it survives
+            // the drain; only the spent per-read buffers are reclaimed.
+            let chunk = autoreleasepool { (try? handle.read(upToCount: take)) ?? Data() }
             remaining -= UInt64(chunk.count)
             return chunk
         }
@@ -5371,8 +5400,10 @@ public actor Volume {
         if let single = try? await allocateClusters(count) {
             return [single]
         }
-        // Fall back to greedy multi-extent allocation.
-        var bm = try await bitmap()
+        // Fall back to greedy multi-extent allocation. Mutate the cached
+        // bitmap in place (see allocateClusters) — no per-call copy-on-write
+        // clone of the bitmap Data.
+        _ = try await bitmap()
         var remaining = count
         var extents: [Extent] = []
         while remaining > 0 {
@@ -5382,13 +5413,13 @@ public actor Volume {
             // at the requested size. Start from remaining and halve until 1.
             var trySize = remaining
             while trySize >= 1 {
-                if let extent = try? bm.allocate(trySize, startingAt: _allocHint) {
+                if let extent = try? _bitmap!.allocate(trySize, startingAt: _allocHint) {
                     extents.append(extent)
                     taken = trySize
                     // Advance the hint so the next sub-run continues from where
                     // this one ended, keeping the fragments as close to
                     // contiguous as the bitmap allows.
-                    advanceAllocHint(after: extent, clusterCount: bm.clusterCount)
+                    advanceAllocHint(after: extent, clusterCount: _bitmap!.clusterCount)
                     break
                 }
                 if trySize == 1 { break }
@@ -5396,14 +5427,14 @@ public actor Volume {
             }
             if taken == 0 {
                 // Free what we already took, then surface outOfSpace.
-                for e in extents { try? bm.free(e) }
-                throw NTFSError.outOfSpace(requestedClusters: count, freeClusters: bm.freeClusterCount)
+                for e in extents { try? _bitmap!.free(e) }
+                throw NTFSError.outOfSpace(requestedClusters: count, freeClusters: _bitmap!.freeClusterCount)
             }
             remaining -= taken
         }
-        try await persistBitmap(bm)
-        bm.clearDirty()
-        _bitmap = bm
+        do { try await persistBitmap(_bitmap!) }
+        catch { _bitmap = nil; throw error }
+        _bitmap!.clearDirty()
         return extents
     }
 
@@ -6718,12 +6749,21 @@ public actor Volume {
     /// path that splits a request into multiple extents when no single run
     /// is large enough (common on fragmented volumes).
     public func allocateClusters(_ count: UInt64) async throws -> Extent {
-        var bm = try await bitmap()
-        let extent = try bm.allocate(count, startingAt: _allocHint)
-        try await persistBitmap(bm)
-        bm.clearDirty()
-        _bitmap = bm
-        advanceAllocHint(after: extent, clusterCount: bm.clusterCount)
+        // Mutate the CACHED bitmap in place. The old `var bm = bitmap()` made a
+        // copy-on-write clone of the whole bitmap Data on the first mutation —
+        // ~128 MB on a 4 TB volume, PER allocated file — which was the dominant
+        // memory churn (→ OOM on large drives) and CPU cost of a big `cp -r`.
+        // `_bitmap` is the sole owner here, so `allocate` mutates in place (no
+        // clone). `allocate` does findFreeRun first and throws BEFORE mutating,
+        // so an outOfSpace leaves `_bitmap` untouched. If the on-disk persist
+        // fails after the in-memory mutation, drop the cache so the next read
+        // reloads the authoritative on-disk bitmap (no in-memory/disk drift).
+        _ = try await bitmap()
+        let extent = try _bitmap!.allocate(count, startingAt: _allocHint)
+        do { try await persistBitmap(_bitmap!) }
+        catch { _bitmap = nil; throw error }
+        _bitmap!.clearDirty()
+        advanceAllocHint(after: extent, clusterCount: _bitmap!.clusterCount)
         return extent
     }
 
@@ -6858,11 +6898,13 @@ public actor Volume {
     /// allocation back to refill the just-freed holes — re-introducing exactly
     /// the fragmentation the next-fit hint exists to avoid.
     public func freeClusters(_ extent: Extent) async throws {
-        var bm = try await bitmap()
-        try bm.free(extent)
-        try await persistBitmap(bm)
-        bm.clearDirty()
-        _bitmap = bm
+        // In-place mutation of the cached bitmap (see allocateClusters) to
+        // avoid a full copy-on-write clone of the bitmap Data per free.
+        _ = try await bitmap()
+        try _bitmap!.free(extent)
+        do { try await persistBitmap(_bitmap!) }
+        catch { _bitmap = nil; throw error }
+        _bitmap!.clearDirty()
     }
 
     /// Test-only accessor for the next-fit allocator hint. Not part of the
