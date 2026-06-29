@@ -203,31 +203,41 @@ public actor FileHandleBlockDevice: BlockDevice {
     /// MAXPHYS. Caller guarantees `offset`/`length` satisfy any device
     /// alignment requirement.
     private func readRange(offset: UInt64, length: Int) throws -> Data {
-        do {
-            try handle.seek(toOffset: offset)
-        } catch {
-            throw NTFSError.ioFailure(description: "seek to offset \(offset) failed: \(error)")
-        }
-        var result = Data()
-        result.reserveCapacity(length)
-        var remaining = length
-        while remaining > 0 {
-            let thisChunk = min(Self.readChunkSize, remaining)
-            let chunk: Data?
+        // Drain the autorelease pool around the FileHandle reads. On Darwin,
+        // `handle.read(upToCount:)` returns an autoreleased NSData-backed
+        // buffer; with no enclosing pool drain (a long-lived `ntfsctl cp -r`
+        // is one async task with no runloop turn), every per-chunk buffer
+        // lives until process exit, so RSS climbs to the full transferred
+        // size and the OOM killer fires mid-copy. The returned `result` is a
+        // Swift value whose storage is ARC-managed — it survives the drain;
+        // only the consumed per-chunk NSData buffers are reclaimed.
+        try autoreleasepool {
             do {
-                chunk = try handle.read(upToCount: thisChunk)
+                try handle.seek(toOffset: offset)
             } catch {
-                throw NTFSError.ioFailure(
-                    description: "read at offset \(offset + UInt64(length - remaining)) length \(thisChunk) failed: \(error)"
-                )
+                throw NTFSError.ioFailure(description: "seek to offset \(offset) failed: \(error)")
             }
-            guard let chunk, !chunk.isEmpty else {
-                throw NTFSError.shortRead(expected: length, got: length - remaining)
+            var result = Data()
+            result.reserveCapacity(length)
+            var remaining = length
+            while remaining > 0 {
+                let thisChunk = min(Self.readChunkSize, remaining)
+                let chunk: Data?
+                do {
+                    chunk = try handle.read(upToCount: thisChunk)
+                } catch {
+                    throw NTFSError.ioFailure(
+                        description: "read at offset \(offset + UInt64(length - remaining)) length \(thisChunk) failed: \(error)"
+                    )
+                }
+                guard let chunk, !chunk.isEmpty else {
+                    throw NTFSError.shortRead(expected: length, got: length - remaining)
+                }
+                result.append(chunk)
+                remaining -= chunk.count
             }
-            result.append(chunk)
-            remaining -= chunk.count
+            return result
         }
-        return result
     }
 
     /// Chunk size for raw-device writes. macOS's BSD block layer caps a
@@ -278,29 +288,35 @@ public actor FileHandleBlockDevice: BlockDevice {
     /// `writeChunkSize` so a raw-device transfer never exceeds MAXPHYS. Caller
     /// guarantees `offset`/`bytes.count` satisfy any device alignment.
     private func writeRangeChunked(offset: UInt64, bytes: Data) throws {
-        do {
-            try handle.seek(toOffset: offset)
-        } catch {
-            throw NTFSError.ioFailure(description: "seek to offset \(offset) for write failed: \(error)")
-        }
-        let total = bytes.count
-        var written = 0
-        while written < total {
-            let thisChunk = min(Self.writeChunkSize, total - written)
-            let lo = bytes.index(bytes.startIndex, offsetBy: written)
-            let hi = bytes.index(lo, offsetBy: thisChunk)
-            // Data(...) copy ensures the slice is contiguous; FileHandle's
-            // write(contentsOf:) accepts any DataProtocol but a fresh Data
-            // sidesteps any slice-backing-store quirks across Swift versions.
-            let slice = Data(bytes[lo..<hi])
+        // Drain the autorelease pool around the FileHandle writes for the same
+        // reason as `readRange`: `write(contentsOf:)` bridges to NSData and the
+        // per-chunk slices would otherwise live until process exit, leaking
+        // memory across a long `cp -r`.
+        try autoreleasepool {
             do {
-                try handle.write(contentsOf: slice)
+                try handle.seek(toOffset: offset)
             } catch {
-                throw NTFSError.ioFailure(
-                    description: "write at offset \(offset + UInt64(written)) length \(thisChunk) failed (chunk \(written)/\(total)): \(error)"
-                )
+                throw NTFSError.ioFailure(description: "seek to offset \(offset) for write failed: \(error)")
             }
-            written += thisChunk
+            let total = bytes.count
+            var written = 0
+            while written < total {
+                let thisChunk = min(Self.writeChunkSize, total - written)
+                let lo = bytes.index(bytes.startIndex, offsetBy: written)
+                let hi = bytes.index(lo, offsetBy: thisChunk)
+                // Data(...) copy ensures the slice is contiguous; FileHandle's
+                // write(contentsOf:) accepts any DataProtocol but a fresh Data
+                // sidesteps any slice-backing-store quirks across Swift versions.
+                let slice = Data(bytes[lo..<hi])
+                do {
+                    try handle.write(contentsOf: slice)
+                } catch {
+                    throw NTFSError.ioFailure(
+                        description: "write at offset \(offset + UInt64(written)) length \(thisChunk) failed (chunk \(written)/\(total)): \(error)"
+                    )
+                }
+                written += thisChunk
+            }
         }
     }
 
