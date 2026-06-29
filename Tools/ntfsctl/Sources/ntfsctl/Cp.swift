@@ -142,25 +142,46 @@ struct Cp: AsyncParsableCommand {
             throw ValidationError("destination already exists as a file: /\(trimmedDest) (pass to a directory ending with '/' to copy under it)")
         }
 
-        // Scan source to build a plan + size totals.
+        // Scan source to build a plan + size totals. `totalBytes` is the raw
+        // sum of file sizes (for display/progress); `dataClusters` is what the
+        // data streams will ACTUALLY consume on the volume — each file's bytes
+        // rounded UP to whole clusters — which is what the free-space check
+        // must use, not the raw sum.
+        let clusterBytes = UInt64(volume.bytesPerCluster)
+        func clustersFor(_ size: UInt64) -> UInt64 { (size + clusterBytes - 1) / clusterBytes }
         var totalFiles = 0
         var totalBytes: UInt64 = 0
+        var dataClusters: UInt64 = 0
         if srcIsDir.boolValue {
             try walkHostDir(source) { _, fileSize in
                 totalFiles += 1
                 totalBytes += fileSize
+                dataClusters += clustersFor(fileSize)
             }
         } else {
             totalFiles = 1
             totalBytes = (try fm.attributesOfItem(atPath: source)[.size] as? UInt64) ?? 0
+            dataClusters = clustersFor(totalBytes)
         }
 
-        // Free-space pre-check.
+        // Free-space pre-check — CONSERVATIVE so the user is stopped UP FRONT
+        // rather than failing mid-copy with ENOSPC. Account for:
+        //   • data: each file's content rounded up to whole clusters
+        //   • $MFT growth: ~1 MFT record per file (recordsPerCluster per cluster)
+        //   • $I30 index growth: a per-file allowance for index entries + the
+        //     non-resident $INDEX_ALLOCATION blocks large directories need.
         if !noFreeCheck {
             let stats = try await volume.allocationStats()
-            if totalBytes > stats.freeBytes {
+            let recsPerCluster = max(UInt64(1), clusterBytes / UInt64(volume.mftRecordSizeBytes))
+            let mftClusters = (UInt64(totalFiles) + recsPerCluster - 1) / recsPerCluster
+            let indexClusters = (UInt64(totalFiles) * 256 + clusterBytes - 1) / clusterBytes  // ~256 B/file, conservative
+            let requiredClusters = dataClusters + mftClusters + indexClusters
+            let requiredBytes = requiredClusters * clusterBytes
+            if requiredClusters > stats.freeClusters {
                 throw ValidationError(
-                    "insufficient free space: source needs \(humanBytes(totalBytes)) but volume has \(humanBytes(stats.freeBytes)) free (pass --no-free-check to override; LARGE_INDEX leaf-full may still cap directories)"
+                    "insufficient free space: \(totalFiles) file(s) need ~\(humanBytes(requiredBytes)) on the volume "
+                    + "(\(humanBytes(totalBytes)) of data, rounded up to whole \(clusterBytes)-byte clusters, plus MFT/index overhead) "
+                    + "but only \(humanBytes(stats.freeBytes)) is free. Free up space or copy less; pass --no-free-check to override."
                 )
             }
         }
@@ -319,16 +340,25 @@ struct Cp: AsyncParsableCommand {
 
     private func walkHostDir(_ root: String, visit: (_ path: String, _ size: UInt64) throws -> Void) throws {
         let fm = FileManager.default
+        // Each iteration touches autoreleased Foundation objects (NSString path
+        // ops, the attributesOfItem NSDictionary). On a 22k-file tree these
+        // would pile up for the whole pre-scan; drain per entry so the walk's
+        // peak memory is independent of the file count.
         let entries = (try? fm.contentsOfDirectory(atPath: root)) ?? []
         for name in entries.sorted() {
-            let full = (root as NSString).appendingPathComponent(name)
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
-            if isDir.boolValue {
-                try walkHostDir(full, visit: visit)
-            } else {
+            let recurseInto: String? = try autoreleasepool {
+                let full = (root as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: full, isDirectory: &isDir) else { return nil }
+                if isDir.boolValue {
+                    return full
+                }
                 let size = (try fm.attributesOfItem(atPath: full)[.size] as? UInt64) ?? 0
                 try visit(full, size)
+                return nil
+            }
+            if let recurseInto {
+                try walkHostDir(recurseInto, visit: visit)
             }
         }
     }
@@ -415,8 +445,14 @@ struct Cp: AsyncParsableCommand {
         startTime: Date
     ) async throws -> Bool {
         let url = URL(fileURLWithPath: hostFile)
-        let attrs = try FileManager.default.attributesOfItem(atPath: hostFile)
-        if let type = attrs[.type] as? FileAttributeType, type != .typeRegular {
+        // Pull the two attributes we need out of the autoreleased NSDictionary
+        // inside a pool so it (and its NSNumber/NSString values) are reclaimed
+        // immediately rather than accumulating across every file in a cp -r.
+        let (fileType, size): (FileAttributeType?, UInt64) = try autoreleasepool {
+            let attrs = try FileManager.default.attributesOfItem(atPath: hostFile)
+            return (attrs[.type] as? FileAttributeType, attrs[.size] as? UInt64 ?? 0)
+        }
+        if let type = fileType, type != .typeRegular {
             FileHandle.standardError.write(Data("skip \(hostFile): not a regular file (\(type.rawValue))\n".utf8))
             return false
         }
@@ -427,7 +463,6 @@ struct Cp: AsyncParsableCommand {
             }
             try await volume.deleteFile(at: existing)
         }
-        let size = attrs[.size] as? UInt64 ?? 0
         // Pass the size so the $I30 index entry carries it — Windows Explorer
         // reads file size from there (0 → shows 0 KB and refuses to open).
         let rn = try await volume.createFile(named: name, inDirectory: ntfsParent, isDirectory: false, dataSize: size)
@@ -483,13 +518,15 @@ struct Cp: AsyncParsableCommand {
         var subdirs: [(name: String, fullPath: String)] = []
         var files: [(name: String, fullPath: String)] = []
         for name in entries.sorted() {
-            let fullPath = (hostDir as NSString).appendingPathComponent(name)
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else { continue }
-            if isDir.boolValue {
-                subdirs.append((name, fullPath))
-            } else {
-                files.append((name, fullPath))
+            autoreleasepool {
+                let fullPath = (hostDir as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: fullPath, isDirectory: &isDir) else { return }
+                if isDir.boolValue {
+                    subdirs.append((name, fullPath))
+                } else {
+                    files.append((name, fullPath))
+                }
             }
         }
 
@@ -758,7 +795,10 @@ struct Cp: AsyncParsableCommand {
         while true {
             let data = try await volume.readFileSlice(at: rn, offset: offset, length: chunk)
             if data.isEmpty { break }
-            try handle.write(contentsOf: data)
+            // Drain the autorelease pool around the host write — `write(contentsOf:)`
+            // bridges to NSData, which would otherwise accumulate one buffer per
+            // chunk for the whole `cp -r --from-volume`, the OOM-mid-copy failure mode.
+            try autoreleasepool { try handle.write(contentsOf: data) }
             offset += UInt64(data.count)
             fileSize += UInt64(data.count)
             if data.count < chunk { break }
