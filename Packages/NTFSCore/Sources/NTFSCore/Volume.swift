@@ -5045,6 +5045,109 @@ public actor Volume {
         try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updated)
     }
 
+    /// Set one or more $STANDARD_INFORMATION timestamps on a file/directory.
+    /// Any argument left `nil` keeps its current on-disk value. Dates are
+    /// converted to Windows FILETIME (100ns ticks since 1601). The $STD_INFO
+    /// layout (resident): offset 0 = created, 8 = modified, 16 = mft-changed,
+    /// 24 = accessed (all u64 LE). Mirrors `bumpMTimeOnWrite`'s rewrite path.
+    ///
+    /// Reserved records (< 16) are rejected. This is the public setter the
+    /// FSKit `setAttributes` adapter marshals .birthTime/.modifyTime/
+    /// .accessTime/.changeTime onto.
+    public func setStandardInformationTimes(
+        at recordNumber: UInt64,
+        created: Date? = nil,
+        modified: Date? = nil,
+        accessed: Date? = nil,
+        mftChanged: Date? = nil
+    ) async throws {
+        guard recordNumber >= MFT.firstUserRecord else {
+            throw NTFSError.unsupportedFeature(
+                description: "setStandardInformationTimes: refusing to mutate reserved MFT record \(recordNumber)"
+            )
+        }
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else {
+            throw NTFSError.corruptOnDisk(description: "setStandardInformationTimes: MFT record \(recordNumber) is not in use")
+        }
+        let attrs = try record.attributes()
+        guard let stdInfo = attrs.first(where: { $0.type == .standardInformation }),
+              case let .resident(stdBytes, _) = stdInfo.value else {
+            throw NTFSError.corruptOnDisk(description: "setStandardInformationTimes: record \(recordNumber) lacks resident $STANDARD_INFORMATION")
+        }
+        var newStd = stdBytes
+        if let created  { MFTRecord.writeU64LE(into: &newStd, at: 0,  value: MFTRecordBuilder.windowsFiletime(from: created)) }
+        if let modified { MFTRecord.writeU64LE(into: &newStd, at: 8,  value: MFTRecordBuilder.windowsFiletime(from: modified)) }
+        if let mftChanged { MFTRecord.writeU64LE(into: &newStd, at: 16, value: MFTRecordBuilder.windowsFiletime(from: mftChanged)) }
+        if let accessed { MFTRecord.writeU64LE(into: &newStd, at: 24, value: MFTRecordBuilder.windowsFiletime(from: accessed)) }
+        try await rewriteStandardInformation(record: record, stdInfo: stdInfo, newStd: newStd, recordNumber: recordNumber)
+    }
+
+    /// Set the NTFS file-attribute flags (the u32 at $STANDARD_INFORMATION
+    /// offset 32 — READ_ONLY/HIDDEN/SYSTEM/ARCHIVE/etc). Replaces the whole
+    /// flags word; callers that want a masked set/clear should read the
+    /// current flags first (via getAttributes) and OR/AND before calling.
+    /// Reserved records (< 16) are rejected.
+    public func setFileAttributeFlags(at recordNumber: UInt64, flags: UInt32) async throws {
+        guard recordNumber >= MFT.firstUserRecord else {
+            throw NTFSError.unsupportedFeature(
+                description: "setFileAttributeFlags: refusing to mutate reserved MFT record \(recordNumber)"
+            )
+        }
+        let mft = self.mft()
+        let record = try await mft.record(at: recordNumber)
+        guard record.isInUse else {
+            throw NTFSError.corruptOnDisk(description: "setFileAttributeFlags: MFT record \(recordNumber) is not in use")
+        }
+        let attrs = try record.attributes()
+        guard let stdInfo = attrs.first(where: { $0.type == .standardInformation }),
+              case let .resident(stdBytes, _) = stdInfo.value else {
+            throw NTFSError.corruptOnDisk(description: "setFileAttributeFlags: record \(recordNumber) lacks resident $STANDARD_INFORMATION")
+        }
+        guard stdBytes.count >= 36 else {
+            throw NTFSError.corruptOnDisk(description: "setFileAttributeFlags: $STANDARD_INFORMATION too short (\(stdBytes.count) bytes) to hold flags at offset 32")
+        }
+        var newStd = stdBytes
+        // $STANDARD_INFORMATION file-attribute flags: u32 LE at offset 32.
+        MFTRecord.writeU32LE(into: &newStd, at: 32, value: flags)
+        try await rewriteStandardInformation(record: record, stdInfo: stdInfo, newStd: newStd, recordNumber: recordNumber)
+    }
+
+    /// Wrap `newStd` in a fresh resident $STANDARD_INFORMATION attribute,
+    /// splice it back into the record, fix up usedSize, and write the record.
+    /// Shared by setStandardInformationTimes / setFileAttributeFlags.
+    private func rewriteStandardInformation(
+        record: MFTRecord,
+        stdInfo: Attribute,
+        newStd: Data,
+        recordNumber: UInt64
+    ) async throws {
+        let mft = self.mft()
+        let newAttrBytes = serializeResidentAttribute(
+            type: AttributeType.standardInformation.rawValue,
+            attrID: stdInfo.header.attributeID,
+            flags: stdInfo.header.flags,
+            attributeName: "",
+            value: newStd
+        )
+        let newRecordBytes = try rewriteEntireAttribute(
+            in: record.bytes,
+            firstAttributeOffset: Int(record.firstAttributeOffset),
+            usedSize: Int(record.usedSize),
+            recordSize: Int(record.allocatedSize),
+            replacingType: AttributeType.standardInformation.rawValue,
+            attributeName: "",
+            replacementBytes: newAttrBytes
+        )
+        guard let mark = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset)) else {
+            throw NTFSError.corruptOnDisk(description: "rewriteStandardInformation: rewritten record \(recordNumber) missing end marker")
+        }
+        var updated = newRecordBytes
+        MFTRecord.writeU32LE(into: &updated, at: 24, value: MFTRecord.align8UsedSize(mark + 4))
+        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updated)
+    }
+
     /// Update the $FILE_NAME size hints (realSize, allocatedSize) inside the
     /// parent directory's $I30 entry. Best-effort; ignored if the parent is
     /// LARGE_INDEX (would require descending the B-tree to find + rewrite the
@@ -5537,6 +5640,30 @@ public actor Volume {
         }
         guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
             throw NTFSError.corruptOnDisk(description: "truncate: record \(recordNumber) lacks unnamed $DATA")
+        }
+
+        // Current logical size of the unnamed $DATA.
+        let oldSize: UInt64
+        switch dataAttr.value {
+        case let .resident(v, _): oldSize = UInt64(v.count)
+        case let .nonResident(_, _, _, _, _, realSize, _, _): oldSize = realSize
+        }
+
+        // GROW: extend the file by zero-filling the new tail. Reuse the proven
+        // allocation / resident->non-resident-promotion machinery in `write`
+        // by appending exactly (newSize - oldSize) zero bytes at offset == oldSize.
+        // `write`'s append path allocates clusters, extends the runlist, and
+        // updates $Bitmap; the appended bytes are zeros so the tail reads back
+        // as zeros, matching POSIX ftruncate-grow semantics. Shrink behavior is
+        // untouched (handled below).
+        if newSize > oldSize {
+            let zeros = Data(count: Int(newSize - oldSize))
+            try await write(at: recordNumber, offset: oldSize, bytes: zeros)
+            return
+        }
+        if newSize == oldSize {
+            // No-op: already the requested size.
+            return
         }
 
         if newSize == 0 {
