@@ -207,7 +207,6 @@ final class NTFSVolume: FSVolume,
         let wantsAccess = newAttributes.isValid(.accessTime)
         let wantsChange = newAttributes.isValid(.changeTime)
         let wantsBirth = newAttributes.isValid(.birthTime)
-        let wantsFlags = newAttributes.isValid(.flags)
 
         // Capture the timespec/scalar values off the request before hopping
         // onto the actor; the request object isn't Sendable.
@@ -216,7 +215,6 @@ final class NTFSVolume: FSVolume,
         let accessDate = wantsAccess ? Self.date(from: newAttributes.accessTime) : nil
         let changeDate = wantsChange ? Self.date(from: newAttributes.changeTime) : nil
         let birthDate = wantsBirth ? Self.date(from: newAttributes.birthTime) : nil
-        let flagsVal = newAttributes.flags
         let rn = ntfsItem.recordNumber
 
         Task {
@@ -241,14 +239,17 @@ final class NTFSVolume: FSVolume,
                     if wantsChange { consumed.insert(.changeTime) }
                     if wantsBirth { consumed.insert(.birthTime) }
                 }
-                // Flags -> NTFS file-attribute flags. NOTE: FSKit `flags` are
-                // BSD st_flags; we pass the value straight through to the NTFS
-                // file-attribute word. This is a best-effort mapping (see the
-                // deviation note in the PR) — honoring it is non-destructive.
-                if wantsFlags {
-                    try await self.coreVolume.setFileAttributeFlags(at: rn, flags: flagsVal)
-                    consumed.insert(.flags)
-                }
+                // Flags (.flags) are deliberately NOT honored: FSKit delivers
+                // BSD st_flags (UF_HIDDEN/UF_IMMUTABLE/...), a different
+                // namespace from the NTFS $STANDARD_INFORMATION file-attribute
+                // word (FILE_ATTRIBUTE_*). Writing st_flags straight in would
+                // clobber the real NTFS attributes (ARCHIVE/HIDDEN/SYSTEM/...)
+                // with a meaningless value — corruption, not a no-op. Until a
+                // correct st_flags -> FILE_ATTRIBUTE_* mapping exists, we
+                // degrade cleanly: acknowledge the call, leave .flags
+                // unconsumed, and never touch the record. (NTFSCore's
+                // setFileAttributeFlags primitive stays available for callers
+                // that pass real NTFS flags.)
                 if !consumed.isEmpty {
                     try? await self.coreVolume.setDirty(false)
                 }
