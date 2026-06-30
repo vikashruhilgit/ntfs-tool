@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import NTFSUIKit
 
@@ -96,6 +97,16 @@ struct VolumeDashboardView: View {
 
     private var actions: some View {
         HStack(spacing: Spacing.small) {
+            if volume.isMounted, let mountPoint = volume.mountPoint {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: mountPoint)])
+                } label: {
+                    Label("Reveal", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .accessibilityLabel("Reveal \(volume.displayName) in Finder")
+            }
+
             Button {
                 Task { await loader.runVerify() }
             } label: {
@@ -326,10 +337,10 @@ struct VolumeDashboardView: View {
         VStack(alignment: .leading, spacing: Spacing.medium) {
             HStack(alignment: .top, spacing: Spacing.medium) {
                 VStack(alignment: .leading, spacing: Spacing.unit) {
-                    Label("Danger Zone", systemImage: "exclamationmark.triangle.fill")
+                    Label("Destructive Actions", systemImage: "exclamationmark.triangle.fill")
                         .font(.ntfsTitle)
                         .foregroundStyle(Color.ntfsError)
-                    Text("These operations rewrite or modify the volume. They cannot be undone.")
+                    Text("These operations will erase or rewrite the volume data permanently.")
                         .font(.ntfsBody)
                         .foregroundStyle(Color.ntfsOnSurfaceVariant)
                         .fixedSize(horizontal: false, vertical: true)

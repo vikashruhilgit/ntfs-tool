@@ -19,14 +19,20 @@ public struct StorageRing: View {
     public var body: some View {
         ZStack {
             Circle()
-                .stroke(Color.ntfsOutline.opacity(0.25), lineWidth: lineWidth)
+                .stroke(Color.ntfsOnSurface.opacity(0.08), lineWidth: lineWidth)
             Circle()
                 .trim(from: 0, to: fraction)
                 .stroke(
-                    Color.ntfsAccent,
+                    AngularGradient(
+                        gradient: Gradient(colors: [Color.ntfsPrimary, Color.ntfsAccent]),
+                        center: .center,
+                        startAngle: .degrees(0),
+                        endAngle: .degrees(360)
+                    ),
                     style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
                 )
                 .rotationEffect(.degrees(-90))
+                .shadow(color: Color.ntfsAccent.opacity(0.35), radius: 6)
                 .animation(.easeInOut(duration: 0.6), value: fraction)
             VStack(spacing: 2) {
                 Text(percentLabel)
