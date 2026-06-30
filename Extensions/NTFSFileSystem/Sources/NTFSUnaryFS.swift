@@ -82,7 +82,7 @@ final class NTFSUnaryFS: FSUnaryFileSystem, FSUnaryFileSystemOperations, @unchec
                     self.log.warning("loadResource: $Bitmap read failed: \(error.localizedDescription, privacy: .public). Stats will show placeholders.")
                 }
 
-                log.info("loadResource: NTFS volume loaded read-only")
+                log.info("loadResource: NTFS volume loaded (read-only=\(isReadOnly, privacy: .public))")
                 reply(volume, nil)
             } catch {
                 log.error("loadResource: \(error.localizedDescription, privacy: .public)")

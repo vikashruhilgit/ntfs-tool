@@ -106,7 +106,23 @@ final class NTFSVolume: FSVolume,
     }
 
     func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping @Sendable (Error?) -> Void) {
-        reply(nil)   // read-only — nothing to flush
+        // Persist all pending metadata + data. endWriteSession flushes the
+        // device, clears the dirty bit, and flushes again so a power loss or
+        // fast unplug after this point leaves a consistent volume. On a
+        // read-only mount there's nothing to flush — succeed immediately.
+        if isReadOnly {
+            reply(nil)
+            return
+        }
+        Task {
+            do {
+                try await self.coreVolume.endWriteSession()
+                reply(nil)
+            } catch {
+                self.log.error("synchronize: flush failed: \(error.localizedDescription, privacy: .public)")
+                reply(error)
+            }
+        }
     }
 
     func activate(
