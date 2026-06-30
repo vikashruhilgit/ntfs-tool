@@ -194,21 +194,71 @@ final class NTFSVolume: FSVolume,
             return
         }
 
-        // Block G stage 5 supports only the size attribute (truncate). Other
-        // mutations (uid/gid/mode/timestamps) come later — return EPERM so
-        // the kernel knows we acknowledged but won't honor the change.
-        let wantsSize = newAttributes.consumedAttributes.contains(.size)
+        // Snapshot which attributes the kernel actually provided. `isValid(_:)`
+        // (inherited from FSItemAttributes) is the request-side probe — the
+        // SetAttributesRequest has no `wantedAttributes`; only the attributes
+        // marked valid carry meaningful values. `consumedAttributes` is the
+        // OUTPUT field: we set it to the subset we successfully honored so the
+        // kernel knows what stuck. Attributes we can't map (uid/gid/mode/...)
+        // are simply not consumed — we acknowledge the call without throwing,
+        // so the kernel doesn't treat an unmappable attr as a hard failure.
+        let wantsSize = newAttributes.isValid(.size)
+        let wantsModify = newAttributes.isValid(.modifyTime)
+        let wantsAccess = newAttributes.isValid(.accessTime)
+        let wantsChange = newAttributes.isValid(.changeTime)
+        let wantsBirth = newAttributes.isValid(.birthTime)
+
+        // Capture the timespec/scalar values off the request before hopping
+        // onto the actor; the request object isn't Sendable.
+        let sizeVal = newAttributes.size
+        let modifyDate = wantsModify ? Self.date(from: newAttributes.modifyTime) : nil
+        let accessDate = wantsAccess ? Self.date(from: newAttributes.accessTime) : nil
+        let changeDate = wantsChange ? Self.date(from: newAttributes.changeTime) : nil
+        let birthDate = wantsBirth ? Self.date(from: newAttributes.birthTime) : nil
+        let rn = ntfsItem.recordNumber
 
         Task {
+            var consumed = FSItem.Attribute()
             do {
+                // Size -> truncate (grow + shrink, both via NTFSCore).
                 if wantsSize {
-                    try await self.coreVolume.truncate(
-                        at: ntfsItem.recordNumber,
-                        newSize: newAttributes.size
+                    try await self.coreVolume.truncate(at: rn, newSize: sizeVal)
+                    consumed.insert(.size)
+                }
+                // Timestamps -> $STANDARD_INFORMATION times.
+                if wantsModify || wantsAccess || wantsChange || wantsBirth {
+                    try await self.coreVolume.setStandardInformationTimes(
+                        at: rn,
+                        created: birthDate,
+                        modified: modifyDate,
+                        accessed: accessDate,
+                        mftChanged: changeDate
                     )
+                    if wantsModify { consumed.insert(.modifyTime) }
+                    if wantsAccess { consumed.insert(.accessTime) }
+                    if wantsChange { consumed.insert(.changeTime) }
+                    if wantsBirth { consumed.insert(.birthTime) }
+                }
+                // Flags (.flags) are deliberately NOT honored: FSKit delivers
+                // BSD st_flags (UF_HIDDEN/UF_IMMUTABLE/...), a different
+                // namespace from the NTFS $STANDARD_INFORMATION file-attribute
+                // word (FILE_ATTRIBUTE_*). Writing st_flags straight in would
+                // clobber the real NTFS attributes (ARCHIVE/HIDDEN/SYSTEM/...)
+                // with a meaningless value — corruption, not a no-op. Until a
+                // correct st_flags -> FILE_ATTRIBUTE_* mapping exists, we
+                // degrade cleanly: acknowledge the call, leave .flags
+                // unconsumed, and never touch the record. (NTFSCore's
+                // setFileAttributeFlags primitive stays available for callers
+                // that pass real NTFS flags.)
+                if !consumed.isEmpty {
                     try? await self.coreVolume.setDirty(false)
                 }
-                // Return refreshed attributes so the kernel sees the new size.
+                // Signal the honored subset back to the kernel via the request's
+                // consumedAttributes (the OUTPUT field lives on the request, not
+                // on the returned Attributes snapshot). Unconsumed attrs were
+                // acknowledged-but-skipped — no error, no corruption.
+                newAttributes.consumedAttributes = consumed
+                // Return refreshed attributes so the kernel sees the new state.
                 let fresh = try await ntfsItem.makeFreshAttributes(volume: self)
                 reply(fresh, nil)
             } catch NTFSError.unsupportedFeature {
@@ -217,6 +267,14 @@ final class NTFSVolume: FSVolume,
                 reply(nil, error)
             }
         }
+    }
+
+    /// Convert an FSKit `timespec` to a `Date`. A zero timespec (the FSKit
+    /// "unset" sentinel) maps to nil so we don't clobber an NTFS timestamp
+    /// with the epoch.
+    private static func date(from ts: timespec) -> Date? {
+        if ts.tv_sec == 0 && ts.tv_nsec == 0 { return nil }
+        return Date(timeIntervalSince1970: Double(ts.tv_sec) + Double(ts.tv_nsec) / 1_000_000_000)
     }
 
     func lookupItem(
@@ -343,6 +401,21 @@ final class NTFSVolume: FSVolume,
         }
         Task {
             do {
+                // rmdir emptiness guard: a directory may only be removed when
+                // it has no real children. Filter out the DOS-namespace alias
+                // and the "." / ".." entries (NTFS $I30 never materializes the
+                // latter, but be defensive). Non-empty -> ENOTEMPTY, matching
+                // POSIX rmdir. Files skip this check entirely.
+                if ntfsItem.isDirectory {
+                    let children = try await self.coreVolume.enumerate(directory: ntfsItem.recordNumber)
+                    let hasRealChild = children.contains {
+                        $0.fileName.namespace != .dos && $0.name != "." && $0.name != ".."
+                    }
+                    if hasRealChild {
+                        reply(self.posixError(ENOTEMPTY))
+                        return
+                    }
+                }
                 try await self.coreVolume.deleteFile(at: ntfsItem.recordNumber)
                 try? await self.coreVolume.setDirty(false)
                 self.cacheQueue.sync { _ = self.itemCache.removeValue(forKey: ntfsItem.recordNumber) }
@@ -364,7 +437,61 @@ final class NTFSVolume: FSVolume,
         overItem: FSItem?,
         replyHandler reply: @escaping @Sendable (FSFileName?, Error?) -> Void
     ) {
-        reply(nil, posixError(EROFS))
+        guard let source = item as? NTFSItem else {
+            reply(nil, posixError(EBADF))
+            return
+        }
+        guard let destParent = destinationDirectory as? NTFSItem, destParent.isDirectory else {
+            reply(nil, posixError(ENOTDIR))
+            return
+        }
+        guard let newName = destinationName.string else {
+            reply(nil, posixError(EINVAL))
+            return
+        }
+        // Capture the (optional) over-written item up front; it's the file the
+        // kernel says already lives at the destination name.
+        let over = overItem as? NTFSItem
+        let sourceRN = source.recordNumber
+        let destParentRN = destParent.recordNumber
+
+        Task {
+            do {
+                // NTFSCore.rename rejects an existing destination by name, so
+                // honor FSKit's `overItem` by removing it FIRST. If it's a
+                // directory, apply the same rmdir emptiness guard (ENOTEMPTY)
+                // before deleting — POSIX rename-over-a-nonempty-dir fails.
+                if let over {
+                    if over.isDirectory {
+                        let children = try await self.coreVolume.enumerate(directory: over.recordNumber)
+                        let hasRealChild = children.contains {
+                            $0.fileName.namespace != .dos && $0.name != "." && $0.name != ".."
+                        }
+                        if hasRealChild {
+                            reply(nil, self.posixError(ENOTEMPTY))
+                            return
+                        }
+                    }
+                    try await self.coreVolume.deleteFile(at: over.recordNumber)
+                    self.cacheQueue.sync { _ = self.itemCache.removeValue(forKey: over.recordNumber) }
+                }
+
+                // NTFSCore performs the move with insert-before-remove ordering
+                // (atomic, verify-clean across throws). Passing the dest parent
+                // covers both same-dir rename and cross-dir move.
+                try await self.coreVolume.rename(
+                    at: sourceRN,
+                    toName: newName,
+                    inDirectory: destParentRN
+                )
+                try? await self.coreVolume.setDirty(false)
+                reply(FSFileName(string: newName), nil)
+            } catch NTFSError.unsupportedFeature {
+                reply(nil, self.posixError(ENOTSUP))
+            } catch {
+                reply(nil, error)
+            }
+        }
     }
 
     func enumerateDirectory(
