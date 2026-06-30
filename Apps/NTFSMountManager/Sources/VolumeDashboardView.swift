@@ -14,15 +14,24 @@ struct VolumeDashboardView: View {
     @State private var actionError: String?
     @State private var busy = false
 
+    // Danger Zone state.
+    @State private var showFormatConfirm = false
+    @State private var showRepairConfirm = false
+    @State private var formatLabel: String
+
     init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService) {
         self.volume = volume
         self.extensionActive = extensionActive
         self.diskService = diskService
+        // A single loader backs both the read-only dashboard and the writable
+        // Danger Zone actions: it opens the device writable only inside
+        // runFormat/runRepair, read-only everywhere else.
         _loader = StateObject(wrappedValue: VolumeDetailLoader(
             devicePath: volume.devicePath,
             label: volume.displayName,
-            isWritable: false
+            isWritable: true
         ))
+        _formatLabel = State(initialValue: volume.displayName)
     }
 
     var body: some View {
@@ -37,6 +46,7 @@ struct VolumeDashboardView: View {
                 }
                 bento
                 infoAndHealth
+                dangerZone
             }
             .padding(Spacing.large)
             .frame(maxWidth: 980, alignment: .leading)
@@ -46,6 +56,8 @@ struct VolumeDashboardView: View {
         .task(id: volume.id) { await loader.load() }
         .animation(.easeInOut(duration: 0.25), value: loader.info)
         .animation(.easeInOut(duration: 0.25), value: loader.verify)
+        .animation(.easeInOut(duration: 0.25), value: loader.format)
+        .animation(.easeInOut(duration: 0.25), value: loader.repair)
         .animation(.easeInOut(duration: 0.2), value: actionError)
     }
 
@@ -308,7 +320,149 @@ struct VolumeDashboardView: View {
         .accessibilityLabel(message)
     }
 
+    // MARK: - Danger Zone (destructive actions)
+
+    private var dangerZone: some View {
+        VStack(alignment: .leading, spacing: Spacing.medium) {
+            HStack(alignment: .top, spacing: Spacing.medium) {
+                VStack(alignment: .leading, spacing: Spacing.unit) {
+                    Label("Danger Zone", systemImage: "exclamationmark.triangle.fill")
+                        .font(.ntfsTitle)
+                        .foregroundStyle(Color.ntfsError)
+                    Text("These operations rewrite or modify the volume. They cannot be undone.")
+                        .font(.ntfsBody)
+                        .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                HStack(spacing: Spacing.small) {
+                    Button { showRepairConfirm = true } label: {
+                        Label("Repair…", systemImage: "bandage")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(loader.repair.isLoading || loader.format.isLoading)
+                    .accessibilityLabel("Repair volume \(volume.displayName)")
+
+                    Button { showFormatConfirm = true } label: {
+                        Label("Format as NTFS…", systemImage: "trash")
+                    }
+                    .buttonStyle(DangerButtonStyle())
+                    .disabled(loader.format.isLoading || loader.repair.isLoading)
+                    .accessibilityLabel("Format \(volume.displayName) as NTFS, erasing all data")
+                }
+            }
+
+            if volume.isMounted {
+                Text("Tip: eject this volume first — Format and Repair require the device to be unmounted.")
+                    .font(.ntfsCodeCaption)
+                    .foregroundStyle(Color.ntfsOnSurfaceVariant)
+            }
+
+            dangerOutcomeView
+        }
+        .padding(Spacing.large)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.ntfsErrorContainer.opacity(0.10), in: RoundedRectangle(cornerRadius: Radius.large, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Radius.large, style: .continuous)
+                .stroke(Color.ntfsError.opacity(0.30), lineWidth: 1)
+        )
+        .overlay(alignment: .leading) {
+            // Hairline accent bar marking the zone as destructive.
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(Color.ntfsError.opacity(0.5))
+                .frame(width: 3)
+                .padding(.vertical, Spacing.medium)
+        }
+        .confirmationDialog(
+            "Erase \(volume.displayName) (\(volume.devicePath))?",
+            isPresented: $showFormatConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Erase and Format as NTFS", role: .destructive) {
+                let label = formatLabel
+                perform { await loader.runFormat(label: label) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently destroys all data on \(volume.devicePath). The volume will be reformatted as a fresh NTFS filesystem.")
+        }
+        .confirmationDialog(
+            "Repair \(volume.displayName) (\(volume.devicePath))?",
+            isPresented: $showRepairConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Run Consistency Check") {
+                perform { await loader.runRepair() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Runs a read-only consistency audit on \(volume.devicePath). If the volume is only flagged dirty, the dirty flag is cleared. Real corruption is reported but must be repaired with Windows chkdsk /F.")
+        }
+    }
+
+    @ViewBuilder
+    private var dangerOutcomeView: some View {
+        switch loader.format {
+        case .loading:
+            outcomeRow(spinner: true, text: "Formatting \(volume.devicePath)…", tone: .neutral)
+        case let .failed(message):
+            outcomeRow(text: "Format failed: \(message)", tone: .error, icon: "exclamationmark.triangle.fill")
+        case let .loaded(result):
+            outcomeRow(text: result.summary, tone: .success, icon: "checkmark.circle.fill")
+        case .idle:
+            EmptyView()
+        }
+
+        switch loader.repair {
+        case .loading:
+            outcomeRow(spinner: true, text: "Running consistency audit…", tone: .neutral)
+        case let .failed(message):
+            outcomeRow(text: "Repair failed: \(message)", tone: .error, icon: "exclamationmark.triangle.fill")
+        case let .loaded(result):
+            outcomeRow(
+                text: result.summary,
+                tone: result.isResolved ? .success : .error,
+                icon: result.isResolved ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+            )
+        case .idle:
+            EmptyView()
+        }
+    }
+
+    private func outcomeRow(spinner: Bool = false, text: String, tone: StatusTone, icon: String? = nil) -> some View {
+        HStack(alignment: .top, spacing: Spacing.small) {
+            if spinner {
+                ProgressView().scaleEffect(0.6)
+            } else if let icon {
+                Image(systemName: icon).foregroundStyle(tone.foreground)
+            }
+            Text(text)
+                .font(.ntfsBody)
+                .foregroundStyle(Color.ntfsOnSurface)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Spacing.small)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tone.foreground.opacity(0.10), in: RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
+        .transition(.opacity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
+    }
+
     // MARK: - Mount/eject
+
+    /// Generic async action runner mirroring `perform(mount:)`: clears prior
+    /// error, flips `busy`, runs the work, refreshes DiskArbitration.
+    private func perform(_ work: @escaping () async -> Void) {
+        actionError = nil
+        busy = true
+        Task {
+            await work()
+            busy = false
+            diskService.refresh()
+        }
+    }
 
     private func perform(mount: Bool) {
         actionError = nil
