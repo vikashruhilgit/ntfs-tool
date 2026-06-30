@@ -6,26 +6,28 @@ struct NTFSMountManagerApp: App {
     @StateObject private var diskService = DiskArbitrationService()
 
     var body: some Scene {
-        // Block F: real menu-bar app. The single-window installer the
-        // Block-E scaffold shipped is now reachable via "Open Settings…"
-        // for the extension activation flow; the everyday surface is the
-        // menu-bar dropdown with the list of currently-attached NTFS
-        // volumes and their mount/unmount affordances.
+        // Main dashboard window — sidebar + bento detail, the everyday surface.
+        // Declared FIRST so it is the app's primary scene: when a MenuBarExtra
+        // is primary instead, macOS doesn't give this window a standard title
+        // bar, and the NavigationSplitView sidebar's top rows render above the
+        // window's content area (clipped behind / above the traffic lights).
+        Window("NTFS", id: "main") {
+            MainWindowView(installer: installer, diskService: diskService)
+        }
+        // Size the WINDOW, not the split-view content. A min-height frame on
+        // the NavigationSplitView itself mis-anchors the sidebar list (its top
+        // rows render above the window's content area). NOTE: do NOT use
+        // .windowResizability(.contentSize) here either — it breaks the
+        // title-bar safe-area inset.
+        .defaultSize(width: 980, height: 640)
+        .defaultPosition(.center)
+
+        // Menu-bar dropdown: the quick panel with attached NTFS volumes and
+        // their mount/unmount affordances.
         MenuBarExtra("NTFS", systemImage: "externaldrive.connected.to.line.below") {
             MenuBarContent(installer: installer, diskService: diskService)
         }
         .menuBarExtraStyle(.window)
-
-        // Main dashboard window — sidebar + bento detail, the everyday surface.
-        // Present it at launch: with a MenuBarExtra as the primary scene, macOS
-        // would otherwise start the app menu-bar-only and never open this window.
-        Window("NTFS", id: "main") {
-            MainWindowView(installer: installer, diskService: diskService)
-                .frame(minWidth: 880, minHeight: 560)
-        }
-        .windowResizability(.contentSize)
-        .defaultPosition(.center)
-        .defaultLaunchBehavior(.presented)
 
         // Extension-activation settings window (kept from the prior scaffold).
         Window("NTFS Mount Manager", id: "settings") {

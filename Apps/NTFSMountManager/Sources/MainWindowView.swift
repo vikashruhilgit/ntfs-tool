@@ -72,64 +72,70 @@ struct MainWindowView: View {
     // MARK: - Sidebar
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: Spacing.medium) {
-            HStack(spacing: Spacing.small) {
-                Image(systemName: "internaldrive")
-                    .foregroundStyle(Color.ntfsPrimary)
-                Text("NTFS Utility")
-                    .font(.ntfsTitle)
-                    .foregroundStyle(Color.ntfsOnSurface)
-            }
-            .padding(.horizontal, Spacing.small)
-            .padding(.top, Spacing.small)
-
-            // Section picker.
-            VStack(alignment: .leading, spacing: Spacing.unit) {
+        // A List with .sidebar style is what gives the native title-bar inset
+        // (content sits below the close/min/max controls) and an edge-to-edge
+        // background — a custom VStack sidebar gets neither, which is what
+        // caused the traffic-light overlap and the doubled left border.
+        List {
+            Section {
                 ForEach(SidebarItem.allCases) { item in
                     sidebarButton(item)
+                        .listRowInsets(EdgeInsets(top: 1, leading: 6, bottom: 1, trailing: 6))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
                 }
+            } header: {
+                HStack(spacing: Spacing.small) {
+                    Image(systemName: "internaldrive")
+                        .foregroundStyle(Color.ntfsPrimary)
+                    Text("NTFS Utility")
+                        .font(.ntfsTitle)
+                        .foregroundStyle(Color.ntfsOnSurface)
+                }
+                .textCase(nil)
+                .padding(.vertical, Spacing.unit)
             }
 
-            Divider().overlay(Color.ntfsOutline.opacity(0.25))
-
-            // Volume list within the chosen section.
             if section != .settings {
-                if filteredVolumes.isEmpty {
-                    Text("No volumes")
-                        .font(.ntfsBody)
-                        .foregroundStyle(Color.ntfsOnSurfaceVariant)
-                        .padding(.horizontal, Spacing.small)
-                } else {
-                    ScrollView {
-                        VStack(spacing: Spacing.unit) {
-                            ForEach(filteredVolumes) { volume in
-                                Button {
-                                    selectedVolumeID = volume.id
-                                } label: {
-                                    VolumeRow(
-                                        model: volume.rowModel(extensionActive: extensionActive),
-                                        isSelected: volume.id == selectedVolumeID
-                                    )
-                                }
-                                .buttonStyle(.plain)
+                Section {
+                    if filteredVolumes.isEmpty {
+                        Text("No volumes")
+                            .font(.ntfsBody)
+                            .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+                    } else {
+                        ForEach(filteredVolumes) { volume in
+                            Button {
+                                selectedVolumeID = volume.id
+                            } label: {
+                                VolumeRow(
+                                    model: volume.rowModel(extensionActive: extensionActive),
+                                    isSelected: volume.id == selectedVolumeID
+                                )
                             }
+                            .buttonStyle(.plain)
+                            .listRowInsets(EdgeInsets(top: 1, leading: 6, bottom: 1, trailing: 6))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
                         }
                     }
                 }
             }
-
-            Spacer()
-
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(Color.ntfsContainerLow)
+        .safeAreaInset(edge: .bottom) {
             StatusBadge(
                 "Extension: \(installer.shortStatus)",
                 tone: extensionActive ? .success : .neutral
             )
-            .padding(.horizontal, Spacing.small)
-            .padding(.bottom, Spacing.small)
+            .padding(.horizontal, Spacing.medium)
+            .padding(.vertical, Spacing.small)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.ntfsContainerLow)
         }
-        .padding(Spacing.small)
-        .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color.ntfsContainerLow)
     }
 
     private func sidebarButton(_ item: SidebarItem) -> some View {
