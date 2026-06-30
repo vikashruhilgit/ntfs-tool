@@ -40,24 +40,34 @@ public final class VolumeDetailLoader: ObservableObject {
 
     @Published public private(set) var info: LoadState<VolumeInfoViewModel> = .idle
     @Published public private(set) var verify: LoadState<VerifyResult> = .idle
+    @Published public private(set) var format: LoadState<FormatResult> = .idle
+    @Published public private(set) var repair: LoadState<RepairResult> = .idle
 
     /// Injection seam so unit tests can drive the state machine without a real
     /// device. Production leaves these `nil` and the real NTFSCore path runs.
     private let factsProvider: (@Sendable () async throws -> VolumeFacts)?
     private let verifyProvider: (@Sendable () async throws -> VerifyResult)?
+    /// Receives the requested label; returns the format outcome. Tests inject a
+    /// closure that never touches a real device.
+    private let formatProvider: (@Sendable (String) async throws -> FormatResult)?
+    private let repairProvider: (@Sendable () async throws -> RepairResult)?
 
     public init(
         devicePath: String,
         label: String,
         isWritable: Bool,
         factsProvider: (@Sendable () async throws -> VolumeFacts)? = nil,
-        verifyProvider: (@Sendable () async throws -> VerifyResult)? = nil
+        verifyProvider: (@Sendable () async throws -> VerifyResult)? = nil,
+        formatProvider: (@Sendable (String) async throws -> FormatResult)? = nil,
+        repairProvider: (@Sendable () async throws -> RepairResult)? = nil
     ) {
         self.devicePath = devicePath
         self.label = label
         self.isWritable = isWritable
         self.factsProvider = factsProvider
         self.verifyProvider = verifyProvider
+        self.formatProvider = formatProvider
+        self.repairProvider = repairProvider
     }
 
     /// Load volume facts via NTFSCore and map to the display view-model.
@@ -89,6 +99,50 @@ public final class VolumeDetailLoader: ObservableObject {
             verify = .loaded(result)
         } catch {
             verify = .failed(Self.message(for: error))
+        }
+    }
+
+    /// Format the device as NTFS via `NTFSCore.Volume.formatNTFS`. DESTRUCTIVE —
+    /// callers must gate this behind a confirmation dialog naming the device.
+    /// The device must be unmounted; the loader opens it writable, formats,
+    /// flushes, and releases the advisory lock.
+    public func runFormat(label requestedLabel: String) async {
+        format = .loading
+        do {
+            let result: FormatResult
+            if let provider = formatProvider {
+                result = try await provider(requestedLabel)
+            } else {
+                result = try await Self.performFormat(devicePath: devicePath, label: requestedLabel)
+            }
+            format = .loaded(result)
+            // The on-disk state changed: re-read facts so the dashboard reflects
+            // the fresh, empty volume.
+            await load()
+        } catch {
+            format = .failed(Self.message(for: error))
+        }
+    }
+
+    /// Run the HONEST repair path: a consistency audit plus a dirty-bit check.
+    /// If the volume is merely dirty but the audit is clean, clear the dirty
+    /// flag. If the audit finds real corruption, report it and advise Windows
+    /// `chkdsk /F` — NTFSCore has no in-place repair and we never claim to fix
+    /// corruption.
+    public func runRepair() async {
+        repair = .loading
+        do {
+            let result: RepairResult
+            if let provider = repairProvider {
+                result = try await provider()
+            } else {
+                result = try await Self.performRepair(devicePath: devicePath)
+            }
+            repair = .loaded(result)
+            // Dirty bit may have been cleared: refresh facts + verify view.
+            await load()
+        } catch {
+            repair = .failed(Self.message(for: error))
         }
     }
 
@@ -131,6 +185,55 @@ public final class VolumeDetailLoader: ObservableObject {
             problems.append("Volume was last modified by chkdsk.")
         }
         return VerifyResult(isClean: !dirty, problems: problems)
+    }
+
+    /// Open the device writable, format it as NTFS, flush, and release the lock.
+    /// DESTRUCTIVE. Device must be unmounted.
+    nonisolated static func performFormat(devicePath: String, label: String) async throws -> FormatResult {
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: devicePath, lockExclusive: true)
+        let size = try await device.size()
+        try await Volume.formatNTFS(device: device, deviceSizeBytes: size, label: label, quick: true)
+        try await device.synchronize()
+        await device.releaseAdvisoryLock()
+        return FormatResult(label: label, devicePath: devicePath)
+    }
+
+    /// Honest repair: audit + dirty check. Clears the dirty bit only when the
+    /// audit is clean; otherwise reports problems without modifying the volume.
+    nonisolated static func performRepair(devicePath: String) async throws -> RepairResult {
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: devicePath, lockExclusive: true)
+        let volume = try await Volume(device: device)
+        let dirty = try await volume.isDirty()
+        let audit = try await volume.auditAllDataRunlistsAgainstBitmap(maxRecords: 0)
+
+        var problems: [String] = []
+        if audit.freeButReferencedClusters > 0 {
+            problems.append("\(audit.freeButReferencedClusters) cluster(s) are referenced by a file but marked free in $Bitmap.")
+        }
+        if audit.outOfRangeClusters > 0 {
+            problems.append("\(audit.outOfRangeClusters) cluster reference(s) point outside the volume.")
+        }
+        if audit.doubleAllocatedClusters > 0 {
+            problems.append("\(audit.doubleAllocatedClusters) cluster(s) are claimed by more than one file.")
+        }
+        if !audit.unreadableRecords.isEmpty {
+            problems.append("\(audit.unreadableRecords.count) MFT record(s) could not be read.")
+        }
+
+        let result: RepairResult
+        if !audit.isClean {
+            // Real corruption — do NOT touch the volume; advise chkdsk.
+            result = RepairResult(outcome: .problemsFound, problems: problems)
+        } else if dirty {
+            // Clean structure but flagged dirty: safe to clear the flag.
+            try await volume.setDirty(false)
+            try await device.synchronize()
+            result = RepairResult(outcome: .clearedDirty, problems: [])
+        } else {
+            result = RepairResult(outcome: .clean, problems: [])
+        }
+        await device.releaseAdvisoryLock()
+        return result
     }
 
     /// Map any thrown error (including NTFSCore + POSIX permission/IO) to a clear

@@ -57,3 +57,76 @@ public struct VerifyResult: Equatable, Sendable {
         return problems.joined(separator: "\n")
     }
 }
+
+/// Result of a "Format as NTFS" action. The format path lives entirely in
+/// `NTFSCore.Volume.formatNTFS`; this value type just carries the outcome the
+/// GUI surfaces afterward.
+public struct FormatResult: Equatable, Sendable {
+    /// The freshly applied volume label.
+    public let label: String
+    /// BSD device path that was reformatted.
+    public let devicePath: String
+    public let completedAt: Date
+
+    public init(label: String, devicePath: String, completedAt: Date = Date()) {
+        self.label = label
+        self.devicePath = devicePath
+        self.completedAt = completedAt
+    }
+
+    public var summary: String {
+        let name = label.isEmpty ? "(no label)" : label
+        return "Formatted \(devicePath) as NTFS (\(name)). It can now be mounted read-write."
+    }
+}
+
+/// Outcome category for the honest "Repair" action. NTFSCore has NO in-place
+/// repair: it can detect dirtiness, run a consistency audit, and clear the
+/// dirty bit. Real on-disk corruption is reported and the user is advised to
+/// run Windows `chkdsk /F` — we never claim to have fixed corruption.
+public enum RepairOutcome: Equatable, Sendable {
+    /// Audit clean and not dirty — nothing to do.
+    case clean
+    /// Was dirty with a clean audit; we cleared the `$Volume` dirty flag.
+    case clearedDirty
+    /// Audit found structural problems. We did NOT modify the volume.
+    case problemsFound
+}
+
+/// Result of a "Repair" action — the audit verdict plus any problems found.
+public struct RepairResult: Equatable, Sendable {
+    public let outcome: RepairOutcome
+    public let problems: [String]
+    public let completedAt: Date
+
+    public init(outcome: RepairOutcome, problems: [String], completedAt: Date = Date()) {
+        self.outcome = outcome
+        self.problems = problems
+        self.completedAt = completedAt
+    }
+
+    /// True when the action found nothing wrong or successfully cleared the
+    /// dirty bit — i.e. the volume is now in a good state.
+    public var isResolved: Bool {
+        switch outcome {
+        case .clean, .clearedDirty: return true
+        case .problemsFound: return false
+        }
+    }
+
+    public var headline: String {
+        switch outcome {
+        case .clean:
+            return "No problems found — volume is clean."
+        case .clearedDirty:
+            return "Cleared the dirty flag — the consistency audit was clean."
+        case .problemsFound:
+            return "Consistency problems found — run Windows chkdsk /F to repair."
+        }
+    }
+
+    public var summary: String {
+        if problems.isEmpty { return headline }
+        return ([headline] + problems).joined(separator: "\n")
+    }
+}
