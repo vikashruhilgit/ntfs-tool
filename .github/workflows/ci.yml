@@ -45,6 +45,11 @@ jobs:
       - name: swift test
         run: swift test
 
+  # Packaging coverage (rubric 2 in docs/PACKAGING.md): this job builds BOTH the
+  # NTFSMountManager (app) and NTFSFileSystem (system extension) schemes on
+  # macos-15, ad-hoc signed. Building the app scheme also embeds the extension
+  # (project.yml: embed: true) — the same path scripts/package.sh exercises
+  # locally. Notarization is NOT run here (needs a paid Apple account).
   fskit-extension-build:
     name: FSKit extension + containing app (xcodebuild)
     runs-on: macos-15

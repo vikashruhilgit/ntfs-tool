@@ -187,6 +187,30 @@ xcodegen generate
 xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager build
 ```
 
+## Build & install the app
+
+One command produces a runnable `NTFSMountManager.app` with the FSKit system
+extension embedded inside it:
+
+```bash
+./scripts/package.sh --release      # → dist/NTFSMountManager.app (ad-hoc signed)
+./scripts/package.sh --release --zip # also writes dist/NTFSMountManager.zip
+```
+
+The script runs `xcodegen generate`, builds the app (which builds and embeds the
+`NTFSFileSystem.systemextension`), stages it into `dist/`, and verifies the
+extension is embedded. The default build is **ad-hoc signed** — it runs locally,
+but to *activate* the system extension you need free personal-use signing plus
+`systemextensionsctl developer on`.
+
+Full free-signing path, clean-machine activation walkthrough, and the
+notarization procedure for off-machine distribution:
+**[`docs/PACKAGING.md`](docs/PACKAGING.md)**.
+
+> CI builds both the `NTFSMountManager` and `NTFSFileSystem` Xcode schemes on
+> `macos-15` (ad-hoc). Notarization is documented but not run in CI — it needs a
+> paid Apple Developer account.
+
 ## Status
 
 | Layer | Status |

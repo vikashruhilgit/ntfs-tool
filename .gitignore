@@ -25,6 +25,9 @@ build/
 *.app
 *.dSYM
 
+# Local packaging output (scripts/package.sh) — never commit built artifacts
+dist/
+
 # Test fixtures larger than 1 MB should use Git LFS
 # Tests/NTFSCoreTests/Fixtures/*.img  (uncomment once LFS is configured)
 
