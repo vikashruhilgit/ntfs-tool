@@ -41,6 +41,7 @@
 		BBB98DE04B189933E57E523D /* Cat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */; };
 		C1F50E65FD4AB246BAC40911 /* Scan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 448EA9B837A137CDD562E07C /* Scan.swift */; };
 		CFB3B74CC0B795207981A6FC /* NTFSFileSystemExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */; };
+		D871A1A5B1DD000B9E3E7D18 /* FirstRunSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */; };
 		DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D92594B427E2C9D518EF55B /* MainWindowView.swift */; };
 		E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */; };
 		EF91959587345A62A4C6F9C7 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = 5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */; };
@@ -104,6 +105,7 @@
 		8FFA3E28642F4967D00BBD28 /* Create.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Create.swift; sourceTree = "<group>"; };
 		9C014D4357F452F985A593B1 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
 		9D92594B427E2C9D518EF55B /* MainWindowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowView.swift; sourceTree = "<group>"; };
+		B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstRunSheet.swift; sourceTree = "<group>"; };
 		C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSVolume.swift; sourceTree = "<group>"; };
 		D05B381FF347C123E61FD621 /* ntfsctl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ntfsctl.swift; sourceTree = "<group>"; };
 		D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSFileSystemExtension.swift; sourceTree = "<group>"; };
@@ -166,6 +168,7 @@
 				5684F8D00837370737BB2555 /* ContentView.swift */,
 				73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */,
 				00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */,
+				B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */,
 				9D92594B427E2C9D518EF55B /* MainWindowView.swift */,
 				138AC53F11BB4630926D3661 /* MenuBarContent.swift */,
 				8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */,
@@ -439,6 +442,7 @@
 				92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */,
 				B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */,
 				E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */,
+				D871A1A5B1DD000B9E3E7D18 /* FirstRunSheet.swift in Sources */,
 				DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */,
 				4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */,
 				54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */,

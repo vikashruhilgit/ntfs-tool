@@ -29,6 +29,10 @@ struct MainWindowView: View {
     @State private var section: SidebarItem = .all
     @State private var selectedVolumeID: String?
 
+    /// First-run onboarding gate — shows the read-write flow sheet once.
+    @AppStorage("hasSeenReadWriteOnboarding") private var hasSeenOnboarding = false
+    @State private var showOnboarding = false
+
     private var extensionActive: Bool { installer.shortStatus == "activated" }
 
     private var filteredVolumes: [DiskArbitrationService.Volume] {
@@ -51,11 +55,17 @@ struct MainWindowView: View {
             detail
         }
         .background(Color.ntfsSurface)
-        .onAppear { diskService.refresh() }
+        .onAppear {
+            diskService.refresh()
+            if !hasSeenOnboarding { showOnboarding = true }
+        }
         .onChange(of: filteredVolumes.map(\.id)) { _, ids in
             if selectedVolumeID == nil || !(ids.contains(selectedVolumeID ?? "")) {
                 selectedVolumeID = ids.first
             }
+        }
+        .sheet(isPresented: $showOnboarding, onDismiss: { hasSeenOnboarding = true }) {
+            FirstRunSheet(isPresented: $showOnboarding)
         }
     }
 
