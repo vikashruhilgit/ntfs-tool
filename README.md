@@ -124,6 +124,38 @@ try await volume.endWriteSession()
 
 The FSKit extension is code-complete but Apple's runtime requires either SIP-off + developer mode (free, ~15 min, fully reversible) or the Apple Developer Program FSKit entitlement ($99/yr, 2-14 day wait). Procedure in [`docs/STATUS.md`](docs/STATUS.md#1-fskit-mount-validation-on-the-m4-high-value).
 
+## Read-write flow (menu-bar app)
+
+End to end, writing NTFS in Finder via the menu-bar app + FSKit extension:
+
+1. **Activate the extension** — launch **NTFS Mount Manager**. On first run it
+   shows a short onboarding sheet describing this flow. Approve the system
+   extension once in System Settings (or `systemextensionsctl developer on` for
+   free personal signing).
+2. **Plug in an NTFS volume** — it appears in the sidebar and mounts read-write
+   through the extension.
+3. **Write in Finder** — copy, rename, and delete files directly in Finder, just
+   like a native disk. Changes are written straight to the NTFS volume.
+4. **Eject safely** — always eject (sidebar **Eject**, or Finder) before
+   unplugging so pending writes flush and the volume stays clean for Windows.
+
+### Format & Repair (Danger Zone)
+
+Each volume's dashboard has a visually separated **Danger Zone**:
+
+- **Format as NTFS…** — reformats the (unmounted) device as a fresh NTFS
+  filesystem via `NTFSCore.Volume.formatNTFS`. Gated by a confirmation dialog
+  that names the target device. Destroys all data.
+- **Repair…** — runs `NTFSCore`'s consistency audit
+  (`auditAllDataRunlistsAgainstBitmap`) plus a `$Volume` dirty-flag check. If the
+  volume is only flagged *dirty* (clean audit), it clears the dirty flag. **There
+  is no in-place corruption repair** — if the audit finds real structural damage,
+  it is reported and you are advised to run Windows `chkdsk /F`. We never claim to
+  fix corruption we cannot.
+
+See [`docs/REPAIR.md`](docs/REPAIR.md) for the manual write-validation and repair
+smoke procedures.
+
 ## Repo layout
 
 ```
@@ -162,7 +194,7 @@ xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager build
 | `ntfsctl` read commands (`info`, `scan`, `list`, `cat`, `verify`, `dump`) | Production-ready |
 | `ntfsctl` write commands (`cp` (+`--move`), `write`, `rm`, `mv`, `create`, `delete`, `truncate`) | Production-ready; validated by a full **22,419-file / 39.6 GiB** single-tree copy on a real 4 TB WD drive (`verify --deep` clean). No known per-directory capacity cap — bounded only by free clusters + MFT slots. |
 | `ntfsctl` volume admin (`reclaim-orphans`, `setdirty`) | Production-ready |
-| NTFS formatting | **Not provided** — format on Windows / `mkntfs-3g`; `ntfsctl` operates on existing volumes (prototype formatter removed — see [`docs/STATUS.md`](docs/STATUS.md)) |
+| NTFS formatting | `NTFSCore.Volume.formatNTFS` — surfaced in the app's Danger Zone (**Format as NTFS**). Validated by the in-repo oracle (`MkntfsTests` asserts `auditAllDataRunlistsAgainstBitmap().isClean`) and `scripts/format-oracle.sh` against real `ntfs-3g`. |
 | `NTFSCore` library | Production-ready (226 tests, full 22,419-file copy validated on a real 4 TB WD drive) |
 | FSKit extension build | Builds clean |
 | FSKit mount in Finder | Needs SIP-off / entitlement to validate |
