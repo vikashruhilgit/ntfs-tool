@@ -17,12 +17,15 @@ struct NTFSMountManagerApp: App {
         .menuBarExtraStyle(.window)
 
         // Main dashboard window — sidebar + bento detail, the everyday surface.
+        // Present it at launch: with a MenuBarExtra as the primary scene, macOS
+        // would otherwise start the app menu-bar-only and never open this window.
         Window("NTFS", id: "main") {
             MainWindowView(installer: installer, diskService: diskService)
                 .frame(minWidth: 880, minHeight: 560)
         }
         .windowResizability(.contentSize)
         .defaultPosition(.center)
+        .defaultLaunchBehavior(.presented)
 
         // Extension-activation settings window (kept from the prior scaffold).
         Window("NTFS Mount Manager", id: "settings") {
