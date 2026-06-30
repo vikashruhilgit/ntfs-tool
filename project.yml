@@ -34,6 +34,8 @@ settings:
 packages:
   NTFSCore:
     path: Packages/NTFSCore
+  NTFSUIKit:
+    path: Packages/NTFSUIKit
   SwiftArgumentParser:
     url: https://github.com/apple/swift-argument-parser.git
     from: "1.3.0"
@@ -62,6 +64,8 @@ targets:
     dependencies:
       - package: NTFSCore
         product: NTFSCore
+      - package: NTFSUIKit
+        product: NTFSUIKit
       - target: NTFSFileSystem
         embed: true
         codeSign: true
