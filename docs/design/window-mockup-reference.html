@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<!--
+  NTFS Mount Manager — full-window dashboard VISUAL REFERENCE.
+
+  This is a design-language reference for the SwiftUI build, NOT a literal spec.
+  Adopt: the dark Material-3 theme + color tokens, the sidebar + bento dashboard
+  layout, spacing/typography scale, status badges, drive-health panel, and the
+  destructive-actions zone.
+
+  TRIM when porting to SwiftUI (decided 2026-06-30):
+    - Replace the WebGL shader storage ring with a native SwiftUI ring
+      (Gauge / Circle.trim) — same look, animates natively.
+    - Use SF Symbols (not Material Symbols) and SF Pro / SF Mono (not Inter /
+      JetBrains Mono). Keep the colors, layout, and spacing.
+    - DROP features with no real NTFS data source: S.M.A.R.T., "Recent",
+      "Activity", "Add Volume", the fake version string, and the mobile/
+      responsive nav. macOS desktop only.
+    - "Drive Health" panel shows ONLY truthful data: overall status (clean/dirty
+      from $Volume flags), permissions (read-only / read-write from the mount),
+      and last-verified time. No SMART row.
+
+  See .supervisor/requirements/auto-2026-06-28-214920-ntfs-ui-and-write-through.md
+  (Design principles + Block M) for the authoritative requirement.
+-->
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>NTFS Mount Manager - Mounted</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "secondary-fixed-dim": "#c8c6c5",
+                        "outline": "#8b91a0",
+                        "on-primary-fixed": "#001b3e",
+                        "tertiary-container": "#929090",
+                        "on-tertiary-fixed-variant": "#474746",
+                        "inverse-primary": "#005db8",
+                        "on-tertiary-fixed": "#1b1b1c",
+                        "secondary-container": "#474746",
+                        "on-secondary-fixed": "#1b1c1c",
+                        "primary": "#aac7ff",
+                        "secondary-fixed": "#e4e2e1",
+                        "on-primary": "#003064",
+                        "outline-variant": "#414754",
+                        "on-error-container": "#ffdad6",
+                        "surface": "#131313",
+                        "error": "#ffb4ab",
+                        "on-tertiary": "#303030",
+                        "on-secondary-fixed-variant": "#474746",
+                        "surface-tint": "#aac7ff",
+                        "on-primary-container": "#002957",
+                        "on-error": "#690005",
+                        "surface-bright": "#393939",
+                        "surface-container": "#201f1f",
+                        "on-surface-variant": "#c0c6d6",
+                        "on-primary-fixed-variant": "#00468d",
+                        "primary-container": "#3e90ff",
+                        "surface-container-low": "#1c1b1b",
+                        "primary-fixed": "#d6e3ff",
+                        "on-secondary-container": "#b6b5b4",
+                        "on-surface": "#e5e2e1",
+                        "surface-dim": "#131313",
+                        "on-background": "#e5e2e1",
+                        "error-container": "#93000a",
+                        "inverse-surface": "#e5e2e1",
+                        "surface-variant": "#353534",
+                        "on-secondary": "#303030",
+                        "surface-container-high": "#2a2a2a",
+                        "surface-container-highest": "#353534",
+                        "surface-container-lowest": "#0e0e0e",
+                        "tertiary": "#c8c6c5",
+                        "on-tertiary-container": "#2a2a2a",
+                        "tertiary-fixed-dim": "#c8c6c5",
+                        "primary-fixed-dim": "#aac7ff",
+                        "secondary": "#c8c6c5",
+                        "inverse-on-surface": "#313030",
+                        "tertiary-fixed": "#e5e2e1",
+                        "background": "#131313"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px",
+                        "2xl": "24px"
+                    },
+                    "spacing": {
+                        "stack-lg": "32px",
+                        "container-padding": "24px",
+                        "stack-sm": "8px",
+                        "unit": "4px",
+                        "gutter": "16px",
+                        "stack-md": "16px"
+                    },
+                    "fontFamily": {
+                        "title-sm": ["Inter"],
+                        "display-lg": ["Inter"],
+                        "body-sm": ["Inter"],
+                        "label-caps": ["Inter"],
+                        "headline-md": ["Inter"],
+                        "code-md": ["JetBrains Mono"],
+                        "body-md": ["Inter"]
+                    },
+                    "fontSize": {
+                        "title-sm": ["16px", { "lineHeight": "24px", "fontWeight": "500" }],
+                        "display-lg": ["32px", { "lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "600" }],
+                        "body-sm": ["13px", { "lineHeight": "18px", "fontWeight": "400" }],
+                        "label-caps": ["11px", { "lineHeight": "16px", "letterSpacing": "0.05em", "fontWeight": "600" }],
+                        "headline-md": ["20px", { "lineHeight": "28px", "letterSpacing": "-0.01em", "fontWeight": "600" }],
+                        "code-md": ["13px", { "lineHeight": "20px", "fontWeight": "450" }],
+                        "body-md": ["14px", { "lineHeight": "20px", "fontWeight": "400" }]
+                    }
+                },
+            },
+        }
+    </script>
+<style>
+        body { background-color: #151515; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #353534; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #474746; }
+        .ambient-shadow {
+            box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+        }
+        .card-inner {
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+        }
+    </style>
+</head>
+<body class="text-on-background font-body-md h-screen overflow-hidden flex flex-col md:flex-row">
+<header class="md:hidden flex justify-between items-center w-full px-container-padding py-stack-sm bg-surface-dim/80 backdrop-blur-xl border-b border-outline-variant/30 shadow-sm z-50">
+<div class="flex items-center gap-unit">
+<span class="material-symbols-outlined text-primary font-bold text-headline-md">storage</span>
+<span class="font-headline-md text-headline-md font-bold text-on-surface">NTFS Mount Manager</span>
+</div>
+<div class="flex items-center gap-stack-md text-on-surface-variant">
+<span class="material-symbols-outlined hover:bg-surface-bright/10 transition-colors p-unit rounded-full cursor-pointer">refresh</span>
+<span class="material-symbols-outlined hover:bg-surface-bright/10 transition-colors p-unit rounded-full cursor-pointer">settings</span>
+<span class="bg-primary/20 text-primary px-3 py-1 rounded-full text-xs font-semibold border border-primary/30 flex items-center gap-1">
+<span class="w-2 h-2 rounded-full bg-primary animate-pulse"></span>
+                Extension Active
+            </span>
+</div>
+</header>
+<nav class="hidden md:flex flex-col h-full p-gutter bg-surface-container-low/95 backdrop-blur-2xl border-r border-outline-variant/20 fixed h-full left-0 w-64 z-40">
+<div class="mb-stack-lg px-2 pt-2">
+<div class="flex items-center gap-3 mb-2">
+<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-primary-container to-primary flex items-center justify-center text-on-primary font-bold">
+<span class="material-symbols-outlined text-sm">hard_drive_2</span>
+</div>
+<div>
+<h1 class="font-headline-md text-title-sm font-extrabold text-on-surface tracking-tight">NTFS Utility</h1>
+<p class="text-xs text-on-surface-variant/70">v2.4.0 Stable</p>
+</div>
+</div>
+</div>
+<div class="flex-1 space-y-1">
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/50 transition-all group" href="#">
+<span class="material-symbols-outlined text-lg group-hover:scale-110 transition-transform">storage</span>
+<span class="font-title-sm text-sm">All Volumes</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg bg-primary/15 text-primary font-bold transition-all transform scale-[0.98]" href="#">
+<span class="material-symbols-outlined text-lg">check_circle</span>
+<span class="font-title-sm text-sm">Mounted</span>
+<span class="ml-auto w-1.5 h-1.5 rounded-full bg-primary"></span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/50 transition-all group" href="#">
+<span class="material-symbols-outlined text-lg group-hover:scale-110 transition-transform">error_outline</span>
+<span class="font-title-sm text-sm">Unmounted</span>
+</a>
+<div class="my-4 border-t border-outline-variant/20"></div>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/50 transition-all group" href="#">
+<span class="material-symbols-outlined text-lg group-hover:scale-110 transition-transform">history</span>
+<span class="font-title-sm text-sm">Recent</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/50 transition-all group" href="#">
+<span class="material-symbols-outlined text-lg group-hover:scale-110 transition-transform">analytics</span>
+<span class="font-title-sm text-sm">Activity</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-2 rounded-lg text-on-surface-variant hover:text-on-surface hover:bg-surface-variant/50 transition-all group" href="#">
+<span class="material-symbols-outlined text-lg group-hover:scale-110 transition-transform">settings</span>
+<span class="font-title-sm text-sm">Settings</span>
+</a>
+</div>
+<div class="mt-auto space-y-4">
+<button class="w-full py-2 px-4 bg-[#0A84FF] hover:bg-blue-500 text-white rounded-lg font-title-sm text-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.2)] transition-all active:scale-95 flex justify-center items-center gap-2">
+<span class="material-symbols-outlined text-sm">add</span> Add Volume
+            </button>
+<div class="flex justify-around pt-4 border-t border-outline-variant/20 text-on-surface-variant">
+<a class="hover:text-on-surface transition-colors p-2" href="#" title="Support"><span class="material-symbols-outlined">help_outline</span></a>
+<a class="hover:text-on-surface transition-colors p-2" href="#" title="Logs"><span class="material-symbols-outlined">description</span></a>
+</div>
+</div>
+</nav>
+<main class="flex-1 md:ml-64 h-full overflow-y-auto bg-surface relative">
+<div class="absolute top-0 left-0 right-0 h-64 bg-gradient-to-b from-primary/5 to-transparent pointer-events-none"></div>
+<div class="p-container-padding max-w-6xl mx-auto space-y-stack-md pt-8 md:pt-container-padding relative z-10">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+<div class="flex items-center gap-4">
+<div class="w-16 h-16 rounded-2xl bg-surface-container border border-white/10 flex items-center justify-center text-primary shadow-inner">
+<span class="material-symbols-outlined text-4xl" style="font-variation-settings: 'FILL' 1;">usb</span>
+</div>
+<div>
+<div class="flex items-center gap-3">
+<h2 class="font-display-lg text-on-surface">SANDISK</h2>
+<span class="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-semibold flex items-center gap-1.5">
+<span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Mounted
+                            </span>
+</div>
+<div class="text-sm font-code-md text-on-surface-variant/80 mt-1 flex items-center gap-2">
+<span>NTFS</span> <span class="text-outline-variant">•</span>
+<span>/Volumes/SANDISK</span> <span class="text-outline-variant">•</span>
+<span>/dev/disk6s1</span>
+</div>
+</div>
+</div>
+<div class="flex flex-wrap gap-2 w-full md:w-auto">
+<button class="flex-1 md:flex-none px-6 py-2.5 bg-surface-container border border-white/10 hover:border-white/20 hover:bg-surface-bright rounded-full text-on-surface font-title-sm text-sm transition-all active:scale-95 flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-sm">search</span> Reveal
+                    </button>
+<button class="flex-1 md:flex-none px-6 py-2.5 bg-surface-container border border-white/10 hover:border-white/20 hover:bg-surface-bright rounded-full text-on-surface font-title-sm text-sm transition-all active:scale-95 flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-sm">build</span> Verify
+                    </button>
+<button class="flex-1 md:flex-none px-8 py-2.5 bg-[#0A84FF] hover:bg-blue-500 text-white rounded-full font-title-sm text-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_4px_12px_rgba(10,132,255,0.3)] transition-all active:scale-95 flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-sm">eject</span> Unmount
+                    </button>
+</div>
+</div>
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-stack-md">
+<div class="lg:col-span-2 bg-[#1F1F1F] rounded-2xl border border-white/10 p-6 ambient-shadow relative overflow-hidden flex flex-col md:flex-row items-center gap-8">
+<div class="w-48 h-48 relative flex-shrink-0 flex items-center justify-center rounded-full border-8 border-[#0A84FF]/60">
+<div class="flex items-center justify-center flex-col">
+<span class="text-3xl font-display-lg text-white">61.6<span class="text-lg text-on-surface-variant">%</span></span>
+<span class="text-xs font-label-caps text-on-surface-variant mt-1">USED</span>
+</div>
+</div>
+<div class="flex-1 w-full grid grid-cols-2 gap-4">
+<div class="bg-surface-container-low rounded-xl p-4 card-inner">
+<div class="flex items-center gap-2 text-on-surface-variant mb-2">
+<span class="material-symbols-outlined text-sm">hard_drive</span>
+<span class="text-xs font-title-sm">Capacity</span>
+</div>
+<div class="font-headline-md text-on-surface">100 GB</div>
+</div>
+<div class="bg-surface-container-low rounded-xl p-4 card-inner">
+<div class="flex items-center gap-2 text-on-surface-variant mb-2">
+<span class="material-symbols-outlined text-sm text-primary">data_usage</span>
+<span class="text-xs font-title-sm text-primary">Used</span>
+</div>
+<div class="font-headline-md text-on-surface">61.6 GB</div>
+</div>
+<div class="bg-surface-container-low rounded-xl p-4 card-inner">
+<div class="flex items-center gap-2 text-on-surface-variant mb-2">
+<span class="material-symbols-outlined text-sm">check_circle</span>
+<span class="text-xs font-title-sm">Free Space</span>
+</div>
+<div class="font-headline-md text-on-surface">38.4 GB</div>
+</div>
+<div class="bg-surface-container-low rounded-xl p-4 card-inner">
+<div class="flex items-center gap-2 text-on-surface-variant mb-2">
+<span class="material-symbols-outlined text-sm">grid_on</span>
+<span class="text-xs font-title-sm">Cluster Size</span>
+</div>
+<div class="font-headline-md text-on-surface">4 KB</div>
+</div>
+</div>
+</div>
+<div class="flex flex-col gap-stack-md">
+<div class="bg-[#1F1F1F] rounded-2xl border border-white/10 p-5 ambient-shadow flex-1">
+<h3 class="font-title-sm text-on-surface mb-4 flex items-center justify-between">
+                            Drive Health
+                            <span class="material-symbols-outlined text-emerald-400 text-lg" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</h3>
+<div class="space-y-3">
+<div class="flex justify-between items-center py-2 border-b border-white/5">
+<span class="text-sm text-on-surface-variant">Overall Status</span>
+<span class="text-sm font-semibold text-emerald-400">Clean</span>
+</div>
+<div class="flex justify-between items-center py-2 border-b border-white/5">
+<span class="text-sm text-on-surface-variant">Permissions</span>
+<span class="text-sm text-on-surface font-code-md">Read/Write</span>
+</div>
+<div class="flex justify-between items-center py-2">
+<span class="text-sm text-on-surface-variant">Last Checked</span>
+<span class="text-xs text-on-surface-variant">Today, 10:42 AM</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="mt-8 border border-error-container/30 bg-error-container/5 rounded-2xl p-6 relative overflow-hidden">
+<div class="absolute top-0 left-0 w-1 h-full bg-error/50"></div>
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+<div>
+<h3 class="font-title-sm text-error flex items-center gap-2 mb-1">
+<span class="material-symbols-outlined text-sm">warning</span> Destructive Actions
+                        </h3>
+<p class="text-sm text-on-surface-variant">These operations will erase or rewrite the volume data permanently.</p>
+</div>
+<div class="flex gap-3 w-full md:w-auto">
+<button class="flex-1 md:flex-none px-4 py-2 bg-surface-container border border-error/20 hover:border-error/50 text-on-surface rounded-lg font-title-sm text-sm transition-colors flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-sm">healing</span> Repair
+                        </button>
+<button class="flex-1 md:flex-none px-4 py-2 bg-error/10 border border-error/30 hover:bg-error hover:text-on-error text-error rounded-lg font-title-sm text-sm transition-colors flex items-center justify-center gap-2 group">
+<span class="material-symbols-outlined text-sm group-hover:text-on-error">delete_forever</span> Format as NTFS
+                        </button>
+</div>
+</div>
+</div>
+</div>
+</main>
+</body></html>

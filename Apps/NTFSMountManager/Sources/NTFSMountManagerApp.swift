@@ -16,6 +16,15 @@ struct NTFSMountManagerApp: App {
         }
         .menuBarExtraStyle(.window)
 
+        // Main dashboard window — sidebar + bento detail, the everyday surface.
+        Window("NTFS", id: "main") {
+            MainWindowView(installer: installer, diskService: diskService)
+                .frame(minWidth: 880, minHeight: 560)
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+
+        // Extension-activation settings window (kept from the prior scaffold).
         Window("NTFS Mount Manager", id: "settings") {
             ContentView(installer: installer)
                 .frame(minWidth: 440, minHeight: 280)
