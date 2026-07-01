@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import NTFSUIKit
 
@@ -20,6 +21,10 @@ struct VolumeDashboardView: View {
     @State private var showFormatConfirm = false
     @State private var showRepairConfirm = false
     @State private var formatLabel: String
+
+    // Admin-access (privileged helper) prompt state.
+    @State private var helperBusy = false
+    @State private var helperNote: String?
 
     init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService, helper: PrivilegedHelperClient) {
         self.volume = volume
@@ -340,15 +345,85 @@ struct VolumeDashboardView: View {
         }
     }
 
-    /// A single subtle line explaining why the NTFS-internal facts are missing —
-    /// shown instead of scary error text when the volume is mounted read-only.
+    /// Shown instead of scary error text when the NTFS-internal facts can't be
+    /// read (the raw device is root-owned). Rather than a dead-end note, this is
+    /// an actionable prompt: install/approve the privileged helper so the app
+    /// can read full drive health, Verify, MFT location and version.
+    @ViewBuilder
     private var unavailableNote: some View {
-        Text("NTFS details unavailable while mounted read-only — eject to inspect.")
-            .font(.ntfsCodeCaption)
-            .foregroundStyle(Color.ntfsOnSurfaceVariant)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, Spacing.small)
+        VStack(alignment: .leading, spacing: Spacing.small) {
+            Text(volume.isMounted
+                 ? "Full drive health & NTFS details need admin access to read the device directly."
+                 : "Reading NTFS details needs admin access — the raw device is owned by root.")
+                .font(.ntfsCodeCaption)
+                .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                .fixedSize(horizontal: false, vertical: true)
+
+            switch helper.status {
+            case .enabled:
+                // Helper is installed but the read still failed — likely the
+                // volume needs ejecting (macOS holds a read-only mount).
+                Text("Helper installed. Eject and reselect to read full details.")
+                    .font(.ntfsCodeCaption)
+                    .foregroundStyle(Color.ntfsOnSurfaceVariant)
+            case .requiresApproval:
+                Button {
+                    openLoginItemsSettings()
+                    helper.refreshStatus()
+                } label: {
+                    Label("Approve in System Settings…", systemImage: "gearshape")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+            default: // notRegistered / notFound
+                Button {
+                    grantAdminAccess()
+                } label: {
+                    Label(helperBusy ? "Requesting…" : "Grant Admin Access…",
+                          systemImage: "lock.shield")
+                }
+                .buttonStyle(AccentButtonStyle())
+                .disabled(helperBusy)
+            }
+
+            if let helperNote {
+                Text(helperNote)
+                    .font(.ntfsCodeCaption)
+                    .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, Spacing.small)
+    }
+
+    /// Install + enable the privileged helper (SMAppService), then guide the
+    /// user through the one-time System Settings approval and reload.
+    private func grantAdminAccess() {
+        helperBusy = true
+        helperNote = nil
+        do {
+            try helper.register()
+            helper.refreshStatus()
+            switch helper.status {
+            case .requiresApproval:
+                helperNote = "Approve “NTFS Privileged Helper” in System Settings ▸ Login Items & Extensions, then reselect this volume."
+                openLoginItemsSettings()
+            case .enabled:
+                helperNote = "Admin access granted — loading full details…"
+                Task { await loader.load() }
+            default:
+                helperNote = "Helper status: \(helper.statusDescription)."
+            }
+        } catch {
+            helperNote = "Couldn't enable the helper: \(error.localizedDescription). It must be built and signed with your Developer team."
+        }
+        helperBusy = false
+    }
+
+    private func openLoginItemsSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private var lastCheckedText: String {

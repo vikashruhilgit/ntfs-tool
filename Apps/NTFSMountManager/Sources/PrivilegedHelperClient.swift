@@ -122,6 +122,10 @@ public final class PrivilegedHelperClient: ObservableObject {
 
     /// Raw DTO read — bridges the reply block to `async`.
     public func readVolumeInfo(devicePath: String) async throws -> HelperVolumeInfo {
+        // Fail FAST when the daemon isn't enabled — a `.privileged` XPC call to
+        // an unregistered mach service can hang instead of erroring, which would
+        // stall the loader before it can fall through to statfs.
+        guard status == .enabled else { throw HelperError.notRegistered }
         let data = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
             let connection = makeConnection()
             guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
@@ -151,6 +155,7 @@ public final class PrivilegedHelperClient: ObservableObject {
 
     /// Verify pass via the root helper. Returns `(isClean, problems)`.
     public func verify(devicePath: String) async throws -> (isClean: Bool, problems: [String]) {
+        guard status == .enabled else { throw HelperError.notRegistered }
         let data = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
             let connection = makeConnection()
             guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
