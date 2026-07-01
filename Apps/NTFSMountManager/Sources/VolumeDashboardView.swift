@@ -392,6 +392,16 @@ struct VolumeDashboardView: View {
 
     // MARK: - Danger Zone (destructive actions)
 
+    /// True only when the volume is known to have a problem: its `$Volume`
+    /// dirty flag is set, or a Verify run surfaced problems. Unknown (mounted
+    /// read-only, dirty state unavailable) counts as "not known-bad" so Repair
+    /// stays hidden until the volume is ejected and the flag can be read.
+    private var needsRepair: Bool {
+        if loader.info.value?.isDirty == true { return true }
+        if let verify = loader.verify.value, !verify.isClean { return true }
+        return false
+    }
+
     private var dangerZone: some View {
         VStack(alignment: .leading, spacing: Spacing.medium) {
             HStack(alignment: .top, spacing: Spacing.medium) {
@@ -406,12 +416,19 @@ struct VolumeDashboardView: View {
                 }
                 Spacer()
                 HStack(spacing: Spacing.small) {
-                    Button { showRepairConfirm = true } label: {
-                        Label("Repair…", systemImage: "bandage")
+                    // Repair only appears when the volume is actually flagged
+                    // dirty (or a Verify surfaced problems) — a clean volume has
+                    // nothing to repair. While mounted read-only the dirty state
+                    // is unknown, so it stays hidden until the volume is ejected
+                    // and its $Volume flag can be read.
+                    if needsRepair {
+                        Button { showRepairConfirm = true } label: {
+                            Label("Repair…", systemImage: "bandage")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(loader.repair.isLoading || loader.format.isLoading)
+                        .accessibilityLabel("Repair volume \(volume.displayName)")
                     }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .disabled(loader.repair.isLoading || loader.format.isLoading)
-                    .accessibilityLabel("Repair volume \(volume.displayName)")
 
                     Button { showFormatConfirm = true } label: {
                         Label("Format as NTFS…", systemImage: "trash")

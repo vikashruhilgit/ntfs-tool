@@ -312,6 +312,13 @@ public final class VolumeDetailLoader: ObservableObject {
             case .readOnlyDevice:
                 return "The device is read-only."
             case let .ioFailure(description):
+                // The device open fails because the raw node is root-owned
+                // (root:operator 0640) and the GUI runs unprivileged — mounting
+                // state doesn't change that, so don't repeat the misleading
+                // "run diskutil unmount" hint the low-level layer attaches.
+                if description.contains("cannot open") {
+                    return "Reading NTFS details needs administrator privileges — the raw device is owned by root. Mounted volumes show capacity via the system; full details require elevated access (e.g. `sudo ntfsctl info`)."
+                }
                 return "I/O error: \(description)"
             case let .corruptOnDisk(description):
                 return "On-disk corruption detected: \(description)"
