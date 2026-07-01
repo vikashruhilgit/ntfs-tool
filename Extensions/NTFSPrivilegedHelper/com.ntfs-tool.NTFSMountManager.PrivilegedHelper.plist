@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ntfs-tool.NTFSMountManager.PrivilegedHelper</string>
+    <!-- Path to the daemon executable INSIDE the app bundle, relative to the
+         bundle root. SMAppService resolves it against the containing app. -->
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/NTFSPrivilegedHelper</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.ntfs-tool.NTFSMountManager.PrivilegedHelper</key>
+        <true/>
+    </dict>
+    <!-- Ties this daemon to the app that ships it, so SMAppService can present
+         it under the app in System Settings ▸ Login Items & Extensions. -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.ntfs-tool.NTFSMountManager</string>
+    </array>
+</dict>
+</plist>
