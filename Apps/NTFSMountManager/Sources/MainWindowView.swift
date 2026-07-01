@@ -6,6 +6,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case all = "All Volumes"
     case mounted = "Mounted"
     case unmounted = "Unmounted"
+    case activity = "Activity"
     case settings = "Settings"
 
     var id: String { rawValue }
@@ -15,6 +16,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .all:       return "externaldrive"
         case .mounted:   return "checkmark.circle"
         case .unmounted: return "minus.circle"
+        case .activity:  return "list.bullet.rectangle"
         case .settings:  return "gearshape"
         }
     }
@@ -25,6 +27,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
 struct MainWindowView: View {
     @ObservedObject var installer: ExtensionInstaller
     @ObservedObject var diskService: DiskArbitrationService
+    @ObservedObject var activity: ActivityLog
 
     @State private var section: SidebarItem = .all
     @State private var selectedVolumeID: String?
@@ -37,9 +40,9 @@ struct MainWindowView: View {
 
     private var filteredVolumes: [DiskArbitrationService.Volume] {
         switch section {
-        case .all, .settings: return diskService.volumes
-        case .mounted:        return diskService.volumes.filter(\.isMounted)
-        case .unmounted:      return diskService.volumes.filter { !$0.isMounted }
+        case .all, .settings, .activity: return diskService.volumes
+        case .mounted:                    return diskService.volumes.filter(\.isMounted)
+        case .unmounted:                  return diskService.volumes.filter { !$0.isMounted }
         }
     }
 
@@ -100,7 +103,7 @@ struct MainWindowView: View {
 
             Divider().overlay(Color.ntfsOutline.opacity(0.25))
 
-            if section != .settings {
+            if section != .settings && section != .activity {
                 if filteredVolumes.isEmpty {
                     Text("No volumes")
                         .font(.ntfsBody)
@@ -175,13 +178,18 @@ struct MainWindowView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if section == .settings {
+        if section == .activity {
+            // Activity is a global timeline, not per-volume — show it regardless
+            // of the current volume selection.
+            ActivityView(activity: activity)
+        } else if section == .settings {
             SettingsDetailView(installer: installer)
         } else if let volume = selectedVolume {
             VolumeDashboardView(
                 volume: volume,
                 extensionActive: extensionActive,
-                diskService: diskService
+                diskService: diskService,
+                activity: activity
             )
             .id(volume.id) // fresh loader per volume
         } else {

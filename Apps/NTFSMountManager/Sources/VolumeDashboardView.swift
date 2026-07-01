@@ -10,6 +10,7 @@ struct VolumeDashboardView: View {
     let volume: DiskArbitrationService.Volume
     let extensionActive: Bool
     @ObservedObject var diskService: DiskArbitrationService
+    @ObservedObject var activity: ActivityLog
 
     @StateObject private var loader: VolumeDetailLoader
     @State private var actionError: String?
@@ -20,10 +21,11 @@ struct VolumeDashboardView: View {
     @State private var showRepairConfirm = false
     @State private var formatLabel: String
 
-    init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService) {
+    init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService, activity: ActivityLog) {
         self.volume = volume
         self.extensionActive = extensionActive
         self.diskService = diskService
+        self.activity = activity
         // A single loader backs both the read-only dashboard and the writable
         // Danger Zone actions: it opens the device writable only inside
         // runFormat/runRepair, read-only everywhere else.
@@ -130,7 +132,7 @@ struct VolumeDashboardView: View {
             }
 
             Button {
-                Task { await loader.runVerify() }
+                Task { await runVerifyLogged() }
             } label: {
                 Label("Verify", systemImage: "checkmark.seal")
             }
@@ -468,7 +470,7 @@ struct VolumeDashboardView: View {
         ) {
             Button("Erase and Format as NTFS", role: .destructive) {
                 let label = formatLabel
-                perform { await loader.runFormat(label: label) }
+                perform { await runFormatLogged(label: label) }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -480,7 +482,7 @@ struct VolumeDashboardView: View {
             titleVisibility: .visible
         ) {
             Button("Run Consistency Check") {
-                perform { await loader.runRepair() }
+                perform { await runRepairLogged() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -552,6 +554,9 @@ struct VolumeDashboardView: View {
     }
 
     private func perform(mount: Bool) {
+        // Mount/eject activity entries are logged inside DiskArbitrationService so
+        // there's a single source of truth (menu-bar and dashboard both funnel
+        // through it) — no need to log again here.
         actionError = nil
         busy = true
         Task {
@@ -561,6 +566,55 @@ struct VolumeDashboardView: View {
             }
             busy = false
             diskService.refresh()
+        }
+    }
+
+    // MARK: - Logged action wrappers
+
+    /// Run Verify, logging a running → clean/problems/failed entry.
+    private func runVerifyLogged() async {
+        let id = activity.log("Verifying \(volume.displayName)…", status: .running, volume: volume.displayName)
+        await loader.runVerify()
+        switch loader.verify {
+        case let .loaded(result):
+            if result.isClean {
+                activity.update(id, status: .success, detail: "Verify: clean")
+            } else {
+                let count = max(result.problems.count, 1)
+                activity.update(id, status: .warning, detail: "Verify: \(count) problem(s) found")
+            }
+        case let .failed(message):
+            activity.update(id, status: .error, detail: "Verify failed: \(message)")
+        default:
+            activity.update(id, status: .info, detail: nil)
+        }
+    }
+
+    /// Run Format, logging a running → done/failed entry.
+    private func runFormatLogged(label: String) async {
+        let id = activity.log("Formatting \(volume.displayName) as NTFS…", status: .running, volume: volume.displayName)
+        await loader.runFormat(label: label)
+        switch loader.format {
+        case let .loaded(result):
+            activity.update(id, status: .success, detail: result.summary)
+        case let .failed(message):
+            activity.update(id, status: .error, detail: "Format failed: \(message)")
+        default:
+            activity.update(id, status: .info, detail: nil)
+        }
+    }
+
+    /// Run Repair, logging a running → resolved/problems/failed entry.
+    private func runRepairLogged() async {
+        let id = activity.log("Repairing \(volume.displayName)…", status: .running, volume: volume.displayName)
+        await loader.runRepair()
+        switch loader.repair {
+        case let .loaded(result):
+            activity.update(id, status: result.isResolved ? .success : .warning, detail: result.headline)
+        case let .failed(message):
+            activity.update(id, status: .error, detail: "Repair failed: \(message)")
+        default:
+            activity.update(id, status: .info, detail: nil)
         }
     }
 }
