@@ -49,6 +49,19 @@ targets:
     platform: macOS
     sources:
       - path: Apps/NTFSMountManager/Sources
+      # The shared XPC protocol + DTOs are compiled into BOTH the app and the
+      # helper daemon. It lives under the helper's Sources dir; reference the
+      # single file here so the app can talk to the daemon without a separate
+      # framework.
+      - path: Extensions/NTFSPrivilegedHelper/Sources/NTFSHelperProtocol.swift
+      # SMAppService reads the LaunchDaemon plist from
+      # Contents/Library/LaunchDaemons/. Copy it there via a copyFiles build
+      # phase whose destination is the bundle wrapper + that subpath.
+      - path: Extensions/NTFSPrivilegedHelper/com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchDaemons
     info:
       path: Apps/NTFSMountManager/Info.plist
       properties:
@@ -69,6 +82,16 @@ targets:
       - target: NTFSFileSystem
         embed: true
         codeSign: true
+      # The privileged helper daemon travels inside the app bundle. SMAppService
+      # requires the daemon executable at Contents/MacOS/<name> (matching
+      # BundleProgram in the plist). `copy` with destination `executables`
+      # places the built tool product there and code-signs it with the app.
+      - target: NTFSPrivilegedHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: executables      # -> Contents/MacOS
+          subpath: ""
 
   NTFSFileSystem:
     type: system-extension
@@ -104,6 +127,26 @@ targets:
       - package: NTFSCore
         product: NTFSCore
       - sdk: FSKit.framework
+
+  NTFSPrivilegedHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Extensions/NTFSPrivilegedHelper/Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ntfs-tool.NTFSMountManager.PrivilegedHelper
+        # SMAppService requires the daemon executable's name to match the
+        # BundleProgram path in the plist (Contents/MacOS/NTFSPrivilegedHelper).
+        PRODUCT_NAME: NTFSPrivilegedHelper
+        # The XPC / Security C interop (audit tokens, SecCode) predates Swift 6
+        # strict concurrency; mirror the FSKit target's relaxation so the
+        # code-signature gate compiles cleanly. App + NTFSUIKit stay complete.
+        SWIFT_STRICT_CONCURRENCY: minimal
+        SWIFT_VERSION: "6.0"
+    dependencies:
+      - package: NTFSCore
+        product: NTFSCore
 
   ntfsctl:
     type: tool

@@ -23,7 +23,9 @@
 		5F4936483FEF4613A8864F81 /* Create.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFA3E28642F4967D00BBD28 /* Create.swift */; };
 		60FAA53823CD24F32B7E98CE /* Rm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F28047C68A668003CC716BB /* Rm.swift */; };
 		6D724EC442E40A0DDDC0B54A /* Cp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DCA58042BB15FFD8F32EDD3 /* Cp.swift */; };
+		713E3C5CA4518691F2B194E0 /* NTFSPrivilegedHelper in Embed Dependencies */ = {isa = PBXBuildFile; fileRef = DCA5E38E9032E0438DC7F187 /* NTFSPrivilegedHelper */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		7D4143F793CD345F7651B4B1 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */; };
+		81A8B5B2A5E5D58BB14759B5 /* com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist in CopyFiles */ = {isa = PBXBuildFile; fileRef = A025CE91F4BCF77EB4982337 /* com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist */; };
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
 		84561F4715F1DFA581FFB5D8 /* NTFSFileSystem.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5684F8D00837370737BB2555 /* ContentView.swift */; };
@@ -31,18 +33,22 @@
 		A283CF3E3376BC4686313635 /* Verify.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20E22577EA73CB6742243E11 /* Verify.swift */; };
 		A4C05E55DD888425B91563F8 /* VolumeDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C34ED043863741172748733 /* VolumeDashboardView.swift */; };
 		A9E17066DF075F9BA303EAA2 /* NTFSItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = F82499EDC514F10F561B7784 /* NTFSItem.swift */; };
+		AC240A7BAADCAE5391B3669A /* NTFSCore in Frameworks */ = {isa = PBXBuildFile; productRef = C61C4690B5F414C669509581 /* NTFSCore */; };
 		AECEABF53F3ADE62CDA9ED6D /* Mv.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3689DB5A25248D9E73F473CE /* Mv.swift */; };
 		AF4C9EE09B1A9FE361797B31 /* TargetResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46FF94CD9B079359D128E1E8 /* TargetResolver.swift */; };
 		AFE66833D21DBA777309099F /* ntfsctl.swift in Sources */ = {isa = PBXBuildFile; fileRef = D05B381FF347C123E61FD621 /* ntfsctl.swift */; };
 		B2FACFD1EEA0B776368CEC67 /* List.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B9DB06823B01F8100989970 /* List.swift */; };
+		B3E3592596DF001EFE111A27 /* NTFSHelperProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC71E4C595524225567FB699 /* NTFSHelperProtocol.swift */; };
 		B4D21FEE221762253DDD9A68 /* Format.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1A3BBEED299F75B6604C0F0 /* Format.swift */; };
 		B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */; };
 		B9751912CAE0F2EA9A170F9E /* FSKitBlockDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */; };
 		BBB98DE04B189933E57E523D /* Cat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */; };
+		BF4D7D1AFBBF0CBBD0DD115C /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 769F864A648DBBB42073B028 /* main.swift */; };
 		C1F50E65FD4AB246BAC40911 /* Scan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 448EA9B837A137CDD562E07C /* Scan.swift */; };
 		CFB3B74CC0B795207981A6FC /* NTFSFileSystemExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */; };
 		D871A1A5B1DD000B9E3E7D18 /* FirstRunSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */; };
 		DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D92594B427E2C9D518EF55B /* MainWindowView.swift */; };
+		E393226E78D76282E1C54E3B /* NTFSHelperProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC71E4C595524225567FB699 /* NTFSHelperProtocol.swift */; };
 		E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */; };
 		EF91959587345A62A4C6F9C7 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = 5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */; };
 		F53D207E8209413C3BDB1B68 /* Write.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82E0F813FDD6E122C9D24085 /* Write.swift */; };
@@ -57,6 +63,13 @@
 			remoteGlobalIDString = C999CC268F92FFEAC8204988;
 			remoteInfo = NTFSFileSystem;
 		};
+		AD4BFFF6F6ED1703CF8757CD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E8487B47CC02CDDF6EA34958 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 18B9F5ED68D50A794FB85BD1;
+			remoteInfo = NTFSPrivilegedHelper;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -69,6 +82,27 @@
 				84561F4715F1DFA581FFB5D8 /* NTFSFileSystem.systemextension in Embed System Extensions */,
 			);
 			name = "Embed System Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D25EC574E31600A6DBBC204C /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Contents/Library/LaunchDaemons;
+			dstSubfolderSpec = 1;
+			files = (
+				81A8B5B2A5E5D58BB14759B5 /* com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist in CopyFiles */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DEC22BFCBCFA3A8ECF64A44D /* Embed Dependencies */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 6;
+			files = (
+				713E3C5CA4518691F2B194E0 /* NTFSPrivilegedHelper in Embed Dependencies */,
+			);
+			name = "Embed Dependencies";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -95,6 +129,7 @@
 		6979FDA309BA3161B7510E41 /* DestinationPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DestinationPlan.swift; sourceTree = "<group>"; };
 		70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKitBlockDevice.swift; sourceTree = "<group>"; };
 		73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskArbitrationService.swift; sourceTree = "<group>"; };
+		769F864A648DBBB42073B028 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		7B02D1797285E5600E962BFC /* NTFSUIKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NTFSUIKit; path = Packages/NTFSUIKit; sourceTree = SOURCE_ROOT; };
 		7F28047C68A668003CC716BB /* Rm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Rm.swift; sourceTree = "<group>"; };
 		82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = NTFSFileSystem.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -105,11 +140,14 @@
 		8FFA3E28642F4967D00BBD28 /* Create.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Create.swift; sourceTree = "<group>"; };
 		9C014D4357F452F985A593B1 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
 		9D92594B427E2C9D518EF55B /* MainWindowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowView.swift; sourceTree = "<group>"; };
+		A025CE91F4BCF77EB4982337 /* com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist"; sourceTree = "<group>"; };
 		B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstRunSheet.swift; sourceTree = "<group>"; };
+		BC71E4C595524225567FB699 /* NTFSHelperProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSHelperProtocol.swift; sourceTree = "<group>"; };
 		C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSVolume.swift; sourceTree = "<group>"; };
 		D05B381FF347C123E61FD621 /* ntfsctl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ntfsctl.swift; sourceTree = "<group>"; };
 		D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSFileSystemExtension.swift; sourceTree = "<group>"; };
 		D95B833D3F9CBB00BD401B92 /* NTFSMountManager.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NTFSMountManager.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		DCA5E38E9032E0438DC7F187 /* NTFSPrivilegedHelper */ = {isa = PBXFileReference; includeInIndex = 0; path = NTFSPrivilegedHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 		DE068D882A088571281101D0 /* Delete.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Delete.swift; sourceTree = "<group>"; };
 		F1A3BBEED299F75B6604C0F0 /* Format.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Format.swift; sourceTree = "<group>"; };
 		F82499EDC514F10F561B7784 /* NTFSItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSItem.swift; sourceTree = "<group>"; };
@@ -143,6 +181,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B19AE13E869B0B3AE0676062 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AC240A7BAADCAE5391B3669A /* NTFSCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -158,6 +204,7 @@
 			isa = PBXGroup;
 			children = (
 				8D62129F707305A5EE57C591 /* NTFSFileSystem */,
+				3E0D0E8BED96799147A2ABFE /* NTFSPrivilegedHelper */,
 			);
 			path = Extensions;
 			sourceTree = "<group>";
@@ -198,6 +245,15 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
+		3E0D0E8BED96799147A2ABFE /* NTFSPrivilegedHelper */ = {
+			isa = PBXGroup;
+			children = (
+				60BA61C1701BA5462088C0BA /* Sources */,
+				A025CE91F4BCF77EB4982337 /* com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist */,
+			);
+			path = NTFSPrivilegedHelper;
+			sourceTree = "<group>";
+		};
 		3EB674BBB3EF2D83BD06DA8C /* Packages */ = {
 			isa = PBXGroup;
 			children = (
@@ -215,6 +271,15 @@
 				F82499EDC514F10F561B7784 /* NTFSItem.swift */,
 				43ACC1740AE27F5F1F244E0A /* NTFSUnaryFS.swift */,
 				C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		60BA61C1701BA5462088C0BA /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				769F864A648DBBB42073B028 /* main.swift */,
+				BC71E4C595524225567FB699 /* NTFSHelperProtocol.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -259,6 +324,7 @@
 				09D3FC8C31A4FC193F55D32C /* ntfsctl */,
 				82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */,
 				D95B833D3F9CBB00BD401B92 /* NTFSMountManager.app */,
+				DCA5E38E9032E0438DC7F187 /* NTFSPrivilegedHelper */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -298,18 +364,40 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		18B9F5ED68D50A794FB85BD1 /* NTFSPrivilegedHelper */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4197E31838CD175F97D89A3D /* Build configuration list for PBXNativeTarget "NTFSPrivilegedHelper" */;
+			buildPhases = (
+				79A0BBF379F6A6F1F103E27A /* Sources */,
+				B19AE13E869B0B3AE0676062 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NTFSPrivilegedHelper;
+			packageProductDependencies = (
+				C61C4690B5F414C669509581 /* NTFSCore */,
+			);
+			productName = NTFSPrivilegedHelper;
+			productReference = DCA5E38E9032E0438DC7F187 /* NTFSPrivilegedHelper */;
+			productType = "com.apple.product-type.tool";
+		};
 		1AE32544B7D0BD9E664FC9FE /* NTFSMountManager */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = F8D917B78E23EE092A9ABE6B /* Build configuration list for PBXNativeTarget "NTFSMountManager" */;
 			buildPhases = (
 				62ABB4C4B000DD4B44FFC12B /* Sources */,
+				D25EC574E31600A6DBBC204C /* CopyFiles */,
 				147C21B3D1C8D043C46FF568 /* Frameworks */,
 				C36CB797B70AB6276C43728D /* Embed System Extensions */,
+				DEC22BFCBCFA3A8ECF64A44D /* Embed Dependencies */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				B213C3F9DA2BC8C06502287F /* PBXTargetDependency */,
+				FB36518B9CB3204F471AC8E7 /* PBXTargetDependency */,
 			);
 			name = NTFSMountManager;
 			packageProductDependencies = (
@@ -368,6 +456,10 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1630;
 				TargetAttributes = {
+					18B9F5ED68D50A794FB85BD1 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
 					1AE32544B7D0BD9E664FC9FE = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
@@ -403,6 +495,7 @@
 			targets = (
 				C999CC268F92FFEAC8204988 /* NTFSFileSystem */,
 				1AE32544B7D0BD9E664FC9FE /* NTFSMountManager */,
+				18B9F5ED68D50A794FB85BD1 /* NTFSPrivilegedHelper */,
 				2485D5A272EA9DB7B479260D /* ntfsctl */,
 			);
 		};
@@ -445,9 +538,19 @@
 				D871A1A5B1DD000B9E3E7D18 /* FirstRunSheet.swift in Sources */,
 				DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */,
 				4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */,
+				B3E3592596DF001EFE111A27 /* NTFSHelperProtocol.swift in Sources */,
 				54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */,
 				A4C05E55DD888425B91563F8 /* VolumeDashboardView.swift in Sources */,
 				A05D196189C6BA4F91ADF250 /* VolumeRowModel+DiskArbitration.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		79A0BBF379F6A6F1F103E27A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E393226E78D76282E1C54E3B /* NTFSHelperProtocol.swift in Sources */,
+				BF4D7D1AFBBF0CBBD0DD115C /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -470,6 +573,11 @@
 			isa = PBXTargetDependency;
 			target = C999CC268F92FFEAC8204988 /* NTFSFileSystem */;
 			targetProxy = 5B8B4FFEACFBB632847119D9 /* PBXContainerItemProxy */;
+		};
+		FB36518B9CB3204F471AC8E7 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 18B9F5ED68D50A794FB85BD1 /* NTFSPrivilegedHelper */;
+			targetProxy = AD4BFFF6F6ED1703CF8757CD /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -628,6 +736,22 @@
 			};
 			name = Release;
 		};
+		C1F5C012B4F9AC1CB5110A3E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.ntfs-tool.NTFSMountManager.PrivilegedHelper";
+				PRODUCT_NAME = NTFSPrivilegedHelper;
+				SDKROOT = macosx;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
 		D04D65D3E43A6D4A01BACC8D /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -705,9 +829,34 @@
 			};
 			name = Release;
 		};
+		F84CEA63F1F7D0CBBF238B57 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COMBINE_HIDPI_IMAGES = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.ntfs-tool.NTFSMountManager.PrivilegedHelper";
+				PRODUCT_NAME = NTFSPrivilegedHelper;
+				SDKROOT = macosx;
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		4197E31838CD175F97D89A3D /* Build configuration list for PBXNativeTarget "NTFSPrivilegedHelper" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C1F5C012B4F9AC1CB5110A3E /* Debug */,
+				F84CEA63F1F7D0CBBF238B57 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		4A94394592847CBC8A4457F9 /* Build configuration list for PBXNativeTarget "ntfsctl" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -785,6 +934,10 @@
 		7DDE21FE056F73E707145D8D /* NTFSUIKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = NTFSUIKit;
+		};
+		C61C4690B5F414C669509581 /* NTFSCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = NTFSCore;
 		};
 		EED6039FC9F604323FFB010D /* NTFSCore */ = {
 			isa = XCSwiftPackageProductDependency;
