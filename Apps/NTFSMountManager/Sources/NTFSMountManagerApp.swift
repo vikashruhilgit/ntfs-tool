@@ -4,6 +4,7 @@ import SwiftUI
 struct NTFSMountManagerApp: App {
     @StateObject private var installer = ExtensionInstaller()
     @StateObject private var diskService = DiskArbitrationService()
+    @StateObject private var activity = ActivityLog()
 
     var body: some Scene {
         // Main dashboard window — sidebar + bento detail, the everyday surface.
@@ -12,7 +13,13 @@ struct NTFSMountManagerApp: App {
         // bar, and the NavigationSplitView sidebar's top rows render above the
         // window's content area (clipped behind / above the traffic lights).
         Window("NTFS", id: "main") {
-            MainWindowView(installer: installer, diskService: diskService)
+            MainWindowView(installer: installer, diskService: diskService, activity: activity)
+                // The disk service logs mount/eject through the shared log; wire
+                // it up once the StateObjects exist.
+                .onAppear {
+                    diskService.activityLog = activity
+                    installer.activityLog = activity
+                }
                 // A modest minimum so the window can be resized freely in BOTH
                 // directions (down to this floor, up to the screen). Paired with
                 // .contentMinSize below — without a content min size the window's
