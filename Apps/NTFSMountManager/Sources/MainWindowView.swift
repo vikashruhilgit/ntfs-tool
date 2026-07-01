@@ -48,13 +48,21 @@ struct MainWindowView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
+        // Custom HStack split instead of NavigationSplitView: on macOS 26 the
+        // split view fails to recompute the sidebar's title-bar inset on
+        // zoom/maximize/restore, sliding the top rows under the traffic lights.
+        // A plain HStack lays out with the standard window safe area, which is
+        // stable at every size. The sidebar owns its own title-bar clearance.
+        HStack(spacing: 0) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 300)
-        } detail: {
+                .frame(width: 264)
+            Divider()
+                .overlay(Color.ntfsOutline.opacity(0.3))
             detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(Color.ntfsSurface)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.ntfsSurface.ignoresSafeArea())
         .onAppear {
             diskService.refresh()
             if !hasSeenOnboarding { showOnboarding = true }
@@ -72,70 +80,67 @@ struct MainWindowView: View {
     // MARK: - Sidebar
 
     private var sidebar: some View {
-        // A List with .sidebar style is what gives the native title-bar inset
-        // (content sits below the close/min/max controls) and an edge-to-edge
-        // background — a custom VStack sidebar gets neither, which is what
-        // caused the traffic-light overlap and the doubled left border.
-        List {
-            Section {
+        VStack(alignment: .leading, spacing: Spacing.medium) {
+            HStack(spacing: Spacing.small) {
+                Image(systemName: "internaldrive")
+                    .foregroundStyle(Color.ntfsPrimary)
+                Text("NTFS Utility")
+                    .font(.ntfsTitle)
+                    .foregroundStyle(Color.ntfsOnSurface)
+            }
+            .padding(.horizontal, Spacing.small)
+
+            VStack(alignment: .leading, spacing: Spacing.unit) {
                 ForEach(SidebarItem.allCases) { item in
                     sidebarButton(item)
-                        .listRowInsets(EdgeInsets(top: 1, leading: 6, bottom: 1, trailing: 6))
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
                 }
-            } header: {
-                HStack(spacing: Spacing.small) {
-                    Image(systemName: "internaldrive")
-                        .foregroundStyle(Color.ntfsPrimary)
-                    Text("NTFS Utility")
-                        .font(.ntfsTitle)
-                        .foregroundStyle(Color.ntfsOnSurface)
-                }
-                .textCase(nil)
-                .padding(.vertical, Spacing.unit)
             }
 
+            Divider().overlay(Color.ntfsOutline.opacity(0.25))
+
             if section != .settings {
-                Section {
-                    if filteredVolumes.isEmpty {
-                        Text("No volumes")
-                            .font(.ntfsBody)
-                            .foregroundStyle(Color.ntfsOnSurfaceVariant)
-                            .listRowSeparator(.hidden)
-                            .listRowBackground(Color.clear)
-                    } else {
-                        ForEach(filteredVolumes) { volume in
-                            Button {
-                                selectedVolumeID = volume.id
-                            } label: {
-                                VolumeRow(
-                                    model: volume.rowModel(extensionActive: extensionActive),
-                                    isSelected: volume.id == selectedVolumeID
-                                )
+                if filteredVolumes.isEmpty {
+                    Text("No volumes")
+                        .font(.ntfsBody)
+                        .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                        .padding(.horizontal, Spacing.small)
+                } else {
+                    ScrollView {
+                        VStack(spacing: Spacing.unit) {
+                            ForEach(filteredVolumes) { volume in
+                                Button {
+                                    selectedVolumeID = volume.id
+                                } label: {
+                                    VolumeRow(
+                                        model: volume.rowModel(extensionActive: extensionActive),
+                                        isSelected: volume.id == selectedVolumeID
+                                    )
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
-                            .listRowInsets(EdgeInsets(top: 1, leading: 6, bottom: 1, trailing: 6))
-                            .listRowSeparator(.hidden)
-                            .listRowBackground(Color.clear)
                         }
                     }
                 }
             }
-        }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
-        .background(Color.ntfsContainerLow)
-        .safeAreaInset(edge: .bottom) {
+
+            Spacer(minLength: 0)
+
             StatusBadge(
                 "Extension: \(installer.shortStatus)",
                 tone: extensionActive ? .success : .neutral
             )
-            .padding(.horizontal, Spacing.medium)
-            .padding(.vertical, Spacing.small)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.ntfsContainerLow)
+            .padding(.horizontal, Spacing.small)
         }
+        // The window's safe area already sits below the title bar; this pads a
+        // little further so the header clears the traffic lights with breathing
+        // room. Fixed inset ⇒ stable at every window size (incl. zoom).
+        .padding(.top, Spacing.large)
+        .padding(.horizontal, Spacing.small)
+        .padding(.bottom, Spacing.medium)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // Background bleeds to the window edges (under the traffic lights);
+        // the content above stays within the safe area.
+        .background(Color.ntfsContainerLow.ignoresSafeArea())
     }
 
     private func sidebarButton(_ item: SidebarItem) -> some View {
