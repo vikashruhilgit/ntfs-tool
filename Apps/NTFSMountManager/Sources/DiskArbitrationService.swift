@@ -112,8 +112,16 @@ final class DiskArbitrationService: ObservableObject {
             } else {
                 mountPath = nil
             }
-            let displayName = (description[kDADiskDescriptionVolumeNameKey as String] as? String)
-                ?? bsdName
+            // Prefer the volume's real name. DiskArbitration's volume-name key
+            // is often empty for an fskit-mounted NTFS volume, so fall back to
+            // the mount-point folder Finder shows (e.g. /Volumes/SANDISK →
+            // "SANDISK", /Volumes/Untitled → "Untitled") before the BSD id.
+            let volumeName = (description[kDADiskDescriptionVolumeNameKey as String] as? String)
+                .flatMap { $0.isEmpty ? nil : $0 }
+            let mountName = mountPath
+                .map { ($0 as NSString).lastPathComponent }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            let displayName = volumeName ?? mountName ?? bsdName
             let mediaSize = (description[kDADiskDescriptionMediaSizeKey as String] as? UInt64)
                 ?? (description[kDADiskDescriptionMediaSizeKey as String] as? NSNumber)?.uint64Value
 
