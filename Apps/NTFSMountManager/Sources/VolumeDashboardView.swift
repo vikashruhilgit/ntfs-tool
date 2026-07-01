@@ -30,7 +30,8 @@ struct VolumeDashboardView: View {
         _loader = StateObject(wrappedValue: VolumeDetailLoader(
             devicePath: volume.devicePath,
             label: volume.displayName,
-            isWritable: true
+            isWritable: true,
+            mountPoint: volume.mountPoint
         ))
         _formatLabel = State(initialValue: volume.displayName)
     }
@@ -211,9 +212,13 @@ struct VolumeDashboardView: View {
                         infoRow("Label", vm.label)
                         infoRow("Total Size", vm.totalDisplay)
                         infoRow("Free Space", vm.freeDisplay)
-                        infoRow("Bytes / Cluster", "\(vm.clusterDisplay)")
-                        infoRow("MFT Location", vm.mftLocationDisplay, mono: true)
-                        infoRow("Version", vm.versionDisplay, last: true)
+                        infoRow("Bytes / Cluster", "\(vm.clusterDisplay)", last: !vm.ntfsDetailsAvailable)
+                        if vm.ntfsDetailsAvailable {
+                            infoRow("MFT Location", vm.mftLocationDisplay, mono: true)
+                            infoRow("Version", vm.versionDisplay, last: true)
+                        } else {
+                            unavailableNote
+                        }
                     }
                 }
             }
@@ -229,8 +234,7 @@ struct VolumeDashboardView: View {
                         .foregroundStyle(Color.ntfsOnSurface)
                     Spacer()
                     if let vm = loader.info.value {
-                        Image(systemName: vm.isDirty ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-                            .foregroundStyle(vm.isDirty ? Color.ntfsError : Color.ntfsSuccess)
+                        healthIcon(for: vm)
                     }
                 }
 
@@ -241,9 +245,15 @@ struct VolumeDashboardView: View {
                     messageRow(message, tone: .error, icon: "exclamationmark.triangle")
                 case let .loaded(vm):
                     VStack(spacing: 0) {
-                        healthRow("Overall Status", value: vm.healthStatus, tone: vm.isDirty ? .error : .success)
-                        infoRow("Permissions", vm.permissionDisplay, mono: true)
-                        infoRow("Last Checked", lastCheckedText, last: true)
+                        // When NTFS details are unavailable (mounted, no device
+                        // access) the status is neutral, not an error.
+                        healthRow("Overall Status", value: vm.healthStatus, tone: healthTone(for: vm))
+                        infoRow("Permissions", vm.permissionDisplay, mono: true, last: !vm.ntfsDetailsAvailable)
+                        if vm.ntfsDetailsAvailable {
+                            infoRow("Last Checked", lastCheckedText, last: true)
+                        } else {
+                            unavailableNote
+                        }
                     }
                 }
 
@@ -291,6 +301,40 @@ struct VolumeDashboardView: View {
             )
             .transition(.opacity)
         }
+    }
+
+    /// Header health icon: green seal (clean), red triangle (dirty), or a neutral
+    /// question mark when the dirty flag couldn't be read (mounted read-only).
+    @ViewBuilder
+    private func healthIcon(for vm: VolumeInfoViewModel) -> some View {
+        switch vm.isDirty {
+        case .some(true):
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.ntfsError)
+        case .some(false):
+            Image(systemName: "checkmark.seal.fill").foregroundStyle(Color.ntfsSuccess)
+        case .none:
+            Image(systemName: "questionmark.circle").foregroundStyle(Color.ntfsOnSurfaceVariant)
+        }
+    }
+
+    /// Status-row tone: neutral when the dirty flag is unknown, else success/error.
+    private func healthTone(for vm: VolumeInfoViewModel) -> StatusTone {
+        switch vm.isDirty {
+        case .some(true): return .error
+        case .some(false): return .success
+        case .none: return .neutral
+        }
+    }
+
+    /// A single subtle line explaining why the NTFS-internal facts are missing —
+    /// shown instead of scary error text when the volume is mounted read-only.
+    private var unavailableNote: some View {
+        Text("NTFS details unavailable while mounted read-only — eject to inspect.")
+            .font(.ntfsCodeCaption)
+            .foregroundStyle(Color.ntfsOnSurfaceVariant)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, Spacing.small)
     }
 
     private var lastCheckedText: String {
