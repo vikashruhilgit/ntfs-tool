@@ -10,6 +10,7 @@ struct VolumeDashboardView: View {
     let volume: DiskArbitrationService.Volume
     let extensionActive: Bool
     @ObservedObject var diskService: DiskArbitrationService
+    @ObservedObject var helper: PrivilegedHelperClient
 
     @StateObject private var loader: VolumeDetailLoader
     @State private var actionError: String?
@@ -20,18 +21,31 @@ struct VolumeDashboardView: View {
     @State private var showRepairConfirm = false
     @State private var formatLabel: String
 
-    init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService) {
+    init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService, helper: PrivilegedHelperClient) {
         self.volume = volume
         self.extensionActive = extensionActive
         self.diskService = diskService
+        self.helper = helper
+        // Privileged fallback: when the direct device read fails (the raw node
+        // is root-owned and the app is unprivileged), the loader asks the root
+        // XPC helper before degrading to statfs. The closure hops to the main
+        // actor to call the @MainActor client. `label`/`isWritable` are
+        // captured so the mapped VolumeFacts carry the same display fields the
+        // direct path would.
+        let label = volume.displayName
+        let isWritable = true
+        let privilegedFactsProvider: @Sendable (String) async throws -> VolumeFacts = { devicePath in
+            try await helper.readVolumeFacts(devicePath: devicePath, label: label, isWritable: isWritable)
+        }
         // A single loader backs both the read-only dashboard and the writable
         // Danger Zone actions: it opens the device writable only inside
         // runFormat/runRepair, read-only everywhere else.
         _loader = StateObject(wrappedValue: VolumeDetailLoader(
             devicePath: volume.devicePath,
-            label: volume.displayName,
-            isWritable: true,
-            mountPoint: volume.mountPoint
+            label: label,
+            isWritable: isWritable,
+            mountPoint: volume.mountPoint,
+            privilegedFactsProvider: privilegedFactsProvider
         ))
         _formatLabel = State(initialValue: volume.displayName)
     }

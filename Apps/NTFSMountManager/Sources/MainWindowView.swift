@@ -25,6 +25,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
 struct MainWindowView: View {
     @ObservedObject var installer: ExtensionInstaller
     @ObservedObject var diskService: DiskArbitrationService
+    @ObservedObject var helper: PrivilegedHelperClient
 
     @State private var section: SidebarItem = .all
     @State private var selectedVolumeID: String?
@@ -176,12 +177,13 @@ struct MainWindowView: View {
     @ViewBuilder
     private var detail: some View {
         if section == .settings {
-            SettingsDetailView(installer: installer)
+            SettingsDetailView(installer: installer, helper: helper)
         } else if let volume = selectedVolume {
             VolumeDashboardView(
                 volume: volume,
                 extensionActive: extensionActive,
-                diskService: diskService
+                diskService: diskService,
+                helper: helper
             )
             .id(volume.id) // fresh loader per volume
         } else {
@@ -198,6 +200,10 @@ struct MainWindowView: View {
 /// Settings detail re-uses the extension activation controls in the design shell.
 struct SettingsDetailView: View {
     @ObservedObject var installer: ExtensionInstaller
+    @ObservedObject var helper: PrivilegedHelperClient
+
+    @State private var helperError: String?
+    @State private var helperBusy = false
 
     var body: some View {
         ScrollView {
@@ -226,10 +232,70 @@ struct SettingsDetailView: View {
                         }
                     }
                 }
+
+                adminAccessCard
             }
             .padding(Spacing.large)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(Color.ntfsSurface)
+        .onAppear { helper.refreshStatus() }
+    }
+
+    /// Admin-access row: installs / enables the privileged helper daemon so the
+    /// unprivileged app can read (and later write) the root-owned raw device.
+    private var adminAccessCard: some View {
+        SectionCard {
+            VStack(alignment: .leading, spacing: Spacing.medium) {
+                Text("Admin Access")
+                    .font(.ntfsTitle)
+                    .foregroundStyle(Color.ntfsOnSurface)
+                Text("Reading full NTFS details on a mounted drive needs a small privileged helper — the raw device is owned by root. Enable it once, then approve it in System Settings.")
+                    .font(.ntfsBody)
+                    .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: Spacing.small) {
+                    Text("Status:")
+                        .font(.ntfsBody)
+                        .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                    Text(helper.statusDescription)
+                        .font(.ntfsCode)
+                        .foregroundStyle(Color.ntfsOnSurface)
+                }
+
+                HStack(spacing: Spacing.small) {
+                    Button("Install / Enable Helper…") { enableHelper() }
+                        .buttonStyle(AccentButtonStyle())
+                        .disabled(helperBusy)
+                    Button("Refresh Status") { helper.refreshStatus() }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(helperBusy)
+                    if helperBusy { ProgressView().scaleEffect(0.6) }
+                }
+
+                Text("Approve in System Settings ▸ Login Items & Extensions.")
+                    .font(.ntfsLabel)
+                    .foregroundStyle(Color.ntfsOnSurfaceVariant)
+
+                if let helperError {
+                    Text(helperError)
+                        .font(.ntfsLabel)
+                        .foregroundStyle(Color.ntfsError)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func enableHelper() {
+        helperError = nil
+        helperBusy = true
+        defer { helperBusy = false }
+        do {
+            try helper.register()
+        } catch {
+            helperError = error.localizedDescription
+        }
     }
 }

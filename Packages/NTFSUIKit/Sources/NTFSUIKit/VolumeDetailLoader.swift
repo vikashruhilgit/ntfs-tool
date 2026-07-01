@@ -51,6 +51,13 @@ public final class VolumeDetailLoader: ObservableObject {
     /// device. Production leaves these `nil` and the real NTFSCore path runs.
     private let factsProvider: (@Sendable () async throws -> VolumeFacts)?
     private let verifyProvider: (@Sendable () async throws -> VerifyResult)?
+    /// Optional privileged fallback: when a DIRECT device read fails (the raw
+    /// node is `root:operator 0640` and the app is unprivileged), the loader
+    /// asks this provider — a closure the app wires to its root XPC helper —
+    /// before degrading to `statfs`. Receives the device path, returns full
+    /// facts. NTFSUIKit stays independent of the app/helper: this is just a
+    /// closure. `nil` when no helper is available (the pre-helper behaviour).
+    private let privilegedFactsProvider: (@Sendable (String) async throws -> VolumeFacts)?
     /// Receives the requested label; returns the format outcome. Tests inject a
     /// closure that never touches a real device.
     private let formatProvider: (@Sendable (String) async throws -> FormatResult)?
@@ -64,7 +71,8 @@ public final class VolumeDetailLoader: ObservableObject {
         factsProvider: (@Sendable () async throws -> VolumeFacts)? = nil,
         verifyProvider: (@Sendable () async throws -> VerifyResult)? = nil,
         formatProvider: (@Sendable (String) async throws -> FormatResult)? = nil,
-        repairProvider: (@Sendable () async throws -> RepairResult)? = nil
+        repairProvider: (@Sendable () async throws -> RepairResult)? = nil,
+        privilegedFactsProvider: (@Sendable (String) async throws -> VolumeFacts)? = nil
     ) {
         self.devicePath = devicePath
         self.label = label
@@ -74,6 +82,7 @@ public final class VolumeDetailLoader: ObservableObject {
         self.verifyProvider = verifyProvider
         self.formatProvider = formatProvider
         self.repairProvider = repairProvider
+        self.privilegedFactsProvider = privilegedFactsProvider
     }
 
     /// Load volume facts via NTFSCore and map to the display view-model.
@@ -84,7 +93,7 @@ public final class VolumeDetailLoader: ObservableObject {
             if let provider = factsProvider {
                 facts = try await provider()
             } else {
-                facts = try await Self.readFacts(devicePath: devicePath, mountPoint: mountPoint, label: label, isWritable: isWritable)
+                facts = try await Self.readFacts(devicePath: devicePath, mountPoint: mountPoint, label: label, isWritable: isWritable, privilegedFactsProvider: privilegedFactsProvider)
             }
             info = .loaded(VolumeInfoViewModel(facts: facts))
         } catch {
@@ -157,21 +166,39 @@ public final class VolumeDetailLoader: ObservableObject {
     /// Read volume facts with this precedence:
     ///   1. Raw NTFSCore read off the device — full facts incl. NTFS-internal
     ///      fields. Best data, works when unmounted or when we have privileges.
-    ///   2. If that fails AND we have a mount point — `statfs` on the mount point.
-    ///      No privileges needed; gives capacity/used/free/block-size but leaves
-    ///      the NTFS-internal fields nil (they degrade to "Unavailable while
-    ///      mounted"). This is the common case for a Finder-mounted NTFS volume,
-    ///      whose raw device node is `root:operator 0640`.
-    ///   3. If that fails and there's no mount point — rethrow the real error so
-    ///      a genuinely unreadable/absent device surfaces it.
-    nonisolated static func readFacts(devicePath: String, mountPoint: String?, label: String, isWritable: Bool) async throws -> VolumeFacts {
+    ///   2. If that fails AND a privileged facts provider is wired (the app's
+    ///      root XPC helper) — ask it. The daemon opens the root-owned device
+    ///      and returns the SAME full facts. This is the whole point of the
+    ///      helper: full NTFS-internal detail on a Finder-mounted volume.
+    ///   3. If that fails/absent AND we have a mount point — `statfs` on the
+    ///      mount point. No privileges needed; gives capacity/used/free/block-
+    ///      size but leaves the NTFS-internal fields nil (they degrade to
+    ///      "Unavailable while mounted").
+    ///   4. If all fail and there's no mount point — rethrow the ORIGINAL direct-
+    ///      read error so a genuinely unreadable/absent device surfaces it.
+    nonisolated static func readFacts(
+        devicePath: String,
+        mountPoint: String?,
+        label: String,
+        isWritable: Bool,
+        privilegedFactsProvider: (@Sendable (String) async throws -> VolumeFacts)? = nil
+    ) async throws -> VolumeFacts {
         do {
             return try await readFactsFromDevice(devicePath: devicePath, label: label, isWritable: isWritable)
-        } catch {
+        } catch let directError {
+            // 2. Privileged helper, if available.
+            if let privilegedFactsProvider {
+                if let facts = try? await privilegedFactsProvider(devicePath) {
+                    return facts
+                }
+            }
+            // 3. Non-privileged statfs on the mount point.
             if let mountPoint {
                 return try statfsFacts(mountPoint: mountPoint, devicePath: devicePath, label: label, isWritable: isWritable)
             }
-            throw error
+            // 4. Nothing worked and the device isn't mounted — surface the real
+            //    direct-read failure.
+            throw directError
         }
     }
 
