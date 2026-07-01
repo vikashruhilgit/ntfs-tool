@@ -20,7 +20,7 @@ struct NTFSMountManagerApp: App {
                 .frame(minWidth: 720, minHeight: 420)
         }
         .windowResizability(.contentMinSize)
-        .defaultSize(width: 980, height: 640)
+        .defaultSize(width: 1120, height: 720)
         .defaultPosition(.center)
 
         // Menu-bar dropdown: the quick panel with attached NTFS volumes and

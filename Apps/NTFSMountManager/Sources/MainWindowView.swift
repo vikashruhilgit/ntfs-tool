@@ -151,14 +151,14 @@ struct MainWindowView: View {
         } label: {
             HStack(spacing: Spacing.small) {
                 Image(systemName: item.systemImage)
-                    .font(.system(size: 13, weight: .regular))
-                    .frame(width: 18, alignment: .center)
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 22, alignment: .center)
                 Text(item.rawValue)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                 Spacer()
             }
             .padding(.horizontal, Spacing.small)
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
             .foregroundStyle(section == item ? Color.ntfsPrimary : Color.ntfsOnSurfaceVariant)
             .background(
                 RoundedRectangle(cornerRadius: Radius.control, style: .continuous)

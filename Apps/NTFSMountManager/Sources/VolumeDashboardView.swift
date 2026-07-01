@@ -45,12 +45,26 @@ struct VolumeDashboardView: View {
                         .background(Color.ntfsError.opacity(0.1), in: RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
                         .transition(.opacity)
                 }
-                bento
-                infoAndHealth
+                // Top row mirrors the mock: the bento (ring + metrics) on the
+                // left, the Drive Health panel on the right. ViewThatFits keeps
+                // them side-by-side when there's room and stacks them when the
+                // window is too narrow.
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: Spacing.medium) {
+                        bento
+                        driveHealthCard
+                            .frame(width: 320)
+                    }
+                    VStack(alignment: .leading, spacing: Spacing.large) {
+                        bento
+                        driveHealthCard
+                    }
+                }
                 dangerZone
+                volumeInfoCard
             }
             .padding(Spacing.large)
-            .frame(maxWidth: 980, alignment: .leading)
+            .frame(maxWidth: 1200, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(Color.ntfsSurface)
@@ -151,6 +165,7 @@ struct VolumeDashboardView: View {
                 metricGrid
             }
         }
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -178,13 +193,6 @@ struct VolumeDashboardView: View {
     }
 
     // MARK: - Volume Info + Drive Health
-
-    private var infoAndHealth: some View {
-        HStack(alignment: .top, spacing: Spacing.medium) {
-            volumeInfoCard
-            driveHealthCard
-        }
-    }
 
     private var volumeInfoCard: some View {
         SectionCard {
