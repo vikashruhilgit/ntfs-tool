@@ -217,6 +217,11 @@ public final class VolumeDetailLoader: ObservableObject {
         let total = UInt64(s.f_blocks) * bsize
         let free  = UInt64(s.f_bavail) * bsize     // available to non-root (matches Finder)
         let used  = total >= free ? total - free : 0
+        // Reflect the ACTUAL mount state (macOS mounts NTFS read-only) via the
+        // MNT_RDONLY flag, rather than the caller's writable-open capability, so
+        // the Permissions row is accurate for a mounted volume. `isWritable`
+        // (the passed value) governs the writable device open for Format/Repair.
+        let mountIsWritable = (s.f_flags & UInt32(MNT_RDONLY)) == 0
         return VolumeFacts(
             label: label,
             devicePath: devicePath,
@@ -229,7 +234,7 @@ public final class VolumeDetailLoader: ObservableObject {
             isDirty: nil,
             ntfsMajorVersion: nil,
             ntfsMinorVersion: nil,
-            isWritable: isWritable
+            isWritable: mountIsWritable
         )
     }
 
