@@ -26,6 +26,17 @@
 #
 #   See docs/PACKAGING.md for the full free-personal-signing walkthrough and
 #   the `systemextensionsctl developer on` activation step.
+#
+# Privileged helper (SMAppService root daemon):
+#   The app also embeds NTFSPrivilegedHelper (Contents/MacOS/) + its LaunchDaemon
+#   plist (Contents/Library/LaunchDaemons/). The DEFAULT ad-hoc build embeds them
+#   correctly and BUILDS fine, but the daemon will NOT register ad-hoc:
+#   SMAppService + the XPC code-signature gate require REAL, team-consistent
+#   signing (app and daemon under the SAME team; OU pinned to JT8YU25ABP). To
+#   exercise the helper at runtime, build signed — see docs/PACKAGING.md §5:
+#
+#     DEVELOPMENT_TEAM=JT8YU25ABP CODE_SIGN_STYLE=Automatic \
+#       CODE_SIGN_IDENTITY="Apple Development" ./scripts/package.sh --release
 
 set -euo pipefail
 

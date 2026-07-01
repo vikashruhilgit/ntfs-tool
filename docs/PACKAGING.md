@@ -220,10 +220,108 @@ system extension on any Mac **without** `systemextensionsctl developer on`.
 
 ---
 
+## 5. Privileged helper (SMAppService root daemon) — REAL signing required
+
+The app ships a second embedded executable: **`NTFSPrivilegedHelper`**, a root
+LaunchDaemon installed at runtime via `SMAppService`. It exists so the
+unprivileged, sandboxed GUI can read (and later write) the raw NTFS device node,
+which macOS creates as `root:operator 0640` — unreadable by the user-level app.
+The GUI talks to the daemon over XPC; the daemon opens the device as root and
+returns volume facts / verify results.
+
+### 5a. What's embedded (verify in any build)
+
+Building the app scheme (section 1) also builds and embeds the helper via
+`project.yml` copy phases. In the built `.app`:
+
+- `Contents/MacOS/NTFSPrivilegedHelper` — the daemon executable. Its path must
+  match `BundleProgram` in the plist below.
+- `Contents/Library/LaunchDaemons/com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist`
+  — the LaunchDaemon plist `SMAppService.daemon(plistName:)` reads.
+
+```bash
+APP=dist/NTFSMountManager.app   # or the DerivedData build products path
+ls -la "$APP/Contents/MacOS/NTFSPrivilegedHelper"
+ls -la "$APP/Contents/Library/LaunchDaemons/com.ntfs-tool.NTFSMountManager.PrivilegedHelper.plist"
+```
+
+The **default ad-hoc build succeeds** (it compiles and embeds correctly), but
+the daemon will **not register** ad-hoc: `SMAppService` and the XPC
+code-signature gate both require real, team-consistent signing.
+
+### 5b. Signing requirements (both binaries, same team)
+
+`SMAppService` requires that the app **and** the embedded daemon are signed by
+the **same** Apple Developer team, and the daemon's client-authentication gate
+pins that team's OU. For this project the team OU is **`JT8YU25ABP`** (see
+`ntfsHelperClientRequirement` in
+`Extensions/NTFSPrivilegedHelper/Sources/NTFSHelperProtocol.swift`; change both
+if you sign under a different team).
+
+Build signed (both targets inherit the project-level signing settings, so one
+invocation signs the app, the FSKit extension, and the helper together):
+
+```bash
+xcodegen generate
+xcodebuild \
+  -project NTFSMountManager.xcodeproj \
+  -scheme NTFSMountManager \
+  -configuration Release \
+  DEVELOPMENT_TEAM=JT8YU25ABP \
+  CODE_SIGN_STYLE=Automatic \
+  CODE_SIGN_IDENTITY="Apple Development" \
+  build
+```
+
+Or, once you have a "Developer ID Application" identity, use the notarization
+flow in section 4 (which passes `DEVELOPMENT_TEAM` and produces a
+Developer-ID-signed, notarized build — the ideal state for the helper).
+
+> The default (`scripts/package.sh` / CI) stays **ad-hoc** — no `DEVELOPMENT_TEAM`,
+> `CODE_SIGN_IDENTITY="-"`. The signed invocation above is opt-in and only needed
+> to exercise the helper at runtime.
+
+### 5c. Bring-up (register → approve → use)
+
+Runtime enablement is **interactive** and cannot be scripted headlessly:
+
+1. Launch the signed app.
+2. Open **Settings → Admin Access → "Install / Enable Helper…"**. This calls
+   `SMAppService.daemon(plistName:).register()`. The status transitions to
+   *"Awaiting approval in System Settings"* (`.requiresApproval`) on first run.
+3. Approve the daemon in **System Settings ▸ General ▸ Login Items & Extensions**
+   (under *Allow in the Background* / the app's daemons). The status becomes
+   `.enabled`.
+4. Select a mounted NTFS volume. When the direct device read fails (root-owned
+   node), the loader now falls back to the helper over XPC and shows the full
+   NTFS-internal facts instead of degrading to `statfs`.
+
+To remove it: the app can call `unregister()` (or
+`sudo sfltool resetbtm` / toggle it off in System Settings).
+
+### 5d. Troubleshooting
+
+- **`register()` throws / status stays `.notFound`** — almost always a signing
+  mismatch: the app and daemon aren't signed by the same team, or the build is
+  ad-hoc. Rebuild with section 5b.
+- **XPC connection rejected** — the daemon's code-signature gate
+  (`SecCodeCheckValidity` against `ntfsHelperClientRequirement`) is refusing the
+  client. Confirm the app's bundle id is `com.ntfs-tool.NTFSMountManager` and its
+  leaf cert OU matches the pinned team.
+- **Inspect the daemon** — `sudo launchctl print system/com.ntfs-tool.NTFSMountManager.PrivilegedHelper`
+  after approval; `log stream --predicate 'process == "NTFSPrivilegedHelper"'`
+  for the `NSLog` gate messages.
+
+---
+
 ## See also
 
 - `scripts/package.sh` — the local packaging script described in section 1.
 - `project.yml` — target definitions; `embed: true` on the extension dependency
-  is what places it inside the app bundle.
+  is what places it inside the app bundle; the `NTFSPrivilegedHelper` target +
+  the app's copy phases place the daemon executable in `Contents/MacOS/` and its
+  plist in `Contents/Library/LaunchDaemons/`.
+- `Extensions/NTFSPrivilegedHelper/` — the root daemon, its XPC protocol/DTOs,
+  and the LaunchDaemon plist.
 - `CLAUDE.md` — toolchain requirements and the personal-use signing policy.
 - `docs/STATUS.md` — current validation state (FSKit mount validation gate).
