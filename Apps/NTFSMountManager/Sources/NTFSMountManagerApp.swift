@@ -13,12 +13,13 @@ struct NTFSMountManagerApp: App {
         // window's content area (clipped behind / above the traffic lights).
         Window("NTFS", id: "main") {
             MainWindowView(installer: installer, diskService: diskService)
+                // A modest minimum so the window can be resized freely in BOTH
+                // directions (down to this floor, up to the screen). Paired with
+                // .contentMinSize below — without a content min size the window's
+                // vertical resize was locked and it could grow past the screen.
+                .frame(minWidth: 720, minHeight: 420)
         }
-        // Size the WINDOW, not the split-view content. A min-height frame on
-        // the NavigationSplitView itself mis-anchors the sidebar list (its top
-        // rows render above the window's content area). NOTE: do NOT use
-        // .windowResizability(.contentSize) here either — it breaks the
-        // title-bar safe-area inset.
+        .windowResizability(.contentMinSize)
         .defaultSize(width: 980, height: 640)
         .defaultPosition(.center)
 
