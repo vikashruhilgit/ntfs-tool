@@ -8,7 +8,9 @@ public struct DangerButtonStyle: ButtonStyle {
     public init() {}
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.ntfsTitle)
+            .font(.system(size: 14, weight: .medium))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .foregroundStyle(.white)
             .padding(.horizontal, Spacing.medium)
             .padding(.vertical, Spacing.small)

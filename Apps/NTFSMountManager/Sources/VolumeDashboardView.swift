@@ -80,18 +80,25 @@ struct VolumeDashboardView: View {
                     Text(volume.displayName)
                         .font(.ntfsDisplay)
                         .foregroundStyle(Color.ntfsOnSurface)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                     StatusBadge(
                         volume.isMounted ? "Mounted" : "Unmounted",
                         tone: volume.isMounted ? .success : .neutral
                     )
+                    .fixedSize()
                 }
                 Text("NTFS · \(volume.mountPoint ?? "not mounted") · \(volume.devicePath)")
                     .font(.ntfsCode)
                     .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
-            Spacer()
+            Spacer(minLength: Spacing.small)
             actions
+                .fixedSize()
+                .layoutPriority(1)
         }
     }
 
