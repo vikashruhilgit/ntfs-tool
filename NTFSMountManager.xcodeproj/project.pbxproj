@@ -22,11 +22,13 @@
 		55282FEDBAEF76F7172E5825 /* SetDirty.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8DE33D7BA5684962834C762F /* SetDirty.swift */; };
 		5F4936483FEF4613A8864F81 /* Create.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FFA3E28642F4967D00BBD28 /* Create.swift */; };
 		60FAA53823CD24F32B7E98CE /* Rm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F28047C68A668003CC716BB /* Rm.swift */; };
+		61E14319F98E26257C03D59D /* ActivityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A51493713E12AE4C5676EDBB /* ActivityView.swift */; };
 		6D724EC442E40A0DDDC0B54A /* Cp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2DCA58042BB15FFD8F32EDD3 /* Cp.swift */; };
 		7D4143F793CD345F7651B4B1 /* NTFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */; };
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
 		84561F4715F1DFA581FFB5D8 /* NTFSFileSystem.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 82C835EDEC051811DFD41412 /* NTFSFileSystem.systemextension */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5684F8D00837370737BB2555 /* ContentView.swift */; };
+		92E8A27AA1103065342DA7B8 /* ActivityLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 203EE770FA35E648615F1197 /* ActivityLog.swift */; };
 		A05D196189C6BA4F91ADF250 /* VolumeRowModel+DiskArbitration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6471581351116FFFC4F16780 /* VolumeRowModel+DiskArbitration.swift */; };
 		A283CF3E3376BC4686313635 /* Verify.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20E22577EA73CB6742243E11 /* Verify.swift */; };
 		A4C05E55DD888425B91563F8 /* VolumeDashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C34ED043863741172748733 /* VolumeDashboardView.swift */; };
@@ -79,6 +81,7 @@
 		0C34ED043863741172748733 /* VolumeDashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VolumeDashboardView.swift; sourceTree = "<group>"; };
 		138AC53F11BB4630926D3661 /* MenuBarContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarContent.swift; sourceTree = "<group>"; };
 		1B9DB06823B01F8100989970 /* List.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = List.swift; sourceTree = "<group>"; };
+		203EE770FA35E648615F1197 /* ActivityLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityLog.swift; sourceTree = "<group>"; };
 		20E22577EA73CB6742243E11 /* Verify.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Verify.swift; sourceTree = "<group>"; };
 		2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cat.swift; sourceTree = "<group>"; };
 		2DCA58042BB15FFD8F32EDD3 /* Cp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cp.swift; sourceTree = "<group>"; };
@@ -105,6 +108,7 @@
 		8FFA3E28642F4967D00BBD28 /* Create.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Create.swift; sourceTree = "<group>"; };
 		9C014D4357F452F985A593B1 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
 		9D92594B427E2C9D518EF55B /* MainWindowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowView.swift; sourceTree = "<group>"; };
+		A51493713E12AE4C5676EDBB /* ActivityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityView.swift; sourceTree = "<group>"; };
 		B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstRunSheet.swift; sourceTree = "<group>"; };
 		C75C6BD0D55718C3D2C6636E /* NTFSVolume.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSVolume.swift; sourceTree = "<group>"; };
 		D05B381FF347C123E61FD621 /* ntfsctl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ntfsctl.swift; sourceTree = "<group>"; };
@@ -165,6 +169,8 @@
 		1D277ED2F0C730E6AD914DB3 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				203EE770FA35E648615F1197 /* ActivityLog.swift */,
+				A51493713E12AE4C5676EDBB /* ActivityView.swift */,
 				5684F8D00837370737BB2555 /* ContentView.swift */,
 				73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */,
 				00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */,
@@ -439,6 +445,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				92E8A27AA1103065342DA7B8 /* ActivityLog.swift in Sources */,
+				61E14319F98E26257C03D59D /* ActivityView.swift in Sources */,
 				92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */,
 				B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */,
 				E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */,
