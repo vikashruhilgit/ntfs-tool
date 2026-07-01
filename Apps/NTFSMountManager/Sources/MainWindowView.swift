@@ -83,9 +83,11 @@ struct MainWindowView: View {
         VStack(alignment: .leading, spacing: Spacing.medium) {
             HStack(spacing: Spacing.small) {
                 Image(systemName: "internaldrive")
+                    .font(.system(size: 13, weight: .regular))
+                    .frame(width: 18, alignment: .center)
                     .foregroundStyle(Color.ntfsPrimary)
                 Text("NTFS Utility")
-                    .font(.ntfsTitle)
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.ntfsOnSurface)
             }
             .padding(.horizontal, Spacing.small)
@@ -149,11 +151,14 @@ struct MainWindowView: View {
         } label: {
             HStack(spacing: Spacing.small) {
                 Image(systemName: item.systemImage)
-                Text(item.rawValue).font(.ntfsTitle)
+                    .font(.system(size: 13, weight: .regular))
+                    .frame(width: 18, alignment: .center)
+                Text(item.rawValue)
+                    .font(.system(size: 14, weight: .medium))
                 Spacer()
             }
             .padding(.horizontal, Spacing.small)
-            .padding(.vertical, Spacing.small)
+            .padding(.vertical, 6)
             .foregroundStyle(section == item ? Color.ntfsPrimary : Color.ntfsOnSurfaceVariant)
             .background(
                 RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
