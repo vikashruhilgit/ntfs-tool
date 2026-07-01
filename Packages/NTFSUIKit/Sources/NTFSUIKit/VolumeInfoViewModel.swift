@@ -13,11 +13,14 @@ public struct VolumeInfoViewModel: Equatable, Sendable {
     public let mftLocationDisplay: String
     public let percentUsed: Double          // 0...1
     public let percentUsedDisplay: String   // "61.6%"
-    public let isDirty: Bool
-    public let healthStatus: String         // "Clean" / "Dirty"
-    public let versionDisplay: String       // "NTFS 3.1"
+    public let isDirty: Bool?               // nil when NTFS details unavailable
+    public let healthStatus: String         // "Clean" / "Dirty" / "Unavailable"
+    public let versionDisplay: String       // "NTFS 3.1" / "Unavailable"
     public let isWritable: Bool
     public let permissionDisplay: String    // "Read-only" / "Read/Write"
+    /// True when NTFS-internal facts were read from the device; false when only
+    /// non-privileged `statfs` numbers are available (mounted read-only).
+    public let ntfsDetailsAvailable: Bool
 
     public init(facts: VolumeFacts) {
         let f = VolumeInfoFormatter.self
@@ -35,6 +38,7 @@ public struct VolumeInfoViewModel: Equatable, Sendable {
         self.versionDisplay = f.versionLabel(major: facts.ntfsMajorVersion, minor: facts.ntfsMinorVersion)
         self.isWritable = facts.isWritable
         self.permissionDisplay = f.permissionLabel(isWritable: facts.isWritable)
+        self.ntfsDetailsAvailable = facts.ntfsDetailsAvailable
     }
 }
 

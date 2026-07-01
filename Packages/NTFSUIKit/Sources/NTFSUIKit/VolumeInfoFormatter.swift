@@ -46,9 +46,22 @@ public struct VolumeInfoFormatter: Sendable {
         return String(format: "%.1f%%", pct)
     }
 
+    /// Text shown for NTFS-internal facts that require raw device access when the
+    /// volume is mounted read-only and only `statfs` numbers are available.
+    public static let unavailableWhileMounted = "Unavailable while mounted"
+    /// Shorter "Unavailable" text for fields that are simply not present.
+    public static let unavailable = "Unavailable"
+
     /// `$MFT` location as a cluster-and-offset description for the Info view.
     public static func mftLocation(cluster: UInt64, byteOffset: UInt64) -> String {
         "cluster \(cluster) (offset \(humanBytes(byteOffset)))"
+    }
+
+    /// Nil-tolerant `$MFT` location: when either value is missing (mounted, no
+    /// device access) it degrades to a gentle "Unavailable while mounted" note.
+    public static func mftLocation(cluster: UInt64?, byteOffset: UInt64?) -> String {
+        guard let cluster, let byteOffset else { return unavailableWhileMounted }
+        return mftLocation(cluster: cluster, byteOffset: byteOffset)
     }
 
     /// NTFS version string ("NTFS 3.1").
@@ -56,9 +69,21 @@ public struct VolumeInfoFormatter: Sendable {
         "NTFS \(major).\(minor)"
     }
 
+    /// Nil-tolerant version label: nil → "Unavailable".
+    public static func versionLabel(major: UInt8?, minor: UInt8?) -> String {
+        guard let major, let minor else { return unavailable }
+        return versionLabel(major: major, minor: minor)
+    }
+
     /// Health/clean status text.
     public static func healthStatus(isDirty: Bool) -> String {
         isDirty ? "Dirty" : "Clean"
+    }
+
+    /// Nil-tolerant health status: nil → "Unavailable".
+    public static func healthStatus(isDirty: Bool?) -> String {
+        guard let isDirty else { return unavailable }
+        return healthStatus(isDirty: isDirty)
     }
 
     /// Permission text from the mount writability.

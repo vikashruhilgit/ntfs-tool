@@ -6,6 +6,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case all = "All Volumes"
     case mounted = "Mounted"
     case unmounted = "Unmounted"
+    case activity = "Activity"
     case settings = "Settings"
 
     var id: String { rawValue }
@@ -15,6 +16,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .all:       return "externaldrive"
         case .mounted:   return "checkmark.circle"
         case .unmounted: return "minus.circle"
+        case .activity:  return "list.bullet.rectangle"
         case .settings:  return "gearshape"
         }
     }
@@ -25,6 +27,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
 struct MainWindowView: View {
     @ObservedObject var installer: ExtensionInstaller
     @ObservedObject var diskService: DiskArbitrationService
+    @ObservedObject var activity: ActivityLog
 
     @State private var section: SidebarItem = .all
     @State private var selectedVolumeID: String?
@@ -37,9 +40,9 @@ struct MainWindowView: View {
 
     private var filteredVolumes: [DiskArbitrationService.Volume] {
         switch section {
-        case .all, .settings: return diskService.volumes
-        case .mounted:        return diskService.volumes.filter(\.isMounted)
-        case .unmounted:      return diskService.volumes.filter { !$0.isMounted }
+        case .all, .settings, .activity: return diskService.volumes
+        case .mounted:                    return diskService.volumes.filter(\.isMounted)
+        case .unmounted:                  return diskService.volumes.filter { !$0.isMounted }
         }
     }
 
@@ -48,13 +51,21 @@ struct MainWindowView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
+        // Custom HStack split instead of NavigationSplitView: on macOS 26 the
+        // split view fails to recompute the sidebar's title-bar inset on
+        // zoom/maximize/restore, sliding the top rows under the traffic lights.
+        // A plain HStack lays out with the standard window safe area, which is
+        // stable at every size. The sidebar owns its own title-bar clearance.
+        HStack(spacing: 0) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 240, ideal: 260, max: 300)
-        } detail: {
+                .frame(width: 264)
+            Divider()
+                .overlay(Color.ntfsOutline.opacity(0.3))
             detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(Color.ntfsSurface)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.ntfsSurface.ignoresSafeArea())
         .onAppear {
             diskService.refresh()
             if !hasSeenOnboarding { showOnboarding = true }
@@ -75,15 +86,15 @@ struct MainWindowView: View {
         VStack(alignment: .leading, spacing: Spacing.medium) {
             HStack(spacing: Spacing.small) {
                 Image(systemName: "internaldrive")
+                    .font(.system(size: 13, weight: .regular))
+                    .frame(width: 18, alignment: .center)
                     .foregroundStyle(Color.ntfsPrimary)
                 Text("NTFS Utility")
-                    .font(.ntfsTitle)
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.ntfsOnSurface)
             }
             .padding(.horizontal, Spacing.small)
-            .padding(.top, Spacing.small)
 
-            // Section picker.
             VStack(alignment: .leading, spacing: Spacing.unit) {
                 ForEach(SidebarItem.allCases) { item in
                     sidebarButton(item)
@@ -92,8 +103,7 @@ struct MainWindowView: View {
 
             Divider().overlay(Color.ntfsOutline.opacity(0.25))
 
-            // Volume list within the chosen section.
-            if section != .settings {
+            if section != .settings && section != .activity {
                 if filteredVolumes.isEmpty {
                     Text("No volumes")
                         .font(.ntfsBody)
@@ -118,18 +128,24 @@ struct MainWindowView: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 0)
 
             StatusBadge(
                 "Extension: \(installer.shortStatus)",
                 tone: extensionActive ? .success : .neutral
             )
             .padding(.horizontal, Spacing.small)
-            .padding(.bottom, Spacing.small)
         }
-        .padding(Spacing.small)
-        .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color.ntfsContainerLow)
+        // The window's safe area already sits below the title bar; this pads a
+        // little further so the header clears the traffic lights with breathing
+        // room. Fixed inset ⇒ stable at every window size (incl. zoom).
+        .padding(.top, Spacing.large)
+        .padding(.horizontal, Spacing.small)
+        .padding(.bottom, Spacing.medium)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        // Background bleeds to the window edges (under the traffic lights);
+        // the content above stays within the safe area.
+        .background(Color.ntfsContainerLow.ignoresSafeArea())
     }
 
     private func sidebarButton(_ item: SidebarItem) -> some View {
@@ -138,11 +154,14 @@ struct MainWindowView: View {
         } label: {
             HStack(spacing: Spacing.small) {
                 Image(systemName: item.systemImage)
-                Text(item.rawValue).font(.ntfsTitle)
+                    .font(.system(size: 15, weight: .regular))
+                    .frame(width: 22, alignment: .center)
+                Text(item.rawValue)
+                    .font(.system(size: 15, weight: .medium))
                 Spacer()
             }
             .padding(.horizontal, Spacing.small)
-            .padding(.vertical, Spacing.small)
+            .padding(.vertical, 8)
             .foregroundStyle(section == item ? Color.ntfsPrimary : Color.ntfsOnSurfaceVariant)
             .background(
                 RoundedRectangle(cornerRadius: Radius.control, style: .continuous)
@@ -159,13 +178,18 @@ struct MainWindowView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if section == .settings {
+        if section == .activity {
+            // Activity is a global timeline, not per-volume — show it regardless
+            // of the current volume selection.
+            ActivityView(activity: activity)
+        } else if section == .settings {
             SettingsDetailView(installer: installer)
         } else if let volume = selectedVolume {
             VolumeDashboardView(
                 volume: volume,
                 extensionActive: extensionActive,
-                diskService: diskService
+                diskService: diskService,
+                activity: activity
             )
             .id(volume.id) // fresh loader per volume
         } else {

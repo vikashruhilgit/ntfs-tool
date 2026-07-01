@@ -32,6 +32,56 @@ final class VolumeDetailLoaderTests: XCTestCase {
         XCTAssertEqual(vm.permissionDisplay, "Read-only")
         XCTAssertEqual(vm.versionDisplay, "NTFS 3.1")
         XCTAssertEqual(vm.percentUsed, 0.616, accuracy: 0.0001)
+        XCTAssertTrue(vm.ntfsDetailsAvailable)
+    }
+
+    /// The `statfs` fallback shape: capacity/used/free/cluster/percent are all
+    /// present (mounted volumes populate the ring + metric cards), but the
+    /// NTFS-internal facts are nil and degrade to the "Unavailable" strings.
+    func testViewModelFromStatfsShapePartialFacts() {
+        // Mimics what statfsFacts(...) returns: NTFS-internal fields all nil.
+        let facts = VolumeFacts(
+            label: "SANDISK",
+            devicePath: "/dev/disk8s1",
+            totalBytes: 100_000_000_000,
+            freeBytes: 38_400_000_000,
+            usedBytes: 61_600_000_000,
+            bytesPerCluster: 4096,
+            isWritable: false
+        )
+        XCTAssertFalse(facts.ntfsDetailsAvailable)
+
+        let vm = VolumeInfoViewModel(facts: facts)
+        // Capacity numbers + ring still populate.
+        XCTAssertEqual(vm.totalDisplay, "100.0 GB")
+        XCTAssertEqual(vm.usedDisplay, "61.6 GB")
+        XCTAssertEqual(vm.freeDisplay, "38.4 GB")
+        XCTAssertEqual(vm.clusterDisplay, "4 KB")
+        XCTAssertEqual(vm.percentUsedDisplay, "61.6%")
+        XCTAssertEqual(vm.percentUsed, 0.616, accuracy: 0.0001)
+        // NTFS-only facts degrade gently.
+        XCTAssertFalse(vm.ntfsDetailsAvailable)
+        XCTAssertNil(vm.isDirty)
+        XCTAssertEqual(vm.healthStatus, "Unavailable")
+        XCTAssertEqual(vm.mftLocationDisplay, "Unavailable while mounted")
+        XCTAssertEqual(vm.versionDisplay, "Unavailable")
+        // Permissions still shown.
+        XCTAssertEqual(vm.permissionDisplay, "Read-only")
+    }
+
+    /// `statfsFacts` reads real numbers off the current mount point without any
+    /// privileges — proves the non-privileged path works end-to-end.
+    func testStatfsFactsReadsMountPointWithoutPrivilege() throws {
+        let facts = try VolumeDetailLoader.statfsFacts(
+            mountPoint: "/",
+            devicePath: "/dev/diskDummy",
+            label: "root",
+            isWritable: false
+        )
+        XCTAssertGreaterThan(facts.totalBytes, 0)
+        XCTAssertGreaterThan(facts.bytesPerCluster, 0)
+        XCTAssertFalse(facts.ntfsDetailsAvailable)
+        XCTAssertEqual(facts.devicePath, "/dev/diskDummy")
     }
 
     func testLoadSuccessTransitionsToLoaded() async {

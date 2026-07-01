@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import NTFSUIKit
 
@@ -9,6 +10,7 @@ struct VolumeDashboardView: View {
     let volume: DiskArbitrationService.Volume
     let extensionActive: Bool
     @ObservedObject var diskService: DiskArbitrationService
+    @ObservedObject var activity: ActivityLog
 
     @StateObject private var loader: VolumeDetailLoader
     @State private var actionError: String?
@@ -19,17 +21,19 @@ struct VolumeDashboardView: View {
     @State private var showRepairConfirm = false
     @State private var formatLabel: String
 
-    init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService) {
+    init(volume: DiskArbitrationService.Volume, extensionActive: Bool, diskService: DiskArbitrationService, activity: ActivityLog) {
         self.volume = volume
         self.extensionActive = extensionActive
         self.diskService = diskService
+        self.activity = activity
         // A single loader backs both the read-only dashboard and the writable
         // Danger Zone actions: it opens the device writable only inside
         // runFormat/runRepair, read-only everywhere else.
         _loader = StateObject(wrappedValue: VolumeDetailLoader(
             devicePath: volume.devicePath,
             label: volume.displayName,
-            isWritable: true
+            isWritable: true,
+            mountPoint: volume.mountPoint
         ))
         _formatLabel = State(initialValue: volume.displayName)
     }
@@ -44,12 +48,26 @@ struct VolumeDashboardView: View {
                         .background(Color.ntfsError.opacity(0.1), in: RoundedRectangle(cornerRadius: Radius.small, style: .continuous))
                         .transition(.opacity)
                 }
-                bento
-                infoAndHealth
+                // Top row mirrors the mock: the bento (ring + metrics) on the
+                // left, the Drive Health panel on the right. ViewThatFits keeps
+                // them side-by-side when there's room and stacks them when the
+                // window is too narrow.
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: Spacing.medium) {
+                        bento
+                        driveHealthCard
+                            .frame(width: 320)
+                    }
+                    VStack(alignment: .leading, spacing: Spacing.large) {
+                        bento
+                        driveHealthCard
+                    }
+                }
                 dangerZone
+                volumeInfoCard
             }
             .padding(Spacing.large)
-            .frame(maxWidth: 980, alignment: .leading)
+            .frame(maxWidth: 1200, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(Color.ntfsSurface)
@@ -79,25 +97,42 @@ struct VolumeDashboardView: View {
                     Text(volume.displayName)
                         .font(.ntfsDisplay)
                         .foregroundStyle(Color.ntfsOnSurface)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                     StatusBadge(
                         volume.isMounted ? "Mounted" : "Unmounted",
                         tone: volume.isMounted ? .success : .neutral
                     )
+                    .fixedSize()
                 }
                 Text("NTFS · \(volume.mountPoint ?? "not mounted") · \(volume.devicePath)")
                     .font(.ntfsCode)
                     .foregroundStyle(Color.ntfsOnSurfaceVariant)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
 
-            Spacer()
+            Spacer(minLength: Spacing.small)
             actions
+                .fixedSize()
+                .layoutPriority(1)
         }
     }
 
     private var actions: some View {
         HStack(spacing: Spacing.small) {
+            if volume.isMounted, let mountPoint = volume.mountPoint {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: mountPoint)])
+                } label: {
+                    Label("Reveal", systemImage: "magnifyingglass")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .accessibilityLabel("Reveal \(volume.displayName) in Finder")
+            }
+
             Button {
-                Task { await loader.runVerify() }
+                Task { await runVerifyLogged() }
             } label: {
                 Label("Verify", systemImage: "checkmark.seal")
             }
@@ -133,6 +168,7 @@ struct VolumeDashboardView: View {
                 metricGrid
             }
         }
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -161,13 +197,6 @@ struct VolumeDashboardView: View {
 
     // MARK: - Volume Info + Drive Health
 
-    private var infoAndHealth: some View {
-        HStack(alignment: .top, spacing: Spacing.medium) {
-            volumeInfoCard
-            driveHealthCard
-        }
-    }
-
     private var volumeInfoCard: some View {
         SectionCard {
             VStack(alignment: .leading, spacing: Spacing.medium) {
@@ -185,9 +214,13 @@ struct VolumeDashboardView: View {
                         infoRow("Label", vm.label)
                         infoRow("Total Size", vm.totalDisplay)
                         infoRow("Free Space", vm.freeDisplay)
-                        infoRow("Bytes / Cluster", "\(vm.clusterDisplay)")
-                        infoRow("MFT Location", vm.mftLocationDisplay, mono: true)
-                        infoRow("Version", vm.versionDisplay, last: true)
+                        infoRow("Bytes / Cluster", "\(vm.clusterDisplay)", last: !vm.ntfsDetailsAvailable)
+                        if vm.ntfsDetailsAvailable {
+                            infoRow("MFT Location", vm.mftLocationDisplay, mono: true)
+                            infoRow("Version", vm.versionDisplay, last: true)
+                        } else {
+                            unavailableNote
+                        }
                     }
                 }
             }
@@ -203,8 +236,7 @@ struct VolumeDashboardView: View {
                         .foregroundStyle(Color.ntfsOnSurface)
                     Spacer()
                     if let vm = loader.info.value {
-                        Image(systemName: vm.isDirty ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-                            .foregroundStyle(vm.isDirty ? Color.ntfsError : Color.ntfsSuccess)
+                        healthIcon(for: vm)
                     }
                 }
 
@@ -215,9 +247,15 @@ struct VolumeDashboardView: View {
                     messageRow(message, tone: .error, icon: "exclamationmark.triangle")
                 case let .loaded(vm):
                     VStack(spacing: 0) {
-                        healthRow("Overall Status", value: vm.healthStatus, tone: vm.isDirty ? .error : .success)
-                        infoRow("Permissions", vm.permissionDisplay, mono: true)
-                        infoRow("Last Checked", lastCheckedText, last: true)
+                        // When NTFS details are unavailable (mounted, no device
+                        // access) the status is neutral, not an error.
+                        healthRow("Overall Status", value: vm.healthStatus, tone: healthTone(for: vm))
+                        infoRow("Permissions", vm.permissionDisplay, mono: true, last: !vm.ntfsDetailsAvailable)
+                        if vm.ntfsDetailsAvailable {
+                            infoRow("Last Checked", lastCheckedText, last: true)
+                        } else {
+                            unavailableNote
+                        }
                     }
                 }
 
@@ -265,6 +303,40 @@ struct VolumeDashboardView: View {
             )
             .transition(.opacity)
         }
+    }
+
+    /// Header health icon: green seal (clean), red triangle (dirty), or a neutral
+    /// question mark when the dirty flag couldn't be read (mounted read-only).
+    @ViewBuilder
+    private func healthIcon(for vm: VolumeInfoViewModel) -> some View {
+        switch vm.isDirty {
+        case .some(true):
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.ntfsError)
+        case .some(false):
+            Image(systemName: "checkmark.seal.fill").foregroundStyle(Color.ntfsSuccess)
+        case .none:
+            Image(systemName: "questionmark.circle").foregroundStyle(Color.ntfsOnSurfaceVariant)
+        }
+    }
+
+    /// Status-row tone: neutral when the dirty flag is unknown, else success/error.
+    private func healthTone(for vm: VolumeInfoViewModel) -> StatusTone {
+        switch vm.isDirty {
+        case .some(true): return .error
+        case .some(false): return .success
+        case .none: return .neutral
+        }
+    }
+
+    /// A single subtle line explaining why the NTFS-internal facts are missing —
+    /// shown instead of scary error text when the volume is mounted read-only.
+    private var unavailableNote: some View {
+        Text("NTFS details unavailable while mounted read-only — eject to inspect.")
+            .font(.ntfsCodeCaption)
+            .foregroundStyle(Color.ntfsOnSurfaceVariant)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, Spacing.small)
     }
 
     private var lastCheckedText: String {
@@ -322,26 +394,43 @@ struct VolumeDashboardView: View {
 
     // MARK: - Danger Zone (destructive actions)
 
+    /// True only when the volume is known to have a problem: its `$Volume`
+    /// dirty flag is set, or a Verify run surfaced problems. Unknown (mounted
+    /// read-only, dirty state unavailable) counts as "not known-bad" so Repair
+    /// stays hidden until the volume is ejected and the flag can be read.
+    private var needsRepair: Bool {
+        if loader.info.value?.isDirty == true { return true }
+        if let verify = loader.verify.value, !verify.isClean { return true }
+        return false
+    }
+
     private var dangerZone: some View {
         VStack(alignment: .leading, spacing: Spacing.medium) {
             HStack(alignment: .top, spacing: Spacing.medium) {
                 VStack(alignment: .leading, spacing: Spacing.unit) {
-                    Label("Danger Zone", systemImage: "exclamationmark.triangle.fill")
+                    Label("Destructive Actions", systemImage: "exclamationmark.triangle.fill")
                         .font(.ntfsTitle)
                         .foregroundStyle(Color.ntfsError)
-                    Text("These operations rewrite or modify the volume. They cannot be undone.")
+                    Text("These operations will erase or rewrite the volume data permanently.")
                         .font(.ntfsBody)
                         .foregroundStyle(Color.ntfsOnSurfaceVariant)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
                 HStack(spacing: Spacing.small) {
-                    Button { showRepairConfirm = true } label: {
-                        Label("Repair…", systemImage: "bandage")
+                    // Repair only appears when the volume is actually flagged
+                    // dirty (or a Verify surfaced problems) — a clean volume has
+                    // nothing to repair. While mounted read-only the dirty state
+                    // is unknown, so it stays hidden until the volume is ejected
+                    // and its $Volume flag can be read.
+                    if needsRepair {
+                        Button { showRepairConfirm = true } label: {
+                            Label("Repair…", systemImage: "bandage")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(loader.repair.isLoading || loader.format.isLoading)
+                        .accessibilityLabel("Repair volume \(volume.displayName)")
                     }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .disabled(loader.repair.isLoading || loader.format.isLoading)
-                    .accessibilityLabel("Repair volume \(volume.displayName)")
 
                     Button { showFormatConfirm = true } label: {
                         Label("Format as NTFS…", systemImage: "trash")
@@ -381,7 +470,7 @@ struct VolumeDashboardView: View {
         ) {
             Button("Erase and Format as NTFS", role: .destructive) {
                 let label = formatLabel
-                perform { await loader.runFormat(label: label) }
+                perform { await runFormatLogged(label: label) }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -393,7 +482,7 @@ struct VolumeDashboardView: View {
             titleVisibility: .visible
         ) {
             Button("Run Consistency Check") {
-                perform { await loader.runRepair() }
+                perform { await runRepairLogged() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -465,6 +554,9 @@ struct VolumeDashboardView: View {
     }
 
     private func perform(mount: Bool) {
+        // Mount/eject activity entries are logged inside DiskArbitrationService so
+        // there's a single source of truth (menu-bar and dashboard both funnel
+        // through it) — no need to log again here.
         actionError = nil
         busy = true
         Task {
@@ -474,6 +566,55 @@ struct VolumeDashboardView: View {
             }
             busy = false
             diskService.refresh()
+        }
+    }
+
+    // MARK: - Logged action wrappers
+
+    /// Run Verify, logging a running → clean/problems/failed entry.
+    private func runVerifyLogged() async {
+        let id = activity.log("Verifying \(volume.displayName)…", status: .running, volume: volume.displayName)
+        await loader.runVerify()
+        switch loader.verify {
+        case let .loaded(result):
+            if result.isClean {
+                activity.update(id, status: .success, detail: "Verify: clean")
+            } else {
+                let count = max(result.problems.count, 1)
+                activity.update(id, status: .warning, detail: "Verify: \(count) problem(s) found")
+            }
+        case let .failed(message):
+            activity.update(id, status: .error, detail: "Verify failed: \(message)")
+        default:
+            activity.update(id, status: .info, detail: nil)
+        }
+    }
+
+    /// Run Format, logging a running → done/failed entry.
+    private func runFormatLogged(label: String) async {
+        let id = activity.log("Formatting \(volume.displayName) as NTFS…", status: .running, volume: volume.displayName)
+        await loader.runFormat(label: label)
+        switch loader.format {
+        case let .loaded(result):
+            activity.update(id, status: .success, detail: result.summary)
+        case let .failed(message):
+            activity.update(id, status: .error, detail: "Format failed: \(message)")
+        default:
+            activity.update(id, status: .info, detail: nil)
+        }
+    }
+
+    /// Run Repair, logging a running → resolved/problems/failed entry.
+    private func runRepairLogged() async {
+        let id = activity.log("Repairing \(volume.displayName)…", status: .running, volume: volume.displayName)
+        await loader.runRepair()
+        switch loader.repair {
+        case let .loaded(result):
+            activity.update(id, status: result.isResolved ? .success : .warning, detail: result.headline)
+        case let .failed(message):
+            activity.update(id, status: .error, detail: "Repair failed: \(message)")
+        default:
+            activity.update(id, status: .info, detail: nil)
         }
     }
 }

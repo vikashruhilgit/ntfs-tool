@@ -17,6 +17,10 @@ final class DiskArbitrationService: ObservableObject {
 
     @Published private(set) var volumes: [Volume] = []
 
+    /// Shared session log — set by the app after init. Mount/eject outcomes are
+    /// recorded here so the Activity view shows a live in-progress → done trail.
+    weak var activityLog: ActivityLog?
+
     private var session: DASession?
     private var callbackBox: CallbackBox?
 
@@ -112,8 +116,16 @@ final class DiskArbitrationService: ObservableObject {
             } else {
                 mountPath = nil
             }
-            let displayName = (description[kDADiskDescriptionVolumeNameKey as String] as? String)
-                ?? bsdName
+            // Prefer the volume's real name. DiskArbitration's volume-name key
+            // is often empty for an fskit-mounted NTFS volume, so fall back to
+            // the mount-point folder Finder shows (e.g. /Volumes/SANDISK →
+            // "SANDISK", /Volumes/Untitled → "Untitled") before the BSD id.
+            let volumeName = (description[kDADiskDescriptionVolumeNameKey as String] as? String)
+                .flatMap { $0.isEmpty ? nil : $0 }
+            let mountName = mountPath
+                .map { ($0 as NSString).lastPathComponent }
+                .flatMap { $0.isEmpty ? nil : $0 }
+            let displayName = volumeName ?? mountName ?? bsdName
             let mediaSize = (description[kDADiskDescriptionMediaSizeKey as String] as? UInt64)
                 ?? (description[kDADiskDescriptionMediaSizeKey as String] as? NSNumber)?.uint64Value
 
@@ -131,11 +143,17 @@ final class DiskArbitrationService: ObservableObject {
     /// Trigger DiskArbitration to mount the volume at its default mount point.
     /// Returns an error string on failure; nil on success.
     func mount(_ volume: Volume) async -> String? {
+        let logID = activityLog?.log("Mounting \(volume.displayName)…", status: .running, volume: volume.displayName)
+
         guard let session = session,
               let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, volume.id)
-        else { return "could not resolve \(volume.id)" }
+        else {
+            let err = "could not resolve \(volume.id)"
+            if let logID { activityLog?.update(logID, status: .error, detail: err) }
+            return err
+        }
 
-        return await withCheckedContinuation { continuation in
+        let err: String? = await withCheckedContinuation { continuation in
             DADiskMount(disk, nil, DADiskMountOptions(kDADiskMountOptionDefault), { _, dissenter, ctx in
                 let resultPtr = Unmanaged<ResultBox>.fromOpaque(ctx!).takeRetainedValue()
                 if let dissenter = dissenter {
@@ -146,14 +164,29 @@ final class DiskArbitrationService: ObservableObject {
                 resultPtr.semaphore.signal()
             }, Unmanaged.passRetained(ResultBox(continuation: continuation)).toOpaque())
         }
+
+        if let logID {
+            activityLog?.update(
+                logID,
+                status: err == nil ? .success : .error,
+                detail: err == nil ? "Mounted \(volume.displayName)." : err
+            )
+        }
+        return err
     }
 
     func unmount(_ volume: Volume) async -> String? {
+        let logID = activityLog?.log("Ejecting \(volume.displayName)…", status: .running, volume: volume.displayName)
+
         guard let session = session,
               let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, volume.id)
-        else { return "could not resolve \(volume.id)" }
+        else {
+            let err = "could not resolve \(volume.id)"
+            if let logID { activityLog?.update(logID, status: .error, detail: err) }
+            return err
+        }
 
-        return await withCheckedContinuation { continuation in
+        let err: String? = await withCheckedContinuation { continuation in
             DADiskUnmount(disk, DADiskUnmountOptions(kDADiskUnmountOptionDefault), { _, dissenter, ctx in
                 let resultPtr = Unmanaged<ResultBox>.fromOpaque(ctx!).takeRetainedValue()
                 if let dissenter = dissenter {
@@ -164,6 +197,15 @@ final class DiskArbitrationService: ObservableObject {
                 resultPtr.semaphore.signal()
             }, Unmanaged.passRetained(ResultBox(continuation: continuation)).toOpaque())
         }
+
+        if let logID {
+            activityLog?.update(
+                logID,
+                status: err == nil ? .success : .error,
+                detail: err == nil ? "Ejected \(volume.displayName)." : "Eject failed: \(err ?? "")"
+            )
+        }
+        return err
     }
 
     /// Boxed reference to escape Swift across the DA C callback boundary.
