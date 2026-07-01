@@ -65,4 +65,31 @@ final class VolumeInfoFormatterTests: XCTestCase {
     func testVersionLabel() {
         XCTAssertEqual(VolumeInfoFormatter.versionLabel(major: 3, minor: 1), "NTFS 3.1")
     }
+
+    // MARK: nil-tolerant overloads (statfs / mounted-read-only path)
+
+    func testMftLocationNilDegradesToUnavailableWhileMounted() {
+        XCTAssertEqual(
+            VolumeInfoFormatter.mftLocation(cluster: nil, byteOffset: nil),
+            "Unavailable while mounted"
+        )
+        XCTAssertEqual(
+            VolumeInfoFormatter.mftLocation(cluster: 786_432, byteOffset: nil),
+            "Unavailable while mounted"
+        )
+        // Both present → the real description via the optional overload.
+        let s = VolumeInfoFormatter.mftLocation(cluster: 786_432 as UInt64?, byteOffset: 3_221_225_472 as UInt64?)
+        XCTAssertTrue(s.contains("cluster 786432"), s)
+    }
+
+    func testVersionLabelNilDegradesToUnavailable() {
+        XCTAssertEqual(VolumeInfoFormatter.versionLabel(major: nil, minor: nil), "Unavailable")
+        XCTAssertEqual(VolumeInfoFormatter.versionLabel(major: 3 as UInt8?, minor: 1 as UInt8?), "NTFS 3.1")
+    }
+
+    func testHealthStatusNilDegradesToUnavailable() {
+        XCTAssertEqual(VolumeInfoFormatter.healthStatus(isDirty: nil), "Unavailable")
+        XCTAssertEqual(VolumeInfoFormatter.healthStatus(isDirty: false as Bool?), "Clean")
+        XCTAssertEqual(VolumeInfoFormatter.healthStatus(isDirty: true as Bool?), "Dirty")
+    }
 }

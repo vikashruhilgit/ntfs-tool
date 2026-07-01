@@ -18,17 +18,24 @@ public struct VolumeFacts: Equatable, Sendable {
     /// `volume.bytesPerCluster`.
     public var bytesPerCluster: UInt32
     /// `volume.mftByteOffset` — byte offset of `$MFT` from the volume start.
-    public var mftByteOffset: UInt64
-    /// First `$MFT` cluster (`boot.mftCluster`).
-    public var mftCluster: UInt64
-    /// `$Volume` dirty flag.
-    public var isDirty: Bool
-    /// NTFS major version (typically 3).
-    public var ntfsMajorVersion: UInt8
-    /// NTFS minor version (typically 1).
-    public var ntfsMinorVersion: UInt8
+    /// `nil` when the NTFS-internal facts weren't read from the device (e.g. the
+    /// volume is mounted and only `statfs` numbers are available).
+    public var mftByteOffset: UInt64?
+    /// First `$MFT` cluster (`boot.mftCluster`). `nil` when not read from device.
+    public var mftCluster: UInt64?
+    /// `$Volume` dirty flag. `nil` when not read from device.
+    public var isDirty: Bool?
+    /// NTFS major version (typically 3). `nil` when not read from device.
+    public var ntfsMajorVersion: UInt8?
+    /// NTFS minor version (typically 1). `nil` when not read from device.
+    public var ntfsMinorVersion: UInt8?
     /// Whether the mount is writable. Read-only path today.
     public var isWritable: Bool
+
+    /// True when the NTFS-internal facts (MFT location, version, dirty flag) were
+    /// actually read off the device. False when only the non-privileged `statfs`
+    /// numbers are available (volume mounted, raw device not readable).
+    public var ntfsDetailsAvailable: Bool { isDirty != nil }
 
     public init(
         label: String,
@@ -37,11 +44,11 @@ public struct VolumeFacts: Equatable, Sendable {
         freeBytes: UInt64,
         usedBytes: UInt64,
         bytesPerCluster: UInt32,
-        mftByteOffset: UInt64,
-        mftCluster: UInt64,
-        isDirty: Bool,
-        ntfsMajorVersion: UInt8,
-        ntfsMinorVersion: UInt8,
+        mftByteOffset: UInt64? = nil,
+        mftCluster: UInt64? = nil,
+        isDirty: Bool? = nil,
+        ntfsMajorVersion: UInt8? = nil,
+        ntfsMinorVersion: UInt8? = nil,
         isWritable: Bool
     ) {
         self.label = label

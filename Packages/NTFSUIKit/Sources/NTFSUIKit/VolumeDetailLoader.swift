@@ -37,6 +37,10 @@ public final class VolumeDetailLoader: ObservableObject {
     public let label: String
     /// Whether the underlying mount is writable (read-only today).
     public let isWritable: Bool
+    /// The volume's mount point (e.g. `/Volumes/SANDISK`) when mounted, else nil.
+    /// Used for a non-privileged `statfs` fallback when the raw device can't be
+    /// opened (Finder-mounted volumes are `root:operator 0640`).
+    public let mountPoint: String?
 
     @Published public private(set) var info: LoadState<VolumeInfoViewModel> = .idle
     @Published public private(set) var verify: LoadState<VerifyResult> = .idle
@@ -56,6 +60,7 @@ public final class VolumeDetailLoader: ObservableObject {
         devicePath: String,
         label: String,
         isWritable: Bool,
+        mountPoint: String? = nil,
         factsProvider: (@Sendable () async throws -> VolumeFacts)? = nil,
         verifyProvider: (@Sendable () async throws -> VerifyResult)? = nil,
         formatProvider: (@Sendable (String) async throws -> FormatResult)? = nil,
@@ -64,6 +69,7 @@ public final class VolumeDetailLoader: ObservableObject {
         self.devicePath = devicePath
         self.label = label
         self.isWritable = isWritable
+        self.mountPoint = mountPoint
         self.factsProvider = factsProvider
         self.verifyProvider = verifyProvider
         self.formatProvider = formatProvider
@@ -78,7 +84,7 @@ public final class VolumeDetailLoader: ObservableObject {
             if let provider = factsProvider {
                 facts = try await provider()
             } else {
-                facts = try await Self.readFacts(devicePath: devicePath, label: label, isWritable: isWritable)
+                facts = try await Self.readFacts(devicePath: devicePath, mountPoint: mountPoint, label: label, isWritable: isWritable)
             }
             info = .loaded(VolumeInfoViewModel(facts: facts))
         } catch {
@@ -148,7 +154,30 @@ public final class VolumeDetailLoader: ObservableObject {
 
     // MARK: - Real NTFSCore reads (run off the main actor)
 
-    nonisolated static func readFacts(devicePath: String, label: String, isWritable: Bool) async throws -> VolumeFacts {
+    /// Read volume facts with this precedence:
+    ///   1. Raw NTFSCore read off the device — full facts incl. NTFS-internal
+    ///      fields. Best data, works when unmounted or when we have privileges.
+    ///   2. If that fails AND we have a mount point — `statfs` on the mount point.
+    ///      No privileges needed; gives capacity/used/free/block-size but leaves
+    ///      the NTFS-internal fields nil (they degrade to "Unavailable while
+    ///      mounted"). This is the common case for a Finder-mounted NTFS volume,
+    ///      whose raw device node is `root:operator 0640`.
+    ///   3. If that fails and there's no mount point — rethrow the real error so
+    ///      a genuinely unreadable/absent device surfaces it.
+    nonisolated static func readFacts(devicePath: String, mountPoint: String?, label: String, isWritable: Bool) async throws -> VolumeFacts {
+        do {
+            return try await readFactsFromDevice(devicePath: devicePath, label: label, isWritable: isWritable)
+        } catch {
+            if let mountPoint {
+                return try statfsFacts(mountPoint: mountPoint, devicePath: devicePath, label: label, isWritable: isWritable)
+            }
+            throw error
+        }
+    }
+
+    /// Full raw read off the device — populates the NTFS-internal fields. Throws
+    /// EACCES for a Finder-mounted volume the user can't open.
+    nonisolated static func readFactsFromDevice(devicePath: String, label: String, isWritable: Bool) async throws -> VolumeFacts {
         let device = try FileHandleBlockDevice(openingFileAt: devicePath)
         let volume = try await Volume(device: device)
         let stats = try await volume.allocationStats()
@@ -168,6 +197,38 @@ public final class VolumeDetailLoader: ObservableObject {
             isDirty: dirty,
             ntfsMajorVersion: vinfo.majorVersion,
             ntfsMinorVersion: vinfo.minorVersion,
+            isWritable: isWritable
+        )
+    }
+
+    /// Non-privileged fallback: `statfs()` on the mount point returns total/free
+    /// blocks + block size without needing to open the raw device. NTFS-internal
+    /// fields stay nil. `f_bavail` (available to non-root) matches Finder's free
+    /// number. `f_bsize` is the filesystem block size — the best non-privileged
+    /// proxy for cluster size (it is NOT guaranteed to equal the NTFS cluster
+    /// size for an fskit mount, but it's the closest we can get without device
+    /// access).
+    nonisolated static func statfsFacts(mountPoint: String, devicePath: String, label: String, isWritable: Bool) throws -> VolumeFacts {
+        var s = statfs()
+        guard statfs(mountPoint, &s) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        let bsize = UInt64(s.f_bsize)
+        let total = UInt64(s.f_blocks) * bsize
+        let free  = UInt64(s.f_bavail) * bsize     // available to non-root (matches Finder)
+        let used  = total >= free ? total - free : 0
+        return VolumeFacts(
+            label: label,
+            devicePath: devicePath,
+            totalBytes: total,
+            freeBytes: free,
+            usedBytes: used,
+            bytesPerCluster: UInt32(s.f_bsize),
+            mftByteOffset: nil,
+            mftCluster: nil,
+            isDirty: nil,
+            ntfsMajorVersion: nil,
+            ntfsMinorVersion: nil,
             isWritable: isWritable
         )
     }
