@@ -50,6 +50,7 @@
 		DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D92594B427E2C9D518EF55B /* MainWindowView.swift */; };
 		E393226E78D76282E1C54E3B /* NTFSHelperProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC71E4C595524225567FB699 /* NTFSHelperProtocol.swift */; };
 		E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */; };
+		EB3AB46CCB7F1D6E31F4C7CB /* PrivilegedHelperClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5B37FAECF4E47898BAC3650 /* PrivilegedHelperClient.swift */; };
 		EF91959587345A62A4C6F9C7 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = 5FC03FBDA32B2A2E0CBB6A46 /* ArgumentParser */; };
 		F53D207E8209413C3BDB1B68 /* Write.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82E0F813FDD6E122C9D24085 /* Write.swift */; };
 		F61D5B995D0BA5EEE68AAE5A /* Reclaim.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5C2D05E8F173F3576EBFB6 /* Reclaim.swift */; };
@@ -150,6 +151,7 @@
 		DCA5E38E9032E0438DC7F187 /* NTFSPrivilegedHelper */ = {isa = PBXFileReference; includeInIndex = 0; path = NTFSPrivilegedHelper; sourceTree = BUILT_PRODUCTS_DIR; };
 		DE068D882A088571281101D0 /* Delete.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Delete.swift; sourceTree = "<group>"; };
 		F1A3BBEED299F75B6604C0F0 /* Format.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Format.swift; sourceTree = "<group>"; };
+		F5B37FAECF4E47898BAC3650 /* PrivilegedHelperClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivilegedHelperClient.swift; sourceTree = "<group>"; };
 		F82499EDC514F10F561B7784 /* NTFSItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NTFSItem.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -219,6 +221,7 @@
 				9D92594B427E2C9D518EF55B /* MainWindowView.swift */,
 				138AC53F11BB4630926D3661 /* MenuBarContent.swift */,
 				8A06B00FBFD00329D5A6271B /* NTFSMountManagerApp.swift */,
+				F5B37FAECF4E47898BAC3650 /* PrivilegedHelperClient.swift */,
 				0C34ED043863741172748733 /* VolumeDashboardView.swift */,
 				6471581351116FFFC4F16780 /* VolumeRowModel+DiskArbitration.swift */,
 			);
@@ -540,6 +543,7 @@
 				4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */,
 				B3E3592596DF001EFE111A27 /* NTFSHelperProtocol.swift in Sources */,
 				54C39871604C2B9CAAB241C4 /* NTFSMountManagerApp.swift in Sources */,
+				EB3AB46CCB7F1D6E31F4C7CB /* PrivilegedHelperClient.swift in Sources */,
 				A4C05E55DD888425B91563F8 /* VolumeDashboardView.swift in Sources */,
 				A05D196189C6BA4F91ADF250 /* VolumeRowModel+DiskArbitration.swift in Sources */,
 			);

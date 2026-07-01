@@ -2,6 +2,15 @@ import Foundation
 import NTFSCore
 import Security
 
+/// `NSXPCConnection.auditToken` exists at runtime (it backs `+[NSXPCConnection
+/// currentConnection]` validation) but Apple does not declare it in the public
+/// SDK header. Expose it through an `@objc` protocol we cast the connection to —
+/// the standard, App-Store-safe technique for retrieving the kernel-bound audit
+/// token of the peer (a bare PID can be recycled; the audit token cannot).
+@objc private protocol XPCConnectionAuditToken {
+    var auditToken: audit_token_t { get }
+}
+
 // Root LaunchDaemon entry point. Runs as root (installed via SMAppService) so it
 // can open the raw NTFS device node — `root:operator 0640` — which the sandboxed,
 // unprivileged GUI cannot. It exposes exactly the read paths NTFSCore already
@@ -15,6 +24,15 @@ import Security
 /// Errors are surfaced as a message string — never a crash (no `fatalError`).
 final class HelperService: NSObject, NTFSHelperProtocol {
 
+    /// Sendable reference box so the detached `Task` can store its `(Data?,
+    /// String?)` result without capturing mutable locals across the concurrency
+    /// boundary. Written once by the Task, read once after `sem.wait()`; the
+    /// semaphore provides the happens-before ordering.
+    private final class ReplyBox: @unchecked Sendable {
+        var payload: Data?
+        var errorMessage: String?
+    }
+
     func helperVersion(withReply reply: @escaping (String) -> Void) {
         reply(helperBuildVersion)
     }
@@ -23,9 +41,8 @@ final class HelperService: NSObject, NTFSHelperProtocol {
         // Bridge the sync XPC reply block to NTFSCore's async actor via a
         // semaphore. We are on an XPC connection's dispatch queue here, so
         // blocking it is fine and keeps the reply strictly ordered.
+        let box = ReplyBox()
         let sem = DispatchSemaphore(value: 0)
-        var payload: Data?
-        var errorMessage: String?
         Task {
             do {
                 let device = try FileHandleBlockDevice(openingFileAt: devicePath)
@@ -46,20 +63,19 @@ final class HelperService: NSObject, NTFSHelperProtocol {
                     ntfsMajor: vinfo.majorVersion,
                     ntfsMinor: vinfo.minorVersion
                 )
-                payload = try JSONEncoder().encode(info)
+                box.payload = try JSONEncoder().encode(info)
             } catch {
-                errorMessage = HelperService.describe(error)
+                box.errorMessage = HelperService.describe(error)
             }
             sem.signal()
         }
         sem.wait()
-        reply(payload, errorMessage)
+        reply(box.payload, box.errorMessage)
     }
 
     func verify(devicePath: String, withReply reply: @escaping (Data?, String?) -> Void) {
+        let box = ReplyBox()
         let sem = DispatchSemaphore(value: 0)
-        var payload: Data?
-        var errorMessage: String?
         Task {
             do {
                 let device = try FileHandleBlockDevice(openingFileAt: devicePath)
@@ -74,14 +90,14 @@ final class HelperService: NSObject, NTFSHelperProtocol {
                     problems.append("Volume was last modified by chkdsk.")
                 }
                 let result = HelperVerifyResult(isClean: !dirty, problems: problems)
-                payload = try JSONEncoder().encode(result)
+                box.payload = try JSONEncoder().encode(result)
             } catch {
-                errorMessage = HelperService.describe(error)
+                box.errorMessage = HelperService.describe(error)
             }
             sem.signal()
         }
         sem.wait()
-        reply(payload, errorMessage)
+        reply(box.payload, box.errorMessage)
     }
 
     /// Human-readable rendering of a thrown error for the reply string.
@@ -121,7 +137,13 @@ final class HelperDelegate: NSObject, NSXPCListenerDelegate {
     /// audit token is bound to the actual sending process by the kernel, unlike
     /// a bare PID which can be recycled.
     static func isClientTrusted(_ connection: NSXPCConnection) -> Bool {
-        var token = connection.auditToken
+        // Retrieve the peer's kernel-bound audit token via the private-but-stable
+        // `auditToken` property (see XPCConnectionAuditToken above).
+        guard let tokenProvider = connection as? XPCConnectionAuditToken else {
+            NSLog("[NTFSPrivilegedHelper] connection does not expose auditToken")
+            return false
+        }
+        var token = tokenProvider.auditToken
         let tokenData = Data(bytes: &token, count: MemoryLayout<audit_token_t>.size)
 
         let attributes: [CFString: Any] = [
