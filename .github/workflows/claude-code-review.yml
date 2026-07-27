@@ -36,6 +36,8 @@ jobs:
       # posting one requires issues:write, not issues:read.
       issues: write
       id-token: write
+      # Needed for `gh pr checks` / run introspection from within the review.
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -57,6 +59,11 @@ jobs:
           # full review (21 turns, ~$0.50 on PR #51) and then posts nothing, while
           # the workflow still reports success. vendsy/hub passes it; this did not.
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
+          # Without an explicit tool grant the review is denied the Bash/gh call it
+          # needs to post, and bails early: PR #51's run ended with
+          # "permission_denials_count": 1 after only 4 turns and posted nothing,
+          # while still reporting is_error=false. Grant copied from vendsy/hub.
+          claude_args: '--allowed-tools "Bash(gh:*),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git rev-parse:*),Bash(find:*),Read,Grep,Glob"'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
