@@ -55,10 +55,25 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          # `--comment` is REQUIRED to actually post. Without it the command runs a
-          # full review (21 turns, ~$0.50 on PR #51) and then posts nothing, while
-          # the workflow still reports success. vendsy/hub passes it; this did not.
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
+          # A BARE slash command as the whole prompt does not produce a posted
+          # review: PR #51's run ended 5 turns / 21s / 0 denials / no comment.
+          # vendsy/hub — the one config in this account verified to post — wraps
+          # the command in an instruction preamble ending "then run the review
+          # command below to post the comment". That preamble is the difference.
+          # `--comment` is also required; without it the command reviews (21 turns,
+          # ~$0.50) and posts nothing while still reporting success.
+          prompt: |
+            Review this pull request and POST the review as a PR comment.
+
+            Investigation steps before drafting findings:
+            1. Run `gh pr checks ${{ github.event.pull_request.number }} --json name,bucket,state`, ignoring the entry named "Claude Code Review" (this workflow reviewing itself). If any other check is `fail`/`cancel`, record it as a finding. If any is `pending`, say so rather than assuming green.
+            2. For every file in the diff, run `git show ${{ github.event.pull_request.base.sha }}:<path>` or `git diff ${{ github.event.pull_request.base.sha }}...HEAD -- <path>` to see the pre-PR state and verify the change's premise. If the stated bug is not actually caused by the changed lines, say so.
+            3. This repo is a Swift NTFS read/write toolkit (`Packages/NTFSCore`, `Tools/ntfsctl`, `Extensions/NTFSFileSystem`). For any change to on-disk structure, allocation, or `$I30`/MFT handling, check whether the claim is validated against something OTHER than our own reader — `docs/STATUS.md` records repeated "weak oracle" incidents where code passed our own decoder but real Windows/ntfs-3g drivers rejected the volume. Validation that only round-trips through NTFSCore is itself a finding.
+            4. Prefer depth over breadth: one real regression traced through the write path beats five file-local nits. Do not pad.
+
+            Then run the review command below, which posts the comment:
+
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment
           # Without an explicit tool grant the review is denied the Bash/gh call it
           # needs to post, and bails early: PR #51's run ended with
           # "permission_denials_count": 1 after only 4 turns and posted nothing,
