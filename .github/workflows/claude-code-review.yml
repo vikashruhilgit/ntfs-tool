@@ -10,6 +10,14 @@ on:
     #   - "src/**/*.js"
     #   - "src/**/*.jsx"
 
+# Collapse rapid-fire pushes to the same PR into a single review of the latest
+# state: a new run cancels any in-flight review for the same PR. `synchronize`
+# is deliberately KEPT in the trigger list above so each pushed fix round gets a
+# fresh review — without it only the first push is ever reviewed.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
     # Optional: Filter by PR author
@@ -21,7 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      # `write`, not `read` — posting the review comment is a write operation.
+      # Matches the two known-working setups in this account (loomwright, Tray/hub).
+      pull-requests: write
       issues: read
       id-token: write
 
