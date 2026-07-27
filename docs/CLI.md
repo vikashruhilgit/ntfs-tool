@@ -172,6 +172,8 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `scan` | (no args) | List attached NTFS partitions with size + free space + serial. `--include-images` also probes `.img` files in cwd. `--long` for cluster size + MFT location. |
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
 | `list` | `<device> [path-or-recnum]` | List directory contents. Default = root (`/`). Accepts a path like `/Backups` (primary) or a bare MFT record number. Pass `--long` for record numbers + sizes + namespace. |
+| `tree` | `<device> [path-or-recnum]` | Recursive `/usr/bin/tree`-style listing, ending with an `N directories, M files` summary. `--depth N` (`-L N`) bounds the descent. Streams a depth-first `$I30` walk — the tree is never held in memory, so it works on very large volumes. **Read-only.** |
+| `find` | `<device> [path-or-recnum]` | Recursively match entry **names** against a glob and print full paths. `--name '<glob>'` (default `*`), `--type f\|d`, `--depth N` (`-L N`). Matching is **case-insensitive**, mirroring NTFS name semantics. Name matching only — no content search, no `-exec`. **Read-only.** |
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
 | `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 0 = auto-bounded by `$MFT`'s logical size). `--verbose` for per-record details. **`--deep`** additionally runs a whole-volume runlist↔`$Bitmap` + double-allocation sweep — catches free-but-referenced / out-of-range / double-allocated clusters the plain check can't see (the v0.5 multi-extent / portability diagnostic). **Read-only.** |
 | `dump` | `<device> <path>` | Read-only deep dump of ONE file's unnamed `$DATA`: MFT record identity (base vs migrated/`$ATTRIBUTE_LIST`), `$DATA` header (resident vs non-resident, real/allocated/initialized sizes, lastVCN), the decoded runlist as an extent table with each extent's `$Bitmap` status (`ALLOCATED` / `FREE(!)` / `OUT_OF_RANGE(!)`, plus an advisory `OVERLAPS_RESERVED(!)` per-extent flag), and a final `runlist OK` / `runlist FAULTY` verdict. `--verbose` for per-cluster detail. The single-file companion to `verify --deep`: both share the same audit, and the pass/fail verdict covers exactly free-but-referenced / out-of-range / double-allocated clusters. Reserved-region overlap is reported only as the advisory per-extent flag and is NOT part of either command's verdict, so the two always agree. **Read-only.** |
@@ -237,7 +239,35 @@ sudo ntfsctl list --long /dev/disk10s1 /gallery/2024
 diskutil mount /dev/disk10s1
 ```
 
-(A `find`-style recursive walker is future work — for now you walk by hand or write a shell loop.)
+### Walk a whole tree, or locate a file by name
+
+`list` shows one directory; `tree` and `find` walk recursively. Both stream a
+depth-first `$I30` walk through the same shared NTFSCore walker, so neither
+holds the tree in memory, both stop at `--depth`, both terminate on a
+directory cycle, and an unreadable subdirectory is reported on stderr while
+the rest of the walk still completes.
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# Whole tree, with a "N directories, M files" summary at the end
+sudo ntfsctl tree /dev/disk10s1
+
+# Only the top two levels of one subtree
+sudo ntfsctl tree /dev/disk10s1 /gallery --depth 2
+
+# Locate files by name anywhere under the volume (case-insensitive glob)
+sudo ntfsctl find /dev/disk10s1 / --name '*.jpg' --type f
+
+# Directories only, within three levels of /Backups
+sudo ntfsctl find /dev/disk10s1 /Backups --type d --depth 3
+
+diskutil mount /dev/disk10s1
+```
+
+Both list the NTFS metafiles (`$MFT`, `$Boot`, `$Extend`, …) that live in the
+volume root, exactly as `list` does — filter them out with a glob
+(`--name '[!$]*'`) if you only want user data.
 
 ### Recursive copy from host to NTFS
 

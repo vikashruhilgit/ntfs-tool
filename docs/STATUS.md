@@ -353,8 +353,8 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 ### Low-impact / polish
 
 9. ~~**Better `ntfsctl verify`.**~~ ✅ Largely done. The "sweeps only records 0..63" description is stale: `Verify.swift` walks the full MFT (bounded by `maxRecords` / `mftLogicalRecords`) and the `--deep` mode detects orphans, dangling `$I30` entries, free-but-referenced and double-allocated clusters, and audits runlists against `$Bitmap` — the capabilities this entry asked for. Remaining `fsck`-equivalent ambitions (repair, not just detect) are tracked separately.
-10. **`ntfsctl tree`.** Recursive directory walk (depth-first or breadth-first), prints a tree like `/usr/bin/tree`.
-11. **Recursive `ntfsctl find`.** Match by name pattern, traverse the volume.
+10. ~~**`ntfsctl tree`.**~~ ✅ Done. Depth-first `/usr/bin/tree`-style rendering with `--depth N` and an `N directories, M files` summary.
+11. ~~**Recursive `ntfsctl find`.**~~ ✅ Done. Case-insensitive glob name matching with `--depth N` and `--type f|d`, printing full paths. Both `tree` and `find` are thin consumers of ONE shared walker — `NTFSCore.DirectoryWalker`, a pull-based streaming `$I30` traversal (`Packages/NTFSCore/Sources/NTFSCore/DirectoryWalker.swift`) that is cycle/revisit-safe (tracks visited MFT record numbers), depth-bounded before descent, streaming (retains only the frames on the current root-to-node path — never the whole tree), and error-contained (an unreadable subdirectory yields one error event and the walk continues; a failure at the walk root is reported at depth 0 so the CLI can exit non-zero like `list`). Neither subcommand re-implements traversal, enforced by a source-text test. 10 `DirectoryWalkerTests` + 8 `TreeFindTests`.
 12. **Better error messages.** Several `NTFSError.corruptOnDisk(...)` strings could be more user-actionable (suggest `chkdsk`, etc.).
 13. **Volume statistics in the menu bar.** Show free space as a progress bar in the per-volume row.
 14. **Drag-and-drop in the menu bar app.** Drop a file onto the volume row to copy it. (Requires FSKit mount actually working, of course.)
