@@ -52,6 +52,15 @@ on a mounted volume, with correct errno mapping instead of a blanket `EROFS`.
 - `createSymbolicLink` still returns `EROFS`, with the reparse-point blocker documented in a
   comment at the refusal site.
 - `verify --deep` is clean after a hard-link create/delete cycle.
+- **Validated against a FOREIGN reader, not only our own.** A hard-link create/delete cycle must
+  be checked through `scripts/ntfs-oracle.sh` (the `ntfs-3g` Docker oracle), or on real hardware
+  via Windows `chkdsk /f`. **`verify --deep` alone is NOT sufficient evidence for this
+  requirement** — it shares the implementation's own assumptions about `$I30` shape and
+  hard-link refcounts, so a subtly wrong on-disk structure passes it while a real driver rejects
+  the volume. This repo has paid for that exact mistake three times (`docs/STATUS.md`: the `$I30`
+  `COLLATION_FILE_NAME` bug, the `mkntfs` removal, the `$MFT` auto-grow gap — the header calls it
+  "the weak-oracle trap"). `createLink` writes real on-disk structure, so it is squarely in that
+  category.
 - The extension builds clean; existing tests pass.
 
 ## Outcomes Rubric
@@ -59,3 +68,5 @@ on a mounted volume, with correct errno mapping instead of a blanket `EROFS`.
 - Errno mapping is specific and individually asserted, never a blanket EROFS
 - Read-only mounts still refuse; symlink refusal is documented, not silent
 - `verify --deep` clean after the hard-link cycle; extension builds clean
+- **Cross-validated through `scripts/ntfs-oracle.sh` (or `chkdsk`) — our own reader agreeing
+  with itself does not count as evidence**

@@ -135,7 +135,8 @@ All write callbacks wired to NTFSCore:
 | `write` (file contents) | ✅ — wires to Volume.write + setDirty, EINVAL on negative offset |
 | `setAttributes` (size only) | ✅ — wires to Volume.truncate |
 | `openItem` | ✅ — honors isReadOnly flag |
-| `createSymbolicLink` / `createLink` / `renameItem` | ❌ — return EROFS (out of scope for v1) |
+| `createSymbolicLink` / `createLink` | ❌ — return EROFS (out of scope for v1) |
+| `renameItem` | ✅ — fully implemented (EBADF/ENOTDIR/EINVAL guards, then real rename logic; never returns EROFS) |
 
 Code is complete. **Has never been activated on real hardware** because that requires SIP-off or the FSKit entitlement.
 
@@ -347,7 +348,7 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 5. **Real `$LogFile` journal records.** Currently uses a "dirty bit only" approach which is correct for clean unmounts but doesn't enable automatic recovery from crashes/power-loss. Implementation: write LFS-formatted journal entries before metadata changes; replay incomplete transactions on dirty mount. Substantial — ~1-2 weeks for a minimal correct implementation.
 6. **In-place runlist extension on append.** Stage 4's append always frees the old runlist and allocates fresh. Wasteful on fragmented allocators. Implementation: extend the last extent if there's free space adjacent, else add a new extent to the existing runlist. ~1 day.
 7. ~~**`$UpCase`-aware filename collation.**~~ ✅ Done (v0.7.3 — this is the `$I30` collation root-cause fix described in the header above). `IndexBuilder.swift` implements the NTFS `COLLATION_FILE_NAME` comparator over `$UpCase`-folded UTF-16 code units; the only surviving mention of `localizedCaseInsensitiveCompare` is a comment explaining the order is deliberately *not* that. This entry described the pre-v0.7.3 state and was simply never struck when the fix landed.
-8. **`renameItem` / `createSymbolicLink` / `createLink` callbacks.** Currently return EROFS. Implementation: rename = remove $I30 entry + insert with new name + update $FILE_NAME's parent ref. Symbolic links require reparse point work — bigger.
+8. **`createSymbolicLink` / `createLink` callbacks.** Currently return EROFS. `createLink` (hard link) = add a second `$FILE_NAME` referencing the same base MFT record, insert the `$I30` entry, bump the hard-link count. Symbolic links require reparse point work — bigger. NOTE: `renameItem` was previously listed here too and is NOT blocked — it is fully implemented (`NTFSVolume.swift:431`).
 
 ### Low-impact / polish
 
