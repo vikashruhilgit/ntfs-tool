@@ -9,6 +9,20 @@ public struct DirectoryEntry: Sendable, Equatable {
     public let sequenceNumber: UInt16
     public let fileName: FileName
 
+    /// Public so a `DirectoryChildSource` can be implemented outside
+    /// NTFSCore (the FSKit adapter, CLI tests, synthetic trees).
+    public init(
+        fileReference: UInt64,
+        recordNumber: UInt64,
+        sequenceNumber: UInt16,
+        fileName: FileName
+    ) {
+        self.fileReference = fileReference
+        self.recordNumber = recordNumber
+        self.sequenceNumber = sequenceNumber
+        self.fileName = fileName
+    }
+
     public var name: String { fileName.name }
     public var isDirectory: Bool {
         // The NTFS-specific FILE_NAME_INDEX_PRESENT bit (0x10000000) of

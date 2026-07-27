@@ -42,6 +42,38 @@ public struct FileName: Sendable, Equatable {
 
     public static let minimumSize = 66  // header before the name bytes
 
+    /// Public so a `DirectoryChildSource` can be implemented outside NTFSCore
+    /// (the FSKit adapter, CLI tests, synthetic trees). Everything but the
+    /// name defaults, since most callers only care about the name, the
+    /// directory bit and the size.
+    public init(
+        parentDirectoryReference: UInt64 = 0,
+        parentRecordNumber: UInt64 = 0,
+        parentSequenceNumber: UInt16 = 0,
+        creationTime: Date? = nil,
+        modificationTime: Date? = nil,
+        mftChangeTime: Date? = nil,
+        accessTime: Date? = nil,
+        allocatedSize: UInt64 = 0,
+        realSize: UInt64 = 0,
+        fileAttributes: UInt32 = 0,
+        namespace: Namespace = .win32,
+        name: String
+    ) {
+        self.parentDirectoryReference = parentDirectoryReference
+        self.parentRecordNumber = parentRecordNumber
+        self.parentSequenceNumber = parentSequenceNumber
+        self.creationTime = creationTime
+        self.modificationTime = modificationTime
+        self.mftChangeTime = mftChangeTime
+        self.accessTime = accessTime
+        self.allocatedSize = allocatedSize
+        self.realSize = realSize
+        self.fileAttributes = fileAttributes
+        self.namespace = namespace
+        self.name = name
+    }
+
     public static func parse(_ data: Data) throws -> FileName {
         guard data.count >= minimumSize else {
             throw NTFSError.corruptOnDisk(

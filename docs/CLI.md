@@ -81,6 +81,10 @@ sudo ntfsctl list /dev/disk10s1                 # root, names only
 sudo ntfsctl list --long /dev/disk10s1          # root, with sizes + record numbers
 sudo ntfsctl list --long /dev/disk10s1 /Photos  # a subdirectory by path
 
+# Walk recursively instead of one level at a time
+sudo ntfsctl tree /dev/disk10s1 /Photos --depth 2   # /usr/bin/tree-style + summary
+sudo ntfsctl find /dev/disk10s1 --name '*.jpg'      # full paths of every match
+
 # Read a file's content by PATH to stdout
 sudo ntfsctl cat /dev/disk10s1 /Photos/vacation.jpg > /tmp/extracted.jpg
 
@@ -100,7 +104,7 @@ sudo ntfsctl verify /dev/disk10s1
 diskutil mount /dev/disk10s1
 ```
 
-**Files and directories are addressed by path by default** (e.g. `/Photos/vacation.jpg`), resolved from the volume root. Every targeting subcommand (`list`, `cat`, `dump`, `create`, `write`, `truncate`, `rm`, `mv`, `delete`) accepts a path.
+**Files and directories are addressed by path by default** (e.g. `/Photos/vacation.jpg`), resolved from the volume root. Every targeting subcommand (`list`, `tree`, `find`, `cat`, `dump`, `create`, `write`, `truncate`, `rm`, `mv`, `delete`) accepts a path.
 
 The legacy MFT-record-number form is still available where it's useful — pass `--recnum` (or, for `create`, `--parent-recnum`) to interpret the argument as a record number instead of a path. A bare argument is **always** a path, so a file literally named `38` targets the path `/38`, never record 38.
 
@@ -172,6 +176,8 @@ Run `ntfsctl <subcommand> --help` for full flag details. Summary:
 | `scan` | (no args) | List attached NTFS partitions with size + free space + serial. `--include-images` also probes `.img` files in cwd. `--long` for cluster size + MFT location. |
 | `info` | `<device>` | Print volume metadata + free/used cluster counts |
 | `list` | `<device> [path-or-recnum]` | List directory contents. Default = root (`/`). Accepts a path like `/Backups` (primary) or a bare MFT record number. Pass `--long` for record numbers + sizes + namespace. |
+| `tree` | `<device> [path-or-recnum]` | Recursive `/usr/bin/tree`-style listing with a trailing `N directories, M files` summary. `--depth N` bounds the descent (1 = immediate children); `--full-path` prints absolute paths instead of names. Streamed — whole-volume trees don't accumulate in memory. Directory cycles are marked `[cycle: already visited]` and not re-entered; an unreadable subdirectory prints inline as `[error: …]`, the walk continues, and the exit status is 1. **Read-only.** |
+| `find` | `<device> [path-or-recnum]` | Recursively match entries by NAME and print their full paths. `--name '<glob>'` (`*` `?` `[abc]` `[a-z]` `[!abc]`, case-insensitive by default — NTFS semantics — or `--case-sensitive`), `--type f\|d`, `--depth N`. Name matching only: no content search, no `-exec`. Unreadable subdirectories go to stderr and the walk continues (exit status 1). **Read-only.** |
 | `cat` | `<device> <recnum-or-path>` | Stream file bytes to stdout (chunked; no 1 GiB cap). `--offset` / `--length` for partial reads. |
 | `verify` | `<device>` | Full MFT sweep + orphan + dangling-$I30 detection. Extension-record aware: reports `Extension records: N (linked)` and treats v0.5-migration extension records (those with a non-zero base file reference) as legitimate, not orphans; surfaces a separate `leaked extension (base record free)` error class. `--max-records N` (default 0 = auto-bounded by `$MFT`'s logical size). `--verbose` for per-record details. **`--deep`** additionally runs a whole-volume runlist↔`$Bitmap` + double-allocation sweep — catches free-but-referenced / out-of-range / double-allocated clusters the plain check can't see (the v0.5 multi-extent / portability diagnostic). **Read-only.** |
 | `dump` | `<device> <path>` | Read-only deep dump of ONE file's unnamed `$DATA`: MFT record identity (base vs migrated/`$ATTRIBUTE_LIST`), `$DATA` header (resident vs non-resident, real/allocated/initialized sizes, lastVCN), the decoded runlist as an extent table with each extent's `$Bitmap` status (`ALLOCATED` / `FREE(!)` / `OUT_OF_RANGE(!)`, plus an advisory `OVERLAPS_RESERVED(!)` per-extent flag), and a final `runlist OK` / `runlist FAULTY` verdict. `--verbose` for per-cluster detail. The single-file companion to `verify --deep`: both share the same audit, and the pass/fail verdict covers exactly free-but-referenced / out-of-range / double-allocated clusters. Reserved-region overlap is reported only as the advisory per-extent flag and is NOT part of either command's verdict, so the two always agree. **Read-only.** |
@@ -230,14 +236,44 @@ diskutil mount /dev/disk10s1
 
 ```bash
 diskutil unmount /dev/disk10s1
-sudo ntfsctl list --long /dev/disk10s1                                # root
+sudo ntfsctl list --long /dev/disk10s1                                # one directory
 # Descend either by record number or by path (path form is friendlier):
 sudo ntfsctl list --long /dev/disk10s1 /WD\ -\ Software
-sudo ntfsctl list --long /dev/disk10s1 /gallery/2024
+
+# …or walk the whole thing at once with `tree`:
+sudo ntfsctl tree /dev/disk10s1                       # entire volume
+sudo ntfsctl tree /dev/disk10s1 /gallery --depth 2    # two levels under /gallery
+sudo ntfsctl tree /dev/disk10s1 --full-path | tail -1 # just the dir/file summary
+
+# Flat list of every file path (no directories), for diffing against a backup:
+sudo ntfsctl find /dev/disk10s1 --type f > /tmp/volume-manifest.txt
 diskutil mount /dev/disk10s1
 ```
 
-(A `find`-style recursive walker is future work — for now you walk by hand or write a shell loop.)
+### Locate a file anywhere on the volume
+
+```bash
+diskutil unmount /dev/disk10s1
+
+# By glob, case-insensitive (NTFS semantics) — prints full paths:
+sudo ntfsctl find /dev/disk10s1 --name '*.HEIC'
+sudo ntfsctl find /dev/disk10s1 --name 'IMG_20240?*' --type f
+
+# Restrict the search to a subtree and/or a depth:
+sudo ntfsctl find /dev/disk10s1 /gallery --name '*.mp4' --depth 3
+
+# Directories only (e.g. "which album folders exist?"):
+sudo ntfsctl find /dev/disk10s1 /gallery --type d --depth 1
+
+diskutil mount /dev/disk10s1
+```
+
+Both `tree` and `find` drive the same recursive `$I30` walker in NTFSCore, so
+they behave identically on the edge cases: the walk is streamed (a
+22,000-file volume costs no more memory than a small one), directories are
+never re-entered (a directory that references an ancestor is reported once and
+skipped), `--depth` is honoured before descending, and one unreadable
+subdirectory does not abort the rest of the walk.
 
 ### Recursive copy from host to NTFS
 
