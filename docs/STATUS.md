@@ -70,6 +70,8 @@ If you want **terminal read/write access to NTFS on macOS today**, the CLI is re
 | `info` | ✅ | Volume metadata + free-space stats |
 | `scan` | ✅ | **NEW.** Enumerate attached NTFS partitions (no more `diskutil list` eyeballing). `--include-images` probes `.img` files too. |
 | `list` | ✅ | Directory enumeration, short + long format. Accepts MFT recnum OR path. |
+| `tree` | ✅ | **NEW.** Recursive `/usr/bin/tree`-style listing with `--depth N` and a `N directories, M files` summary. Consumes the shared `NTFSCore.DirectoryWalker` (cycle-safe, depth-bounded, streaming, per-node error containment). |
+| `find` | ✅ | **NEW.** Recursive name search by shell glob, printing full paths. `--from` / `--depth N` / `--type f\|d`. Second consumer of the same `DirectoryWalker` — no duplicated traversal. |
 | `verify` | ✅ | **Full-MFT sweep** + orphan detection + dangling-$I30 detection. Bounds itself by $MFT's $DATA realSize. **Extension-record aware (v0.5):** distinguishes base records from v0.5 Fix B migration extension records — reports an `Extension records: N (linked)` line, no longer false-flags them as orphans, and surfaces a `leaked extension (base record free)` error class. |
 | `cat` | ✅ | File content to stdout. Streaming (no 1 GiB cap), supports `--offset`/`--length`. Accepts MFT recnum OR path. |
 | `create` | ✅ | New file/directory with $I30 insertion. Auto-promotes small dirs to LARGE_INDEX on overflow. |
@@ -353,8 +355,10 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 ### Low-impact / polish
 
 9. ~~**Better `ntfsctl verify`.**~~ ✅ Largely done. The "sweeps only records 0..63" description is stale: `Verify.swift` walks the full MFT (bounded by `maxRecords` / `mftLogicalRecords`) and the `--deep` mode detects orphans, dangling `$I30` entries, free-but-referenced and double-allocated clusters, and audits runlists against `$Bitmap` — the capabilities this entry asked for. Remaining `fsck`-equivalent ambitions (repair, not just detect) are tracked separately.
-10. **`ntfsctl tree`.** Recursive directory walk (depth-first or breadth-first), prints a tree like `/usr/bin/tree`.
-11. **Recursive `ntfsctl find`.** Match by name pattern, traverse the volume.
+10. ~~**`ntfsctl tree`.**~~ ✅ Done. Depth-first pre-order render with `--depth N` (`-L N`) and a trailing `N directories, M files` summary.
+11. ~~**Recursive `ntfsctl find`.**~~ ✅ Done. Glob name match with `--from`, `--depth N`, `--type f|d`, printing full paths.
+
+    Both landed together on ONE shared traversal — `Packages/NTFSCore/Sources/NTFSCore/DirectoryWalker.swift` — rather than a walk per subcommand. The walker is generic over a `DirectoryEnumerating` source (`Volume` conforms), streams `(path, entry, depth)` events to a visitor so nothing accumulates (measured: 3.2 MiB resident growth over a 349,524-entry walk vs 204 MiB when the same events are collected), tracks visited MFT record numbers so a `$I30` back-edge is reported once and not followed, checks `maxDepth` *before* enumerating (so `--depth` bounds IO, not just output), and turns an unreadable subdirectory into a per-node failure event instead of aborting the walk. `Tree.swift` / `Find.swift` contain rendering and matching only; a source-level test asserts neither touches `Volume.enumerate` directly.
 12. **Better error messages.** Several `NTFSError.corruptOnDisk(...)` strings could be more user-actionable (suggest `chkdsk`, etc.).
 13. **Volume statistics in the menu bar.** Show free space as a progress bar in the per-volume row.
 14. **Drag-and-drop in the menu bar app.** Drop a file onto the volume row to copy it. (Requires FSKit mount actually working, of course.)
