@@ -17,7 +17,7 @@ for a single PR.
 | 01 | `cp --resume` | high-impact #8 | No `resume` symbol in `Tools/ntfsctl/Sources/ntfsctl/Cp.swift` | moderate |
 | 02 | Streaming `$Bitmap` reader | high-impact #9 | `Bitmap.swift:12` — `public var bytes: Data` holds the whole bitmap | **strong** |
 | 03 | `ntfsctl tree` + `find` | low-impact #10, #11 | Neither in the `subcommands:` list (`ntfsctl.swift:17`) | **strong** |
-| 04 | FSKit link callbacks | medium-impact #8 | `NTFSVolume.swift:380,389` return `posixError(EROFS)` | moderate |
+| 04 | FSKit `createLink` (hard link) | medium-impact #8 | `NTFSVolume.swift:389` returns `posixError(EROFS)`. NOTE: `renameItem` is NOT blocked — already implemented; see 04's correction note | low |
 | 05 | `NTFSError` richer model | substantial #15 | Flat enum with string descriptions in `Errors.swift` | broad//refactor |
 
 ## Stale entries found — STATUS.md needs correcting
