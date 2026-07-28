@@ -77,6 +77,13 @@ public enum WalkEvent {
 /// O(depth) walker would require a streaming `enumerate`, which does not exist
 /// yet.
 ///
+/// There is a second, smaller term: ``visited`` retains one `UInt64` per
+/// directory descended into, for the whole walk, and is never pruned when a
+/// frame pops (~8 bytes per directory, so ~800 KB for a 100,000-directory
+/// volume). That term genuinely does grow with the size of the tree — it is
+/// the price of the cycle guard below, and it is bounded by the directory
+/// count, not the file count.
+///
 /// ## Cycle and revisit safety
 ///
 /// `$I30` graphs can contain cycles (`Volume.rename` has no ancestor guard, so
