@@ -353,8 +353,8 @@ Ordered by user impact. Each is a focused piece of work appropriate for a single
 ### Low-impact / polish
 
 9. ~~**Better `ntfsctl verify`.**~~ ✅ Largely done. The "sweeps only records 0..63" description is stale: `Verify.swift` walks the full MFT (bounded by `maxRecords` / `mftLogicalRecords`) and the `--deep` mode detects orphans, dangling `$I30` entries, free-but-referenced and double-allocated clusters, and audits runlists against `$Bitmap` — the capabilities this entry asked for. Remaining `fsck`-equivalent ambitions (repair, not just detect) are tracked separately.
-10. **`ntfsctl tree`.** Recursive directory walk (depth-first or breadth-first), prints a tree like `/usr/bin/tree`.
-11. **Recursive `ntfsctl find`.** Match by name pattern, traverse the volume.
+10. ~~**`ntfsctl tree`.**~~ ✅ Done (2026-07-27). `Tree.swift` renders a depth-first `$I30` walk in `/usr/bin/tree` style (`├── `, `└── `, `│   `) with a trailing `N directories, M files` summary; `--depth N` bounds the descent and an unreadable directory becomes an inline `[error: …]` line instead of aborting the render. The traversal itself lives in the shared `NTFSCore.DirectoryWalker` (cursor-based, cycle-safe, depth-bounded), not in the subcommand — `Tree.swift` contains no descent logic of its own.
+11. ~~**Recursive `ntfsctl find`.**~~ ✅ Done (2026-07-27). `Find.swift` matches each entry's **name** against a glob (`--name`, case-insensitive `fnmatch(3)` — `find -name` semantics, not `-path`), with `--type f|d` and `--depth N`, and prints one full path per match. Shares the same `NTFSCore.DirectoryWalker` as `tree`, so there is exactly one general-purpose directory walker in the codebase.
 12. **Better error messages.** Several `NTFSError.corruptOnDisk(...)` strings could be more user-actionable (suggest `chkdsk`, etc.).
 13. **Volume statistics in the menu bar.** Show free space as a progress bar in the per-volume row.
 14. **Drag-and-drop in the menu bar app.** Drop a file onto the volume row to copy it. (Requires FSKit mount actually working, of course.)
