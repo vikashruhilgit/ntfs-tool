@@ -71,7 +71,13 @@ struct VolumeDashboardView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(Color.ntfsSurface)
-        .task(id: volume.id) { await loader.load() }
+        .task(id: volume.id) { await syncAndLoad() }
+        // `volume` is a value that DiskArbitration replaces on every refresh,
+        // but `@StateObject` pins the loader to the value present at first
+        // appearance. Watch the fields the loader actually reads so a mount
+        // point that arrives later reaches it.
+        .onChange(of: volume.mountPoint) { Task { await syncAndLoad() } }
+        .onChange(of: volume.isMounted) { Task { await syncAndLoad() } }
         .animation(.easeInOut(duration: 0.25), value: loader.info)
         .animation(.easeInOut(duration: 0.25), value: loader.verify)
         .animation(.easeInOut(duration: 0.25), value: loader.format)
@@ -541,6 +547,34 @@ struct VolumeDashboardView: View {
 
     // MARK: - Mount/eject
 
+    /// Point the loader at the volume's current state, then load.
+    ///
+    /// The re-point is the load-bearing half: the loader is a `@StateObject`
+    /// built once per view identity, so without this it keeps the device path,
+    /// label and mount point captured at first appearance.
+    private func syncAndLoad() async {
+        await syncAndLoad(from: volume)
+    }
+
+    /// Re-point the loader at `source`, then load.
+    ///
+    /// Callers running after an action must pass the *re-resolved* volume, not
+    /// the view's own `volume`: this view is a value type, so the `volume`
+    /// captured by an in-flight `Task` closure is frozen at tap time. Loading
+    /// from it after a successful mount would configure the loader with the old
+    /// `mountPoint: nil`, skip the `statfs` fallback, hit the root-only raw
+    /// device, and flash the very "administrator privileges" placeholder this
+    /// view exists to avoid.
+    private func syncAndLoad(from source: DiskArbitrationService.Volume) async {
+        loader.configure(
+            devicePath: source.devicePath,
+            label: source.displayName,
+            isWritable: true,
+            mountPoint: source.mountPoint
+        )
+        await loader.load()
+    }
+
     /// Generic async action runner mirroring `perform(mount:)`: clears prior
     /// error, flips `busy`, runs the work, refreshes DiskArbitration.
     private func perform(_ work: @escaping () async -> Void) {
@@ -549,7 +583,14 @@ struct VolumeDashboardView: View {
         Task {
             await work()
             busy = false
-            diskService.refresh()
+            // Await the refresh, then re-resolve: `.task(id: volume.id)` only
+            // re-fires when the selection changes, so without this an action
+            // leaves the facts panel showing what was loaded before it — blank
+            // until the user switches sections and comes back. Format/repair
+            // change the label without changing mount state, so the `onChange`
+            // watchers alone would not cover them.
+            await diskService.refreshAndWait()
+            await syncAndLoad(from: diskService.current(volume.id, fallback: volume))
         }
     }
 
@@ -565,7 +606,13 @@ struct VolumeDashboardView: View {
                 actionError = "\(mount ? "Mount" : "Eject") failed: \(err)"
             }
             busy = false
-            diskService.refresh()
+            // Mount state just changed: the facts come from a `statfs` fallback
+            // keyed on the mount point (the raw device needs root), so they are
+            // only valid for the state we are now in. Await the refresh and
+            // reload from the re-resolved volume — loading from the captured
+            // one would use the pre-action mount point. See `perform(_:)`.
+            await diskService.refreshAndWait()
+            await syncAndLoad(from: diskService.current(volume.id, fallback: volume))
         }
     }
 
