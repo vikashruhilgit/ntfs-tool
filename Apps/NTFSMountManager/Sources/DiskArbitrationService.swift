@@ -46,10 +46,28 @@ final class DiskArbitrationService: ObservableObject {
     }
 
     func refresh() {
-        Task {
-            let snapshot = await snapshotAllNTFSDisks()
-            self.volumes = snapshot
-        }
+        Task { await refreshAndWait() }
+    }
+
+    /// Refresh, and don't return until `volumes` actually reflects the new
+    /// snapshot.
+    ///
+    /// `refresh()` is fire-and-forget: it returns before the assignment lands.
+    /// Anything that acts on post-action state (mount, eject, format) must use
+    /// this instead, or it reads the pre-action world. Pair it with
+    /// `current(_:)` — awaiting the refresh updates `volumes`, but a SwiftUI
+    /// value-type view still holds the `Volume` it captured at tap time.
+    func refreshAndWait() async {
+        volumes = await snapshotAllNTFSDisks()
+    }
+
+    /// The live `Volume` for a BSD id, or `fallback` if it has gone away.
+    ///
+    /// A `View` is a value: the `volume` inside an in-flight `Task` closure is
+    /// frozen at the moment the button was tapped and never updates, however
+    /// long you wait. Re-resolve through this after `refreshAndWait()`.
+    func current(_ id: String, fallback: Volume) -> Volume {
+        volumes.first { $0.id == id } ?? fallback
     }
 
     private func startSession() {

@@ -553,11 +553,24 @@ struct VolumeDashboardView: View {
     /// built once per view identity, so without this it keeps the device path,
     /// label and mount point captured at first appearance.
     private func syncAndLoad() async {
+        await syncAndLoad(from: volume)
+    }
+
+    /// Re-point the loader at `source`, then load.
+    ///
+    /// Callers running after an action must pass the *re-resolved* volume, not
+    /// the view's own `volume`: this view is a value type, so the `volume`
+    /// captured by an in-flight `Task` closure is frozen at tap time. Loading
+    /// from it after a successful mount would configure the loader with the old
+    /// `mountPoint: nil`, skip the `statfs` fallback, hit the root-only raw
+    /// device, and flash the very "administrator privileges" placeholder this
+    /// view exists to avoid.
+    private func syncAndLoad(from source: DiskArbitrationService.Volume) async {
         loader.configure(
-            devicePath: volume.devicePath,
-            label: volume.displayName,
+            devicePath: source.devicePath,
+            label: source.displayName,
             isWritable: true,
-            mountPoint: volume.mountPoint
+            mountPoint: source.mountPoint
         )
         await loader.load()
     }
@@ -570,12 +583,14 @@ struct VolumeDashboardView: View {
         Task {
             await work()
             busy = false
-            diskService.refresh()
-            // `.task(id: volume.id)` only re-fires when the selection changes,
-            // so an action that alters mount state would otherwise leave the
-            // facts panel showing whatever was loaded before it — blank until
-            // the user switches sections and comes back.
-            await syncAndLoad()
+            // Await the refresh, then re-resolve: `.task(id: volume.id)` only
+            // re-fires when the selection changes, so without this an action
+            // leaves the facts panel showing what was loaded before it — blank
+            // until the user switches sections and comes back. Format/repair
+            // change the label without changing mount state, so the `onChange`
+            // watchers alone would not cover them.
+            await diskService.refreshAndWait()
+            await syncAndLoad(from: diskService.current(volume.id, fallback: volume))
         }
     }
 
@@ -591,12 +606,13 @@ struct VolumeDashboardView: View {
                 actionError = "\(mount ? "Mount" : "Eject") failed: \(err)"
             }
             busy = false
-            diskService.refresh()
             // Mount state just changed: the facts come from a `statfs` fallback
             // keyed on the mount point (the raw device needs root), so they are
-            // only valid for the state we are now in. Reload rather than let a
-            // stale panel stand. See `perform(_:)`.
-            await syncAndLoad()
+            // only valid for the state we are now in. Await the refresh and
+            // reload from the re-resolved volume — loading from the captured
+            // one would use the pre-action mount point. See `perform(_:)`.
+            await diskService.refreshAndWait()
+            await syncAndLoad(from: diskService.current(volume.id, fallback: volume))
         }
     }
 
