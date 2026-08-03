@@ -31,16 +31,24 @@ public enum LoadState<Value: Equatable & Sendable>: Equatable, Sendable {
 @MainActor
 public final class VolumeDetailLoader: ObservableObject {
 
+    // These are `var`, not `let`, because the loader outlives the values it was
+    // built from. A SwiftUI view owning this via `@StateObject` evaluates
+    // `StateObject(wrappedValue:)` exactly once per view identity — every later
+    // `init` with a fresher volume is discarded. Left immutable, a loader
+    // created before DiskArbitration reported a mount point keeps `nil`
+    // forever, the `statfs` fallback can never fire, and the panel shows the
+    // root-only raw-device error instead of capacity. See `configure`.
+
     /// The BSD device path this loader reads, e.g. `/dev/disk6s1`.
-    public let devicePath: String
+    public private(set) var devicePath: String
     /// Label to surface (DiskArbitration-derived).
-    public let label: String
+    public private(set) var label: String
     /// Whether the underlying mount is writable (read-only today).
-    public let isWritable: Bool
+    public private(set) var isWritable: Bool
     /// The volume's mount point (e.g. `/Volumes/SANDISK`) when mounted, else nil.
     /// Used for a non-privileged `statfs` fallback when the raw device can't be
     /// opened (Finder-mounted volumes are `root:operator 0640`).
-    public let mountPoint: String?
+    public private(set) var mountPoint: String?
 
     @Published public private(set) var info: LoadState<VolumeInfoViewModel> = .idle
     @Published public private(set) var verify: LoadState<VerifyResult> = .idle
@@ -74,6 +82,32 @@ public final class VolumeDetailLoader: ObservableObject {
         self.verifyProvider = verifyProvider
         self.formatProvider = formatProvider
         self.repairProvider = repairProvider
+    }
+
+    /// Re-point this loader at the current state of the same volume.
+    ///
+    /// Call before `load()` whenever the owning view's volume value may have
+    /// changed — most importantly when `mountPoint` appears or disappears,
+    /// since that decides whether the non-privileged `statfs` path is available
+    /// at all. Returns `true` when something actually changed, so callers can
+    /// skip a redundant reload.
+    @discardableResult
+    public func configure(
+        devicePath: String,
+        label: String,
+        isWritable: Bool,
+        mountPoint: String?
+    ) -> Bool {
+        let changed = devicePath != self.devicePath
+            || label != self.label
+            || isWritable != self.isWritable
+            || mountPoint != self.mountPoint
+        guard changed else { return false }
+        self.devicePath = devicePath
+        self.label = label
+        self.isWritable = isWritable
+        self.mountPoint = mountPoint
+        return true
     }
 
     /// Load volume facts via NTFSCore and map to the display view-model.

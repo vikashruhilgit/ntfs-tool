@@ -132,4 +132,65 @@ final class VolumeDetailLoaderTests: XCTestCase {
         let msg = VolumeDetailLoader.message(for: err)
         XCTAssertTrue(msg.lowercased().contains("permission"), msg)
     }
+
+    // MARK: - Re-pointing an existing loader (the @StateObject staleness trap)
+
+    private func loader(mountPoint: String?) -> VolumeDetailLoader {
+        VolumeDetailLoader(
+            devicePath: "/dev/disk6s1",
+            label: "Untitled",
+            isWritable: true,
+            mountPoint: mountPoint
+        )
+    }
+
+    /// The regression this exists for. A SwiftUI view owning the loader via
+    /// `@StateObject` builds it exactly once per view identity, so a loader
+    /// created before DiskArbitration reported a mount point must be able to
+    /// learn it later — otherwise the non-privileged `statfs` fallback can
+    /// never fire and the dashboard shows the root-only raw-device error
+    /// instead of capacity.
+    func testConfigureLearnsAMountPointThatArrivesLater() {
+        let l = loader(mountPoint: nil)
+        XCTAssertNil(l.mountPoint)
+
+        let changed = l.configure(
+            devicePath: "/dev/disk6s1",
+            label: "Untitled",
+            isWritable: true,
+            mountPoint: "/Volumes/Untitled"
+        )
+
+        XCTAssertTrue(changed, "a newly-arrived mount point must register as a change")
+        XCTAssertEqual(l.mountPoint, "/Volumes/Untitled")
+    }
+
+    /// Eject must clear the mount point, so the loader stops claiming a
+    /// `statfs` path that no longer exists.
+    func testConfigureClearsMountPointOnEject() {
+        let l = loader(mountPoint: "/Volumes/Untitled")
+        XCTAssertTrue(l.configure(devicePath: "/dev/disk6s1", label: "Untitled", isWritable: true, mountPoint: nil))
+        XCTAssertNil(l.mountPoint)
+    }
+
+    /// Idempotence: re-configuring with identical values reports no change, so
+    /// callers can skip a redundant reload.
+    func testConfigureWithIdenticalValuesReportsNoChange() {
+        let l = loader(mountPoint: "/Volumes/Untitled")
+        XCTAssertFalse(
+            l.configure(devicePath: "/dev/disk6s1", label: "Untitled", isWritable: true, mountPoint: "/Volumes/Untitled"),
+            "unchanged inputs must not report a change"
+        )
+        XCTAssertEqual(l.mountPoint, "/Volumes/Untitled")
+    }
+
+    /// A renamed volume (DiskArbitration resolves the real name after the row
+    /// first appears with the BSD id) must reach the loader too.
+    func testConfigureUpdatesLabelAndDevicePath() {
+        let l = loader(mountPoint: nil)
+        XCTAssertTrue(l.configure(devicePath: "/dev/disk7s2", label: "SANDISK", isWritable: false, mountPoint: nil))
+        XCTAssertEqual(l.devicePath, "/dev/disk7s2")
+        XCTAssertEqual(l.label, "SANDISK")
+        XCTAssertFalse(l.isWritable)
+    }
 }

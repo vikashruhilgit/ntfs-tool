@@ -71,7 +71,13 @@ struct VolumeDashboardView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .background(Color.ntfsSurface)
-        .task(id: volume.id) { await loader.load() }
+        .task(id: volume.id) { await syncAndLoad() }
+        // `volume` is a value that DiskArbitration replaces on every refresh,
+        // but `@StateObject` pins the loader to the value present at first
+        // appearance. Watch the fields the loader actually reads so a mount
+        // point that arrives later reaches it.
+        .onChange(of: volume.mountPoint) { Task { await syncAndLoad() } }
+        .onChange(of: volume.isMounted) { Task { await syncAndLoad() } }
         .animation(.easeInOut(duration: 0.25), value: loader.info)
         .animation(.easeInOut(duration: 0.25), value: loader.verify)
         .animation(.easeInOut(duration: 0.25), value: loader.format)
@@ -541,6 +547,21 @@ struct VolumeDashboardView: View {
 
     // MARK: - Mount/eject
 
+    /// Point the loader at the volume's current state, then load.
+    ///
+    /// The re-point is the load-bearing half: the loader is a `@StateObject`
+    /// built once per view identity, so without this it keeps the device path,
+    /// label and mount point captured at first appearance.
+    private func syncAndLoad() async {
+        loader.configure(
+            devicePath: volume.devicePath,
+            label: volume.displayName,
+            isWritable: true,
+            mountPoint: volume.mountPoint
+        )
+        await loader.load()
+    }
+
     /// Generic async action runner mirroring `perform(mount:)`: clears prior
     /// error, flips `busy`, runs the work, refreshes DiskArbitration.
     private func perform(_ work: @escaping () async -> Void) {
@@ -550,6 +571,11 @@ struct VolumeDashboardView: View {
             await work()
             busy = false
             diskService.refresh()
+            // `.task(id: volume.id)` only re-fires when the selection changes,
+            // so an action that alters mount state would otherwise leave the
+            // facts panel showing whatever was loaded before it — blank until
+            // the user switches sections and comes back.
+            await syncAndLoad()
         }
     }
 
@@ -566,6 +592,11 @@ struct VolumeDashboardView: View {
             }
             busy = false
             diskService.refresh()
+            // Mount state just changed: the facts come from a `statfs` fallback
+            // keyed on the mount point (the raw device needs root), so they are
+            // only valid for the state we are now in. Reload rather than let a
+            // stale panel stand. See `perform(_:)`.
+            await syncAndLoad()
         }
     }
 

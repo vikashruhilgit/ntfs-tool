@@ -140,10 +140,72 @@ final class DiskArbitrationService: ObservableObject {
         return result.sorted { $0.id < $1.id }
     }
 
+    /// Live mount state for a BSD name, read straight from DiskArbitration
+    /// rather than from the last `refresh()` snapshot the views hold.
+    private func isMountedNow(_ bsdName: String) -> Bool {
+        guard let session = session,
+              let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, bsdName),
+              let description = DADiskCopyDescription(disk) as? [String: Any]
+        else { return false }
+        return description[kDADiskDescriptionVolumePathKey as String] as? URL != nil
+    }
+
+    /// Render a DiskArbitration dissenter as text a human can act on.
+    ///
+    /// `DADissenterGetStatusString` is nil for most `DAReturn` codes — the
+    /// framework only populates it when the dissenting client supplied a
+    /// message, which the system mounter does not. Falling back to a bare
+    /// "mount failed" therefore discards the only diagnostic there is. Read the
+    /// status code and name it; keep the raw value so an unmapped code is still
+    /// identifiable.
+    private static func describe(_ dissenter: DADissenter, verb: String) -> String {
+        if let supplied = DADissenterGetStatusString(dissenter) as String?, !supplied.isEmpty {
+            return supplied
+        }
+        // `DAReturn` bridges to Int32 while the `kDAReturn*` constants bridge to
+        // Int, so widen once and compare against the framework constants rather
+        // than hand-rolled numbers.
+        let status = Int(DADissenterGetStatus(dissenter))
+        switch status {
+        case kDAReturnBusy:
+            return "volume is busy — macOS may have re-mounted it automatically"
+        case kDAReturnNotMounted:
+            return "volume is not mounted"
+        case kDAReturnNotPermitted, kDAReturnNotPrivileged:
+            return "not permitted — this operation needs elevated privileges"
+        case kDAReturnUnsupported:
+            return "unsupported by the system mounter"
+        case kDAReturnBadArgument:
+            return "bad argument"
+        case kDAReturnExclusiveAccess:
+            return "another process holds exclusive access"
+        case kDAReturnNoResources:
+            return "out of resources"
+        case kDAReturnNotFound:
+            return "disk not found"
+        case kDAReturnNotReady:
+            return "disk not ready"
+        case kDAReturnNotWritable:
+            return "volume is not writable"
+        default:
+            return "\(verb) failed (DAReturn 0x\(String(status, radix: 16)))"
+        }
+    }
+
     /// Trigger DiskArbitration to mount the volume at its default mount point.
     /// Returns an error string on failure; nil on success.
     func mount(_ volume: Volume) async -> String? {
         let logID = activityLog?.log("Mounting \(volume.displayName)…", status: .running, volume: volume.displayName)
+
+        // The view's snapshot of mount state can be stale by the time the click
+        // lands: macOS re-mounts an ejected NTFS volume on its own, so an eject
+        // that just succeeded can be undone before the user presses Mount.
+        // Re-read the live state instead of dissenting with an opaque busy code.
+        if isMountedNow(volume.id) {
+            let msg = "already mounted — macOS re-mounted it automatically"
+            if let logID { activityLog?.update(logID, status: .success, detail: msg) }
+            return nil
+        }
 
         guard let session = session,
               let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, volume.id)
@@ -157,7 +219,7 @@ final class DiskArbitrationService: ObservableObject {
             DADiskMount(disk, nil, DADiskMountOptions(kDADiskMountOptionDefault), { _, dissenter, ctx in
                 let resultPtr = Unmanaged<ResultBox>.fromOpaque(ctx!).takeRetainedValue()
                 if let dissenter = dissenter {
-                    resultPtr.result = String(DADissenterGetStatusString(dissenter) as String? ?? "mount failed")
+                    resultPtr.result = DiskArbitrationService.describe(dissenter, verb: "mount")
                 } else {
                     resultPtr.result = nil
                 }
@@ -190,7 +252,7 @@ final class DiskArbitrationService: ObservableObject {
             DADiskUnmount(disk, DADiskUnmountOptions(kDADiskUnmountOptionDefault), { _, dissenter, ctx in
                 let resultPtr = Unmanaged<ResultBox>.fromOpaque(ctx!).takeRetainedValue()
                 if let dissenter = dissenter {
-                    resultPtr.result = String(DADissenterGetStatusString(dissenter) as String? ?? "unmount failed")
+                    resultPtr.result = DiskArbitrationService.describe(dissenter, verb: "unmount")
                 } else {
                     resultPtr.result = nil
                 }
