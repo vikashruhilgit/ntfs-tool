@@ -302,10 +302,16 @@ public struct DirectoryWalker {
     }
 }
 
-extension DirectoryWalker: AsyncSequence, AsyncIteratorProtocol {
-    public typealias Element = WalkEvent
-
-    /// Convenience `for await` wrapper around the cursor. The iterator is a
-    /// copy of the walker, so each call starts a fresh walk.
-    public func makeAsyncIterator() -> DirectoryWalker { self }
-}
+// Deliberately NOT an AsyncSequence.
+//
+// The obvious `extension DirectoryWalker: AsyncSequence, AsyncIteratorProtocol`
+// with a self-returning `makeAsyncIterator()` compiles under Swift 6.2 but not
+// under the Swift 6.0 toolchain in Xcode 16.3, which this project targets
+// (CLAUDE.md; .github/workflows/ci.yml pins Xcode_16.3). Since typed-throws
+// AsyncSequence added an associated `Failure` type, 6.0 cannot synthesize the
+// dual self-conforming-iterator pattern and rejects both conformances.
+//
+// Nothing needs it: every consumer — Tree, Find, and the tests — drives
+// `next()` directly, and no code does `for await` over a walker. Adding the
+// conformance back means writing an explicit nested `AsyncIterator` plus a
+// `Failure` typealias, which buys sugar no caller uses.
