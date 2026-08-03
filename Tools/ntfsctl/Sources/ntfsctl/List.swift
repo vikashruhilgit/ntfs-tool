@@ -31,8 +31,10 @@ struct List: AsyncParsableCommand {
         }
         let entries = try await volume.enumerate(directory: recordNumber)
 
-        // Filter out DOS-namespace aliases so 8.3 names don't double up.
-        let canonical = entries.filter { $0.fileName.namespace != .dos }
+        // Filter out DOS-namespace aliases so 8.3 names don't double up —
+        // but only where the record also has a long name, so a file whose
+        // only $FILE_NAME is an 8.3 alias still shows up.
+        let canonical = DirectoryWalker.dropRedundantDOSAliases(entries)
 
         if long {
             print(padRight("RECNUM", 10) + padRight("SIZE", 12) + padRight("NAMESPACE", 12) + "NAME")

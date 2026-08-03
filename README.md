@@ -160,10 +160,10 @@ smoke procedures.
 
 ```
 ntfs-tool/
-├── Packages/NTFSCore/     Swift library — pure NTFS read/write/format, 226 tests
+├── Packages/NTFSCore/     Swift library — pure NTFS read/write/format, 269 tests
 ├── Extensions/NTFSFileSystem/  FSKit System Extension
 ├── Apps/NTFSMountManager/      SwiftUI menu-bar app
-├── Tools/ntfsctl/         Command-line tool (16 subcommands)
+├── Tools/ntfsctl/         Command-line tool (18 subcommands)
 ├── docs/
 │   ├── CLI.md             ntfsctl walkthrough
 │   └── STATUS.md          What's done, what's pending, what's next
@@ -215,7 +215,7 @@ notarization procedure for off-machine distribution:
 
 | Layer | Status |
 |---|---|
-| `ntfsctl` read commands (`info`, `scan`, `list`, `cat`, `verify`, `dump`) | Production-ready |
+| `ntfsctl` read commands (`info`, `scan`, `list`, `tree`, `find`, `cat`, `verify`, `dump`) | Production-ready |
 | `ntfsctl` write commands (`cp` (+`--move`), `write`, `rm`, `mv`, `create`, `delete`, `truncate`) | Production-ready; validated by a full **22,419-file / 39.6 GiB** single-tree copy on a real 4 TB WD drive (`verify --deep` clean). No known per-directory capacity cap — bounded only by free clusters + MFT slots. |
 | `ntfsctl` volume admin (`reclaim-orphans`, `setdirty`) | Production-ready |
 | NTFS formatting | `NTFSCore.Volume.formatNTFS` — surfaced in the app's Danger Zone (**Format as NTFS**). Validated by the in-repo oracle (`MkntfsTests` asserts `auditAllDataRunlistsAgainstBitmap().isClean`) and `scripts/format-oracle.sh` against real `ntfs-3g`. |

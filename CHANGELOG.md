@@ -2,6 +2,27 @@
 
 All notable changes to ntfs-tool. Format roughly follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] — `ntfsctl tree` + `ntfsctl find` over one shared `$I30` walker
+
+### Added
+
+- **`NTFSCore.DirectoryWalker` — the single general-purpose directory traversal in the codebase.** A depth-first, pre-order **cursor** (`public mutating func next() async -> WalkEvent?`) over an explicit frame stack, deliberately *not* an `AsyncStream` producer task — that default-unbounded buffering would let the producer race ahead and re-accumulate the whole tree. A directory is enumerated only when the walk reaches it, and its children only on the call *after* the directory itself was emitted.
+  - **Cycle-safe:** `visited: Set<UInt64>` seeded with the start record. An already-visited directory is still emitted as an entry but never descended into twice, so a genuine on-disk `$I30` cycle terminates.
+  - **Depth-bounded:** the bound is checked *before* the `enumerate` call, so `maxDepth: 0` issues no device reads at all.
+  - **Per-node error containment:** `next()` never throws. An unreadable directory — including the start directory — yields one `.error` event carrying that node's path, record number, depth and underlying error; the walk continues with the next sibling.
+  - **DOS-alias filtering in one place** (`dropRedundantDOSAliases`), so `isLastSibling` is computed against the filtered listing and 8.3-aliased entries do not double. A DOS entry is dropped **only when the same MFT record also carries a non-DOS name** — a blanket `namespace != .dos` filter (which `ntfsctl list` shipped with, and which this release also fixes) makes a file whose only `$FILE_NAME` is an 8.3 alias vanish from the listing entirely.
+  - **Honest memory bound, stated in the doc comment:** O(sum of the sibling arrays along the current root-to-node path) — *not* O(depth), because `Volume.enumerate` returns a materialized `[DirectoryEntry]` per directory — plus one `UInt64` per directory descended into retained in `visited` for the whole walk. The guarantee is that the whole tree is never accumulated, not that memory is O(depth).
+- **`ntfsctl tree <device> [path] [--depth N] [--recnum]`** — `/usr/bin/tree`-style renderer (`├── `, `└── `, `│   `) ending in a `N directories, M files` summary. An unreadable directory renders as an inline `[error: …]` line and does not abort the render.
+- **`ntfsctl find <device> [path] --name <glob> [--depth N] [--type f|d] [--recnum]`** — `find -name` semantics: case-insensitive `fnmatch(3)`/`FNM_CASEFOLD` against each entry's **name** (not its path). Prints one full path per match; unreadable directories go to stderr without aborting.
+- Both subcommands are **thin consumers** — neither contains descent logic of its own (enforced by test: zero occurrences of `enumerate(directory:` in either file) — and both adopt the post-v0.2.0 `TargetResolver` contract where a bare argument is **always** a path and `--recnum` is opt-in. `list`/`cat` keep their pre-v0.2.0 auto-parse behavior, untouched.
+- **Tests:** `DirectoryWalkerTests` (7) covering depth bounding against an independent `enumerate` oracle, termination on a **genuine on-disk cycle** (built via `Volume.rename` into a descendant, which has no ancestor guard), per-node error containment via a `FaultingBlockDevice` decorator that fails exactly the one read covering a subdirectory's MFT record, and the streaming guarantee (frame-stack depth is 1 after exactly one `next()`). `TreeFindTests` (9) pins the summary counts against an independent two-level `enumerate` walk. Suites: NTFSCore 269 executed / 2 skipped / 0 failures; ntfsctl 33 / 0 failures.
+
+### Known limitations
+
+- `tree`/`find` exit **0** when the walk root resolves but cannot be enumerated (e.g. a file target), diverging from `list`, which exits 1 on the same input. Deliberate and test-pinned, but it means a script cannot distinguish "no matches" from "the search root could not be read".
+- With `--recnum <N>` for a non-root record, `find` prints paths relative to the search root with a leading `/`, so they look absolute but only genuinely are when `N == 5` — NTFSCore has no reverse record→path lookup.
+- Pre-existing purpose-coupled recursion in `Rm.swift`, `Cp.swift`, `Verify.swift` and `Reclaim.swift` was **not** refactored onto the walker (out of scope; the first two carry data-loss risk, the latter two are MFT-reachability sweeps rather than directory renderers).
+
 ## [Unreleased] — v0.7.3 — write to real Windows-formatted volumes (`$I30` collation + `$MFT` auto-grow) + ntfs-3g oracle
 
 ### Fixed
