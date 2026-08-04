@@ -193,10 +193,23 @@ These are the items the automated work simply can't reach. Each one is a single 
 
 ### 1. FSKit mount validation — BLOCKED BY AN APPLE BUG (2026-08-04)
 
-**Not our code. Third-party FSKit extensions are broken on macOS 26.** The
-`fskitd` daemon rejects connections from unprivileged clients, so no
-third-party module can mount -- **Apple's own FSKitSample fails identically**
-on these builds. Confirmed broken on macOS 26.1 (25B78) and 26.2 (25C56).
+**Not our code — established by controlled experiment, not inference.**
+
+Apple's own reference sample (<https://github.com/KhaosT/FSKitSample>) was
+built and installed on this machine with identical ad-hoc signing, and it
+**fails exactly the same way**: its File System Extensions toggle in System
+Settings does nothing, and — the tell — it never presents the password /
+Touch ID authorization prompt that every other extension type shows. Two
+independent implementations, same machine, same signing, same failure.
+
+That test was run precisely because the log-signature evidence below is
+circumstantial and could have been us. It is not us. If a future reader
+doubts this conclusion, re-run that experiment first; it takes ten minutes
+and is decisive either way.
+
+Third-party FSKit extensions are broken on macOS 26. `fskitd` rejects
+connections from unprivileged clients, so no third-party module can mount.
+Confirmed broken on macOS 26.1 (25B78) and 26.2 (25C56).
 
 Verified on this machine (macOS **26.1**, build **25B78**) -- the log signature
 is the documented one, repeating on every mount attempt:
@@ -268,6 +281,21 @@ keeping straight:
   for another.
 - **Correction:** earlier revisions of this document told you to run
   `fskit_admin probe`. That binary does not exist on macOS 26.1.
+- Our `EXAppExtensionAttributes` is still thinner than the sample's. Not the
+  cause of the current block (the sample fails too), but worth matching before
+  the next attempt: `FSMediaTypes`, `FSSupportsPathURLs`,
+  `FSSupportsGenericURLResources`, `FSRequiresSecurityScopedPathURLResources`,
+  and the `FSActivateOptionSyntax` / `FSCheckOptionSyntax` /
+  `FSFormatOptionSyntax` dictionaries.
+- Xcode injects `com.apple.security.get-task-allow` (the debug entitlement)
+  into BOTH Debug and Release ad-hoc builds. Apple's shipping modules do not
+  carry it. Strip it with `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO`. This was
+  tested and did NOT unblock the toggle, but it is a real difference from a
+  shipping module and should stay stripped.
+- Every `xcodebuild` re-registers the DerivedData copy of the extension, which
+  produces DUPLICATE rows in System Settings (Apple's sample does this too —
+  it is not a symptom of anything wrong). Drop the extra with
+  `pluginkit -r <path-to-appex>` after each build.
 
 Sources: <https://github.com/andrewgazelka/loaf/issues/1>,
 <https://github.com/KhaosT/FSKitSample>,
