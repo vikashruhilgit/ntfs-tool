@@ -71,7 +71,17 @@ targets:
         codeSign: true
 
   NTFSFileSystem:
-    type: system-extension
+    # ExtensionKit app extension, NOT a system-extension. FSKit modules
+    # declare EXAppExtensionAttributes / EXExtensionPointIdentifier
+    # (com.apple.fskit.fsmodule) and are packaged as `.appex` in the app's
+    # Contents/Extensions -- macOS discovers them when the containing app is
+    # installed and the user enables them in System Settings > General >
+    # Login Items & Extensions. Built as `system-extension` the bundle landed
+    # in Contents/Library/SystemExtensions and OSSystemExtensionManager
+    # rejected activation with "Extension not found in App bundle. Unable to
+    # find any matched extension with identifier: ..." -- accurate, since it
+    # searches for a SYSX-style system extension and ours is an app extension.
+    type: extensionkit-extension
     platform: macOS
     sources:
       - path: Extensions/NTFSFileSystem/Sources
