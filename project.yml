@@ -71,7 +71,17 @@ targets:
         codeSign: true
 
   NTFSFileSystem:
-    type: system-extension
+    # ExtensionKit app extension, NOT a system-extension. FSKit modules
+    # declare EXAppExtensionAttributes / EXExtensionPointIdentifier
+    # (com.apple.fskit.fsmodule) and are packaged as `.appex` in the app's
+    # Contents/Extensions -- macOS discovers them when the containing app is
+    # installed and the user enables them in System Settings > General >
+    # Login Items & Extensions. Built as `system-extension` the bundle landed
+    # in Contents/Library/SystemExtensions and OSSystemExtensionManager
+    # rejected activation with "Extension not found in App bundle. Unable to
+    # find any matched extension with identifier: ..." -- accurate, since it
+    # searches for a SYSX-style system extension and ours is an app extension.
+    type: extensionkit-extension
     platform: macOS
     sources:
       - path: Extensions/NTFSFileSystem/Sources
@@ -80,14 +90,40 @@ targets:
       properties:
         CFBundlePackageType: "XPC!"
         LSMinimumSystemVersion: "15.4"
-        FSShortName: "NTFS (Phase 2)"
+        # FSKit reads FSPersonalities / FSShortName from INSIDE
+        # EXAppExtensionAttributes, not from the top level of the Info.plist.
+        # Declared at top level they are invisible to fskit_agent, so the
+        # module advertises no personalities and `mount -F -t ntfs_tool`
+        # fails with "Unable to invoke task" -- there is no task to invoke
+        # because nothing named ntfs_tool exists. Verified by diffing against
+        # Apple's own module at
+        # /System/Library/ExtensionKit/Extensions/com.apple.fskit.exfat.appex,
+        # which nests all of these.
         EXAppExtensionAttributes:
           EXExtensionPointIdentifier: com.apple.fskit.fsmodule
-        FSPersonalities:
-          NTFS:
-            FSName: ntfs
-            FSSubType: 0
-            FSFormatSubType: 0
+          # FSShortName is the `mount -t` TYPE TOKEN, not a display string:
+          # Apple's own modules use "exfat" / "msdos" / "ftp" here, matching
+          # `mount -t exfat`. FSName is the user-visible personality name
+          # ("ExFAT", "MS-DOS (FAT)"). We had the two swapped, so
+          # `mount -F -t ntfs_tool` searched for a short name that did not
+          # exist while ours was "NTFS (ntfs-tool)" -- spaces and parentheses,
+          # unusable as a type token. Hence "Unable to invoke task".
+          #
+          # "ntfs_tool" deliberately avoids "ntfs", which Apple's legacy
+          # driver at /System/Library/Filesystems/ntfs.fs already claims --
+          # a collision would make it ambiguous which driver mounted a volume,
+          # the exact question this gate exists to answer.
+          FSShortName: "ntfs_tool"
+          # We operate on a block device (/dev/diskNsM), not a network URL.
+          FSSupportsBlockResources: true
+          FSSupportsServerURLs: false
+          FSPersonalities:
+            NTFS:
+              # User-visible personality name (what diskutil shows), NOT the
+              # mount token -- that is FSShortName above.
+              FSName: "NTFS (ntfs-tool)"
+              FSSubType: 0
+              FSFormatSubType: 0
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ntfs-tool.NTFSMountManager.NTFSFileSystem
