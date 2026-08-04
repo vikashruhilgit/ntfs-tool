@@ -222,7 +222,7 @@ notarization procedure for off-machine distribution:
 | `NTFSCore` library | Production-ready (226 tests, full 22,419-file copy validated on a real 4 TB WD drive) |
 | FSKit extension build | Builds clean |
 | FSKit mount in Finder | Needs SIP-off / entitlement to validate |
-| Windows `chkdsk /f` clean | Pending — manual user step on a Windows machine |
+| Windows `chkdsk` clean | ✅ Passed 2026-08-04 — 11,568-file copy, all stages clean, no bitmap error |
 
 Full breakdown: [`docs/STATUS.md`](docs/STATUS.md).
 
@@ -234,4 +234,4 @@ The NTFS implementation is a clean-room Swift port from publicly-documented on-d
 
 ## Contributing
 
-Architecture notes + conventions in [`CLAUDE.md`](CLAUDE.md). For substantive work, file an issue first to align on approach. Remaining follow-ups (documented in [`docs/STATUS.md`](docs/STATUS.md)): Windows `chkdsk /f` validation (manual, needs a Windows machine — the only external correctness gate left), CI workflow repair (the `.github/workflows/ci.yml` macOS jobs fail at provisioning; merges currently rely on local `swift test`), and optional polish like multi-extension `$DATA` (the file-level analogue of the shipped multi-extension `$INDEX_ALLOCATION`; not driven by any known failure).
+Architecture notes + conventions in [`CLAUDE.md`](CLAUDE.md). For substantive work, file an issue first to align on approach. Remaining follow-ups (documented in [`docs/STATUS.md`](docs/STATUS.md)): FSKit mount validation (manual, needs SIP-off + developer mode or the FSKit entitlement — the only external gate left now that Windows `chkdsk` passes), CI workflow repair (the `.github/workflows/ci.yml` macOS jobs fail at provisioning; merges currently rely on local `swift test`), and optional polish like multi-extension `$DATA` (the file-level analogue of the shipped multi-extension `$INDEX_ALLOCATION`; not driven by any known failure).
