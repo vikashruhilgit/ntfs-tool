@@ -12,7 +12,7 @@ struct MenuBarContent: View {
     @State private var actionError: String?
     @State private var busyVolumeID: String?
 
-    private var extensionActive: Bool { installer.shortStatus == "activated" }
+    private var extensionActive: Bool { installer.state == .activated }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.small) {

@@ -15,13 +15,15 @@ let package = Package(
         .library(name: "NTFSUIKit", targets: ["NTFSUIKit"])
     ],
     dependencies: [
-        .package(path: "../NTFSCore")
+        .package(path: "../NTFSCore"),
+        .package(path: "../NTFSOps")
     ],
     targets: [
         .target(
             name: "NTFSUIKit",
             dependencies: [
-                .product(name: "NTFSCore", package: "NTFSCore")
+                .product(name: "NTFSCore", package: "NTFSCore"),
+                .product(name: "NTFSOps", package: "NTFSOps")
             ],
             resources: [
                 .process("Resources/NTFSColors.xcassets")

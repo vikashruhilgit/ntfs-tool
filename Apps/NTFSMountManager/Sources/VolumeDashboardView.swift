@@ -16,6 +16,10 @@ struct VolumeDashboardView: View {
     @State private var actionError: String?
     @State private var busy = false
 
+    /// File browser presentation. Reads (and, with access, writes) the volume
+    /// through NTFSCore — independent of whether the FSKit mount works.
+    @State private var showBrowser = false
+
     // Danger Zone state.
     @State private var showFormatConfirm = false
     @State private var showRepairConfirm = false
@@ -83,6 +87,18 @@ struct VolumeDashboardView: View {
         .animation(.easeInOut(duration: 0.25), value: loader.format)
         .animation(.easeInOut(duration: 0.25), value: loader.repair)
         .animation(.easeInOut(duration: 0.2), value: actionError)
+        .sheet(isPresented: $showBrowser) {
+            NavigationStack {
+                FileBrowserView(devicePath: volume.devicePath, volumeLabel: volume.displayName)
+                    .navigationTitle(volume.displayName)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { showBrowser = false }
+                        }
+                    }
+            }
+            .frame(minWidth: 760, minHeight: 480)
+        }
     }
 
     // MARK: - Header
@@ -136,6 +152,17 @@ struct VolumeDashboardView: View {
                 .buttonStyle(SecondaryButtonStyle())
                 .accessibilityLabel("Reveal \(volume.displayName) in Finder")
             }
+
+            // Browsing reads the volume through NTFSCore directly, so it works
+            // whether or not the volume is mounted — which matters while the
+            // FSKit mount is blocked and Finder can't show these files at all.
+            Button {
+                showBrowser = true
+            } label: {
+                Label("Browse Files", systemImage: "folder")
+            }
+            .buttonStyle(SecondaryButtonStyle())
+            .accessibilityLabel("Browse files on \(volume.displayName)")
 
             Button {
                 Task { await runVerifyLogged() }

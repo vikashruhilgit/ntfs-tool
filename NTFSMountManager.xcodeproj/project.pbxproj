@@ -29,6 +29,7 @@
 		83C5AB393704602915008B48 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9C014D4357F452F985A593B1 /* FSKit.framework */; };
 		92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5684F8D00837370737BB2555 /* ContentView.swift */; };
 		92E8A27AA1103065342DA7B8 /* ActivityLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 203EE770FA35E648615F1197 /* ActivityLog.swift */; };
+		957875DD40DC6320F994B8A2 /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9633A4C1E21D3A4730A09B9B /* FileBrowserView.swift */; };
 		9A8B070281667AB5C5D24745 /* NTFSFileSystem.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 74E6ED0B78D3D7AE6C3536F0 /* NTFSFileSystem.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A05D196189C6BA4F91ADF250 /* VolumeRowModel+DiskArbitration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6471581351116FFFC4F16780 /* VolumeRowModel+DiskArbitration.swift */; };
 		A283CF3E3376BC4686313635 /* Verify.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20E22577EA73CB6742243E11 /* Verify.swift */; };
@@ -43,6 +44,7 @@
 		B9751912CAE0F2EA9A170F9E /* FSKitBlockDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */; };
 		BBB98DE04B189933E57E523D /* Cat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2BFE6DBA53BC4D0A7D706F25 /* Cat.swift */; };
 		C1F50E65FD4AB246BAC40911 /* Scan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 448EA9B837A137CDD562E07C /* Scan.swift */; };
+		C742AE2DE4682990A2FB74D8 /* NTFSOps in Frameworks */ = {isa = PBXBuildFile; productRef = E23E6BE725C5ADD45A03FF50 /* NTFSOps */; };
 		CFB3B74CC0B795207981A6FC /* NTFSFileSystemExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = D34EBA7D491228AEC9008277 /* NTFSFileSystemExtension.swift */; };
 		D871A1A5B1DD000B9E3E7D18 /* FirstRunSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */; };
 		DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D92594B427E2C9D518EF55B /* MainWindowView.swift */; };
@@ -98,6 +100,7 @@
 		6019F254ED7C9E458EBAE741 /* Dump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Dump.swift; sourceTree = "<group>"; };
 		62C008E3A77CB7E1A8D38487 /* Truncate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Truncate.swift; sourceTree = "<group>"; };
 		6471581351116FFFC4F16780 /* VolumeRowModel+DiskArbitration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "VolumeRowModel+DiskArbitration.swift"; sourceTree = "<group>"; };
+		6774B6CC6DA871EC39B3DCE8 /* NTFSOps */ = {isa = PBXFileReference; lastKnownFileType = folder; name = NTFSOps; path = Packages/NTFSOps; sourceTree = SOURCE_ROOT; };
 		6979FDA309BA3161B7510E41 /* DestinationPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DestinationPlan.swift; sourceTree = "<group>"; };
 		70058C05F3A85D9768072D8D /* FSKitBlockDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FSKitBlockDevice.swift; sourceTree = "<group>"; };
 		73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiskArbitrationService.swift; sourceTree = "<group>"; };
@@ -109,6 +112,7 @@
 		8B5C2D05E8F173F3576EBFB6 /* Reclaim.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Reclaim.swift; sourceTree = "<group>"; };
 		8DE33D7BA5684962834C762F /* SetDirty.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SetDirty.swift; sourceTree = "<group>"; };
 		8FFA3E28642F4967D00BBD28 /* Create.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Create.swift; sourceTree = "<group>"; };
+		9633A4C1E21D3A4730A09B9B /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
 		9C014D4357F452F985A593B1 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
 		9D92594B427E2C9D518EF55B /* MainWindowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowView.swift; sourceTree = "<group>"; };
 		A51493713E12AE4C5676EDBB /* ActivityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityView.swift; sourceTree = "<group>"; };
@@ -130,6 +134,7 @@
 			files = (
 				21E98A27BEA920BA59362F20 /* NTFSCore in Frameworks */,
 				217D2990B433BD83A9C22ED0 /* NTFSUIKit in Frameworks */,
+				C742AE2DE4682990A2FB74D8 /* NTFSOps in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -178,6 +183,7 @@
 				5684F8D00837370737BB2555 /* ContentView.swift */,
 				73008A4D59B8067B1CA81290 /* DiskArbitrationService.swift */,
 				00C24B0CF6BEA09D956D2D99 /* ExtensionInstaller.swift */,
+				9633A4C1E21D3A4730A09B9B /* FileBrowserView.swift */,
 				B9DEE5A9B468C44DA98C9259 /* FirstRunSheet.swift */,
 				9D92594B427E2C9D518EF55B /* MainWindowView.swift */,
 				138AC53F11BB4630926D3661 /* MenuBarContent.swift */,
@@ -212,6 +218,7 @@
 			isa = PBXGroup;
 			children = (
 				4CC62877FC7ADECC37C4FC47 /* NTFSCore */,
+				6774B6CC6DA871EC39B3DCE8 /* NTFSOps */,
 				7B02D1797285E5600E962BFC /* NTFSUIKit */,
 			);
 			path = Packages;
@@ -327,6 +334,7 @@
 			packageProductDependencies = (
 				387AA4DBE0FBBEF7BD24A6E7 /* NTFSCore */,
 				7DDE21FE056F73E707145D8D /* NTFSUIKit */,
+				E23E6BE725C5ADD45A03FF50 /* NTFSOps */,
 			);
 			productName = NTFSMountManager;
 			productReference = D95B833D3F9CBB00BD401B92 /* NTFSMountManager.app */;
@@ -406,6 +414,7 @@
 			packageReferences = (
 				7D761D3355081F77909C4863 /* XCRemoteSwiftPackageReference "swift-argument-parser" */,
 				4967F3E4688D9349D2468E18 /* XCLocalSwiftPackageReference "Packages/NTFSCore" */,
+				66F4DA8E02484D79F04B96EE /* XCLocalSwiftPackageReference "Packages/NTFSOps" */,
 				5A8E4918ED3C1E1123EAA6FE /* XCLocalSwiftPackageReference "Packages/NTFSUIKit" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -458,6 +467,7 @@
 				92E011B65ECD2625CB91AB5D /* ContentView.swift in Sources */,
 				B5F713B3EF1B7FD8B544453A /* DiskArbitrationService.swift in Sources */,
 				E85B1CC3E363F5D622512C91 /* ExtensionInstaller.swift in Sources */,
+				957875DD40DC6320F994B8A2 /* FileBrowserView.swift in Sources */,
 				D871A1A5B1DD000B9E3E7D18 /* FirstRunSheet.swift in Sources */,
 				DAE5E9586060CF09B0BF1A47 /* MainWindowView.swift in Sources */,
 				4C09369A721D561465BF074A /* MenuBarContent.swift in Sources */,
@@ -771,6 +781,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Packages/NTFSUIKit;
 		};
+		66F4DA8E02484D79F04B96EE /* XCLocalSwiftPackageReference "Packages/NTFSOps" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/NTFSOps;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -801,6 +815,10 @@
 		7DDE21FE056F73E707145D8D /* NTFSUIKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = NTFSUIKit;
+		};
+		E23E6BE725C5ADD45A03FF50 /* NTFSOps */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = NTFSOps;
 		};
 		EED6039FC9F604323FFB010D /* NTFSCore */ = {
 			isa = XCSwiftPackageProductDependency;

@@ -36,7 +36,7 @@ struct MainWindowView: View {
     @AppStorage("hasSeenReadWriteOnboarding") private var hasSeenOnboarding = false
     @State private var showOnboarding = false
 
-    private var extensionActive: Bool { installer.shortStatus == "activated" }
+    private var extensionActive: Bool { installer.state == .activated }
 
     private var filteredVolumes: [DiskArbitrationService.Volume] {
         switch section {

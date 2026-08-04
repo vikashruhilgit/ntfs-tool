@@ -1,5 +1,10 @@
 # 03 — `ntfsctl tree` and `ntfsctl find` (shared recursive walker)
 
+> **✅ LANDED 2026-07-27 — this requirement is closed.** Both subcommands are registered in
+> `Tools/ntfsctl/Sources/ntfsctl/ntfsctl.swift:22` and implemented in `Tree.swift` / `Find.swift`
+> over the shared `NTFSCore.DirectoryWalker`. The text below is kept for provenance; the
+> "Verified open (2026-07-27)" note in §Problem describes the pre-implementation state.
+
 ## Problem
 `ntfsctl` can list a single directory (`list`) but has no recursive traversal. Inspecting a
 copied backup means running `list` by hand at every level, and there is no way to locate a file

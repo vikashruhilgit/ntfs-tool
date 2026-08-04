@@ -12,6 +12,7 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../../Packages/NTFSCore"),
+        .package(path: "../../Packages/NTFSOps"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0")
     ],
     targets: [
@@ -19,6 +20,7 @@ let package = Package(
             name: "ntfsctl",
             dependencies: [
                 "NTFSCore",
+                "NTFSOps",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ]
         ),
@@ -26,7 +28,8 @@ let package = Package(
             name: "ntfsctlTests",
             dependencies: [
                 "ntfsctl",
-                "NTFSCore"
+                "NTFSCore",
+                "NTFSOps"
             ]
         )
     ]
