@@ -191,115 +191,115 @@ The first 6 are the strong correctness signals. The last 3 are physical-world te
 
 These are the items the automated work simply can't reach. Each one is a single concrete action.
 
-### 1. FSKit mount validation — BLOCKED BY AN APPLE BUG (2026-08-04)
+### 1. FSKit mount validation — BLOCKED pending properly provisioned signing
 
-**Not our code — established by controlled experiment, not inference.**
+**Status: unproven, not "an Apple bug".** An earlier revision of this document
+claimed a macOS 26 defect was proven by a control experiment. That claim was
+withdrawn — the experiment was invalid. See "What was wrong with the earlier
+conclusion" below, and do not re-derive it.
 
-Apple's own reference sample (<https://github.com/KhaosT/FSKitSample>) was
-built and installed on this machine with identical ad-hoc signing, and it
-**fails exactly the same way**: its File System Extensions toggle in System
-Settings does nothing, and — the tell — it never presents the password /
-Touch ID authorization prompt that every other extension type shows. Two
-independent implementations, same machine, same signing, same failure.
-
-That test was run precisely because the log-signature evidence below is
-circumstantial and could have been us. It is not us. If a future reader
-doubts this conclusion, re-run that experiment first; it takes ten minutes
-and is decisive either way.
-
-Third-party FSKit extensions are broken on macOS 26. `fskitd` rejects
-connections from unprivileged clients, so no third-party module can mount.
-Confirmed broken on macOS 26.1 (25B78) and 26.2 (25C56).
-
-Verified on this machine (macOS **26.1**, build **25B78**) -- the log signature
-is the documented one, repeating on every mount attempt:
+**The concrete blocker.** `com.apple.developer.fskit.fsmodule` is a
+**restricted** entitlement: it must be *authorized by a provisioning profile
+issued to a paid developer team*. Merely listing the key in an entitlements
+file does not grant it. This build is ad-hoc signed and carries **no
+provisioning profile at all**:
 
 ```
-fskitd: [com.apple.FSKit:default] Incomming connection, entitled 0
-fskitd: [com.apple.FSKit:default] Hello FSClient! entitlement no
+$ codesign -dv .../NTFSFileSystem.appex
+Signature=adhoc          TeamIdentifier=not set
+$ ls .../Contents/embedded.provisionprofile
+No such file or directory
 ```
 
-Symptom chain: `mount -F -t ntfs_tool ...` reports
-`Module com.ntfs-tool.NTFSMountManager.NTFSFileSystem is disabled!`, and the
-**System Settings > General > Login Items & Extensions > File System
-Extensions toggle does nothing** -- it will not stay enabled.
+So the entitlement is present but unauthorized, and `fskitd` says exactly
+that on every mount attempt:
 
-Others have already tried and failed with: Developer ID signing, notarization,
-hardened runtime, FSKit entitlements, disabling library validation, and manual
-plist enablement. Related radars: **FB18230524** ("System NTFS driver blocking
-FSKit" -- this project's exact scenario) and FB17772372 (probing, partly fixed
-in 15.6 beta). Apple DTS, July 2025: *"more bugs have been found so you're
-going to need to wait for more fixes."*
+```
+fskitd: Incomming connection, entitled 0
+fskitd: Hello FSClient! entitlement no
+```
 
-**Do not spend time on this gate until Apple ships a fix.** Re-test on each
-macOS update by attempting the mount and grepping for `entitlement no`.
+Apple's developer forums document this same message resolving once a paid
+development team is selected in Xcode so the profile authorizes the
+entitlement.
 
-**SIP-off and `amfi_get_out_of_my_way=1` are NOT required and do not help.**
-Both were tried here against a wrong theory and made no difference; the
-failure is identical with full security enabled. Do not weaken the machine for
-this. Revert with `sudo nvram -d boot-args` and `csrutil enable` (Recovery).
+Symptoms this explains: the System Settings > General > Login Items &
+Extensions > File System Extensions toggle does nothing and **never shows the
+password / Touch ID authorization prompt** other extension types show; and
+`mount -F -t ntfs_tool ...` reports the module is disabled.
+
+**Next valid test:** enroll in the Apple Developer Program ($99/yr), request
+the FSKit entitlement, and build BOTH Apple's official passthrough FSKit
+sample AND this project with a paid team and provisioning profiles that
+authorize `com.apple.developer.fskit.fsmodule`. Only then is a comparison
+meaningful.
+
+#### What was wrong with the earlier conclusion
+
+The claim was: "Apple's own sample fails identically on this machine,
+therefore macOS 26 is broken." Three errors:
+
+1. **The comparison was not a control.** Both builds shared the SAME invalid
+   condition — ad-hoc signing with no provisioning profile — so both lacked an
+   authorized entitlement. Varying the codebase while holding the defect
+   constant proves nothing about macOS.
+2. **Misattributed source.** `KhaosT/FSKitSample` is a community sample, not
+   Apple's official reference.
+3. **Inverted causality.** `entitlement no` was read as evidence of a daemon
+   bug. It is the expected report when a restricted entitlement is not
+   authorized — i.e. evidence of the signing gap, not of a macOS defect.
+
+Public reports of FSKit trouble on macOS 26 do exist, and may turn out to
+matter, but nothing observed here establishes them as the cause.
+
+**SIP-off and `amfi_get_out_of_my_way=1` did not help and are not known to be
+required.** Both were tried against a wrong theory. Note this does not
+disprove the provisioning explanation: `fskitd` performs its own userspace
+entitlement check, which an AMFI bypass would not affect. Revert with
+`sudo nvram -d boot-args` and `csrutil enable` (Recovery).
 
 #### What this gate DID establish (real bugs, now fixed)
 
-Three genuine packaging defects were found and fixed before hitting the Apple
-wall. They are prerequisites for the gate ever passing, so they are worth
-keeping straight:
+Three genuine packaging defects, prerequisites for the gate ever passing:
 
-1. **The extension was packaged as a `system-extension`.** FSKit modules are
-   ExtensionKit **app extensions**: `.appex` in `Contents/Extensions`,
-   discovered on install, never activated via `OSSystemExtensionManager`.
-   Built the old way, activation failed with *"Extension not found in App
-   bundle"* -- accurate, since macOS was looking for a SYSX-style extension.
+1. **Packaged as a `system-extension`.** FSKit modules are ExtensionKit **app
+   extensions**: `.appex` in `Contents/Extensions`, discovered on install,
+   never activated via `OSSystemExtensionManager`. Built the old way,
+   activation failed with *"Extension not found in App bundle"* — accurate,
+   since macOS was looking for a SYSX-style extension.
 2. **`FSPersonalities` / `FSShortName` were at the top level of Info.plist.**
-   FSKit reads them from **inside** `EXAppExtensionAttributes`. At top level
+   FSKit reads them from **inside** `EXAppExtensionAttributes`; at top level
    the module advertises no personalities at all.
 3. **`FSShortName` and `FSName` were swapped.** `FSShortName` is the
-   `mount -t` **type token** (Apple uses `exfat` / `msdos` / `ftp`);
-   `FSName` is the user-visible personality name (`ExFAT`, `MS-DOS (FAT)`).
-   Ours had `FSShortName: "NTFS (ntfs-tool)"` -- spaces and parentheses,
-   unusable as a type token. Fixing this is what moved the error from a
-   generic *"Unable to invoke task"* to FSKit naming our module directly,
-   which is how we know name resolution now works.
+   `mount -t` **type token** (Apple's shipping modules use `exfat` / `msdos` /
+   `ftp`); `FSName` is the user-visible personality name (`ExFAT`,
+   `MS-DOS (FAT)`). Ours had `FSShortName: "NTFS (ntfs-tool)"` — spaces and
+   parentheses, unusable as a type token. Fixing it moved the error from a
+   generic *"Unable to invoke task"* to FSKit naming our module directly, so
+   type-name resolution now demonstrably works.
 
-#### Mechanics worth keeping (for when Apple fixes it)
+#### Mechanics worth keeping
 
-- Mount with **`mount -F -t <FSShortName> <device> <mountpoint>`**. The `-F`
-  flag is required: `man mount` says it "Forces the file system type be
-  considered as an FSModule delivered using FSKit". Plain `-t` uses the legacy
-  `/Library/Filesystems/<type>.fs` path and fails with "No such file or
-  directory". Apple's sample passes the bare device name (`disk18`, not
-  `/dev/disk18`).
-- Install the app to `/Applications` and verify registration with
-  `pluginkit -m -v -p com.apple.fskit.fsmodule` -- ours should appear beside
-  Apple's exfat/msdos/ftp modules.
-- Keep exactly ONE registration. A rebuild re-registers the DerivedData copy,
-  which produces duplicate rows in System Settings and ambiguity about which
-  bundle loaded. Drop extras with `pluginkit -r <path-to-appex>`.
-- `pluginkit -e use` sets PlugInKit's flag, **not** FSKit's enablement. The
-  System Settings toggle is the real gate.
-- FSKit extensions are **per-user**: enabling as one user leaves them disabled
-  for another.
-- **Correction:** earlier revisions of this document told you to run
-  `fskit_admin probe`. That binary does not exist on macOS 26.1.
-- Our `EXAppExtensionAttributes` is still thinner than the sample's. Not the
-  cause of the current block (the sample fails too), but worth matching before
-  the next attempt: `FSMediaTypes`, `FSSupportsPathURLs`,
-  `FSSupportsGenericURLResources`, `FSRequiresSecurityScopedPathURLResources`,
-  and the `FSActivateOptionSyntax` / `FSCheckOptionSyntax` /
-  `FSFormatOptionSyntax` dictionaries.
-- Xcode injects `com.apple.security.get-task-allow` (the debug entitlement)
-  into BOTH Debug and Release ad-hoc builds. Apple's shipping modules do not
-  carry it. Strip it with `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO`. This was
-  tested and did NOT unblock the toggle, but it is a real difference from a
-  shipping module and should stay stripped.
-- Every `xcodebuild` re-registers the DerivedData copy of the extension, which
-  produces DUPLICATE rows in System Settings (Apple's sample does this too —
-  it is not a symptom of anything wrong). Drop the extra with
-  `pluginkit -r <path-to-appex>` after each build.
-
-Sources: <https://github.com/andrewgazelka/loaf/issues/1>,
-<https://github.com/KhaosT/FSKitSample>,
-<https://developer.apple.com/forums/thread/808594>
+- Mount with **`mount -F -t <FSShortName> <device> <mountpoint>`**. `man mount`
+  documents `-F` as "Forces the file system type be considered as an FSModule
+  delivered using FSKit". Plain `-t` uses the legacy
+  `/Library/Filesystems/<type>.fs` path and fails.
+- Install the app to `/Applications`; verify with
+  `pluginkit -m -v -p com.apple.fskit.fsmodule`.
+- Keep exactly ONE registration. Every `xcodebuild` re-registers the
+  DerivedData copy, producing duplicate System Settings rows. Drop extras with
+  `pluginkit -r <path-to-appex>`.
+- `pluginkit -e use` sets PlugInKit's flag, **not** FSKit's enablement.
+- FSKit extensions are **per-user**.
+- Xcode injects `com.apple.security.get-task-allow` into both Debug AND
+  Release ad-hoc builds; shipping modules do not carry it. Strip with
+  `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO`. Tested; did not unblock the toggle.
+- Our `EXAppExtensionAttributes` is thinner than working modules': missing
+  `FSMediaTypes`, `FSSupportsPathURLs`, `FSSupportsGenericURLResources`,
+  `FSRequiresSecurityScopedPathURLResources` and the option-syntax dicts.
+  Worth matching before the next attempt.
+- **Correction:** earlier revisions told you to run `fskit_admin probe`. That
+  binary does not exist on macOS 26.1.
 
 ### 2. Windows `chkdsk` round-trip — ✅ DONE (2026-08-04, v0.7.4)
 
