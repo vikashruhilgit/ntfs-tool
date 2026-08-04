@@ -977,14 +977,6 @@ public enum Mkntfs {
         return bytes
     }
 
-    static func encodeUnsignedLE(_ value: UInt64) -> Data {
-        if value == 0 { return Data([0]) }
-        var v = value
-        var bytes: [UInt8] = []
-        while v != 0 { bytes.append(UInt8(v & 0xFF)); v >>= 8 }
-        return Data(bytes)
-    }
-
     static func encodeSignedLE(_ value: Int64) -> Data {
         if value == 0 { return Data([0]) }
         for width in 1...8 {
