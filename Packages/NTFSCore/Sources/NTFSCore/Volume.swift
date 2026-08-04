@@ -5951,8 +5951,24 @@ public actor Volume {
         var bytes = Data()
         var prevLCN: Int64 = 0
         for extent in extents {
-            // length field width: bytes needed to hold extent.clusterCount.
-            let lengthBytes = encodeUnsignedLE(extent.clusterCount)
+            // Length field width: bytes needed to hold extent.clusterCount
+            // WITHOUT the top byte's high bit set.
+            //
+            // The length is semantically unsigned, but Windows decodes it as a
+            // signed value: a count of 184 encoded minimally-unsigned is the
+            // single byte 0xB8, which Windows reads as -72 and rejects with
+            // "Attribute record (80, "") from file record segment N is
+            // corrupt". It must be encoded as 0xB8 0x00 — two bytes, high bit
+            // clear — which is exactly what signed-minimal encoding produces
+            // (and what Windows itself writes: a 298-cluster run observed on a
+            // Windows-formatted volume encodes as `2a 01`).
+            //
+            // Found by `chkdsk` on hardware: every file whose run length fell
+            // in [128, 255] clusters (~512 KiB–1 MiB) was flagged — 41 of
+            // 10,045 records, a perfect correlation with the high bit being
+            // set. Our own decoder reads the field unsigned, so nothing on
+            // this side ever noticed; a leading 0x00 decodes identically.
+            let lengthBytes = encodeSignedLE(Int64(extent.clusterCount))
             // Offset: signed delta from prevLCN, or no offset bytes for sparse.
             if let startLCN = extent.startLCN {
                 let delta = Int64(startLCN) - prevLCN
@@ -7405,15 +7421,35 @@ public actor Volume {
         let record = try await mft.record(at: recordNumber)
         let attrs = try record.attributes()
 
+        // A base record carrying an $ATTRIBUTE_LIST may have had its unnamed
+        // $DATA migrated into an extension record. Resolve through the same
+        // $ATTRIBUTE_LIST-aware seam `readFile` uses, so the streaming path
+        // and the whole-file path agree on every record.
+        //
+        // Before v0.7.4 this path rejected any record with an $ATTRIBUTE_LIST
+        // outright, which made migrated files unreadable via every streaming
+        // consumer: `ntfsctl cat`, `ntfsctl cp --from-volume`, and the FSKit
+        // extension's kernel read callback. Found on hardware — a 11,500-file
+        // copy wrote 40 migrated files that could not be read back.
+        let dataAttr: Attribute
         if attrs.contains(where: { $0.rawType == AttributeType.attributeList.rawValue }) {
-            throw NTFSError.unsupportedFeature(
-                description: "MFT record \(recordNumber) has $ATTRIBUTE_LIST — multi-record attributes are not yet supported"
-            )
-        }
-        guard let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
-            throw NTFSError.corruptOnDisk(
-                description: "MFT record \(recordNumber) has no unnamed $DATA attribute"
-            )
+            guard let resolved = try await resolveAttribute(
+                recordNumber: recordNumber,
+                type: .data,
+                name: ""
+            ) else {
+                throw NTFSError.corruptOnDisk(
+                    description: "MFT record \(recordNumber) has $ATTRIBUTE_LIST but no resolvable unnamed $DATA"
+                )
+            }
+            dataAttr = resolved
+        } else {
+            guard let base = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" }) else {
+                throw NTFSError.corruptOnDisk(
+                    description: "MFT record \(recordNumber) has no unnamed $DATA attribute"
+                )
+            }
+            dataAttr = base
         }
 
         switch dataAttr.value {

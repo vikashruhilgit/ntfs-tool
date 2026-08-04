@@ -21,6 +21,11 @@ public struct Extent: Equatable, Sendable {
 //   - Each run begins with a header byte: low nibble = byte-width of the
 //     length field (L), high nibble = byte-width of the offset field (V).
 //   - Then L bytes of unsigned cluster count (little-endian).
+//     READING it unsigned is correct and what we do. But WRITING it requires
+//     care: Windows decodes this field as *signed*, so an encoder must widen
+//     the field by one zero byte whenever the top byte's high bit would be
+//     set (a 184-cluster run must be `b8 00`, not `b8` — chkdsk rejects the
+//     latter as a corrupt attribute record). See `Volume.encodeRunlist`.
 //   - Then V bytes of *signed* cluster offset (little-endian, sign-extended).
 //     The offset is a delta from the previous run's startLCN. The first
 //     run's offset is absolute (delta from 0).
