@@ -223,13 +223,21 @@ does require the reboot — there is no way around it from a running system.
    out of Security & Privacy).
 6. `systemextensionsctl list` -> expect `activated enabled`.
    `activated waiting for user` means the approval did not land.
-7. Watch the logs in a second terminal while testing:
+7. **Plug in a scratch NTFS USB stick** and find it:
+   `diskutil list external physical`. Note the identifier (e.g. `/dev/disk6s1`);
+   it can change on every replug, so re-check rather than reusing an old one.
+8. Watch the logs in a second terminal, and leave this running for the rest of
+   the test — it is the only view into which callback failed:
    `log stream --predicate 'subsystem == "com.ntfs-tool.fskit"' --level debug`
-8. `diskutil unmount /dev/diskNsM` to release Apple's automount, then mount ours:
-   `mount -t ntfs_tool /dev/diskNsM /tmp/m`.
-9. `ls /tmp/m`, browse in Finder, then `cp ~/foo.txt /tmp/m/` to exercise the
-   write callbacks.
-10. Re-enable SIP when done (same Recovery procedure, `csrutil enable`).
+9. Release Apple's automount and create a mount point:
+   `diskutil unmount /dev/diskNsM` then `sudo mkdir -p /tmp/m`.
+10. Mount with OUR driver: `sudo mount -t ntfs_tool /dev/diskNsM /tmp/m`.
+    Then check who actually took it: `mount | grep diskN` — the filesystem type
+    in that line tells you whether ours or Apple's driver won.
+11. `ls /tmp/m`, browse in Finder, then `cp ~/foo.txt /tmp/m/` to exercise the
+    write callbacks.
+12. `sudo umount /tmp/m` and eject: `diskutil eject /dev/diskN`.
+13. Re-enable SIP when done (same Recovery procedure, `csrutil enable`).
 
 **`FSName` is `ntfs_tool`, deliberately not `ntfs`.** Apple's own driver at
 `/System/Library/Filesystems/ntfs.fs` claims `ntfs`, and a collision makes it
