@@ -734,6 +734,72 @@ public actor Volume {
         }
     }
 
+    /// How many free, already-materialized MFT slots a single write
+    /// transaction may consume *after* its base-record allocation.
+    ///
+    /// A `createFile` can trigger an `$I30` leaf split that migrates
+    /// `$INDEX_ALLOCATION` (1 extension), and a multi-extension overflow can
+    /// need a second. A `writeFile` can migrate `$DATA` (1 more). 8 is
+    /// comfortably above the worst case observed while staying negligible to
+    /// reserve — growth happens in 256-record chunks anyway.
+    private static let mftTransactionHeadroomSlots: UInt64 = 8
+    /// Guarantee that at least `slots` free MFT records exist *and* are backed
+    /// by `$MFT.$DATA`, growing `$MFT` if they are not.
+    ///
+    /// This exists because `$MFT` growth is deliberately DISABLED at the two
+    /// migration allocation sites (`allocateMFTRecord()` defaults to
+    /// `allowGrowth: false`) to avoid the historical grow-during-leaf-split
+    /// corruption hazard. But `$MFT` grows in 256-record chunks, so every
+    /// ~256 records there is one allocation that must grow — and whichever
+    /// call site asks first wins. If that caller happened to be a migration
+    /// rather than `createFile`, the whole copy aborted with
+    /// "mid-transaction growth is disabled".
+    ///
+    /// Observed on hardware: an 11,500-file copy aborted at file 8,180 on a
+    /// migration that crossed the boundary, while an earlier identical run
+    /// crossed ~62 boundaries and never collided. Same code, different luck.
+    ///
+    /// The fix is to reserve headroom at transaction ENTRY — where growing is
+    /// safe — so no mid-transaction allocation ever needs to grow. Callers
+    /// must invoke this only outside a transaction (no partially-built
+    /// on-disk state), which is why it lives at the top of `createFile` /
+    /// `writeFile` rather than inside the migration paths.
+    func ensureMFTHeadroom(_ slots: UInt64 = Volume.mftTransactionHeadroomSlots) async throws {
+        guard slots > 0 else { return }
+        let materialized = try await mftDataAllocatedRecords()
+        let bm = try await mftBitmap()
+        let limit = min(bm.clusterCount, materialized)
+
+        // Count free materialized slots, stopping as soon as we have enough.
+        // Start at the allocator's next-fit hint: during a bulk copy the free
+        // tail sits right there, so the common case exits after `slots`
+        // iterations rather than scanning the whole bitmap per file.
+        var free: UInt64 = 0
+        let hint = max(_mftAllocHint, MFT.firstUserRecord)
+        var n = hint
+        while n < limit && free < slots {
+            if !bm.isAllocated(cluster: n) { free += 1 }
+            n += 1
+        }
+        if free < slots && hint > MFT.firstUserRecord {
+            // Wrap, to count slots freed by deletes below the hint.
+            var m = MFT.firstUserRecord
+            while m < min(hint, limit) && free < slots {
+                if !bm.isAllocated(cluster: m) { free += 1 }
+                m += 1
+            }
+        }
+        guard free < slots else { return }
+
+        // Not enough materialized headroom — grow now, while it is safe to.
+        // Growth also extends $MFT.$BITMAP so the new slots become visible.
+        let recBytes = UInt64(mftRecordSizeBytes)
+        let clusterBytes = UInt64(bytesPerCluster)
+        let deficitRecords = slots - free
+        let deficitClusters = (deficitRecords * recBytes + clusterBytes - 1) / clusterBytes
+        try await growMFTDataByClusters(max(deficitClusters, Volume.mftGrowChunkClusters))
+    }
+
     /// Current $MFT.$DATA allocatedSize expressed in whole MFT records.
     private func mftDataAllocatedRecords() async throws -> UInt64 {
         let r0 = try await mft().record(at: 0)
@@ -1442,6 +1508,11 @@ public actor Volume {
         dataSize: UInt64 = 0
     ) async throws -> UInt64 {
         let mft = self.mft()
+        // Reserve materialized MFT headroom BEFORE any transactional state
+        // exists, so a migration later in this createFile (leaf split →
+        // $INDEX_ALLOCATION migration) can never be the allocation that has
+        // to grow $MFT — growth is disabled at those sites by design.
+        try await ensureMFTHeadroom()
         // T1.1: allocate via $MFT.$BITMAP (authoritative). Fall back to the
         // linear scan only if no $BITMAP attribute exists (degenerate fixture
         // — shouldn't happen on real volumes).
@@ -5345,6 +5416,10 @@ public actor Volume {
                 description: "writeFile: refusing to mutate reserved MFT record \(recordNumber)"
             )
         }
+        // Reserve MFT headroom before the write transaction begins: a large
+        // or fragmented $DATA can migrate to an extension record mid-write,
+        // and that allocation is not allowed to grow $MFT.
+        try await ensureMFTHeadroom()
         let mft = self.mft()
         let record = try await mft.record(at: recordNumber)
         guard record.isInUse else {
