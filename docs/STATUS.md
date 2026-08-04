@@ -191,31 +191,62 @@ The first 6 are the strong correctness signals. The last 3 are physical-world te
 
 These are the items the automated work simply can't reach. Each one is a single concrete action.
 
-### 1. FSKit mount validation on the M4 (high value)
+### 1. FSKit mount validation on the M4 (the only gate left)
 
-**Why it matters:** the FSKit extension code is structurally complete and ntfs-3g-validated, but has never been loaded by macOS's FSKit runtime against a real device. The first time it runs is the first real test of:
-- Whether the Info.plist / entitlements / FSPersonalities are correctly registered
-- Whether macOS picks our extension over Apple's built-in NTFS driver for the same volume
-- Whether Finder's drag-and-drop actually works
-- Whether the FSKit callback contract (sequencing, error handling) holds in practice
+**Why it matters:** the FSKit extension is structurally complete and builds
+clean, but has **never been loaded by macOS's FSKit runtime**. The first run is
+the first real test of Info.plist / entitlements / `FSPersonalities`
+registration, whether macOS picks our extension over Apple's driver, whether
+Finder drag-and-drop works, and whether the callback contract holds.
 
-**Two paths:**
+**Verified on this machine (2026-08-04):** macOS **26.1**, Xcode **26.1.1**,
+SIP **enabled**, and `systemextensionsctl developer` refuses to run
+("cannot be used if System Integrity Protection is enabled"). So Path A really
+does require the reboot — there is no way around it from a running system.
 
-| Path | Cost | Steps |
-|---|---|---|
-| **SIP-off + dev mode (free)** | ~15 min, reversible | Recovery boot → `csrutil disable` → reboot → `sudo systemextensionsctl developer on` → run NTFSMountManager → approve in System Settings → plug NTFS USB → `diskutil unmount` Apple's mount → `mount -t ntfs -o rdonly /dev/diskN /tmp/m` → browse Finder → re-enable SIP |
-| **Apple Developer Program FSKit entitlement** | $99/yr + 2-14 day wait | Sign up if not already → request entitlement in dev portal → wait → no SIP changes ever |
+| Path | Cost |
+|---|---|
+| **SIP-off + developer mode** | ~15 min, reversible |
+| **Apple Developer Program FSKit entitlement** (`com.apple.developer.fskit.fsmodule` is restricted) | $99/yr + 2-14 day wait, no SIP change |
 
-**What to look for during the test:**
-- Does NTFSMountManager.app appear in your menu bar after launching?
-- Does "Activate Extension" successfully prompt System Settings approval?
-- After approval, does `systemextensionsctl list` show our extension as "activated enabled"?
-- When you plug in an NTFS USB, does `fskit_admin probe /dev/diskNsM` recognize it?
-- Does `mount -t ntfs /dev/diskNsM /tmp/m` succeed and show contents via `ls /tmp/m`?
-- Does Finder browse `/tmp/m` correctly?
-- Can you copy a file via `cp ~/foo.txt /tmp/m/` (this tests our write callbacks)?
+**Steps (Path A):**
+1. Shut down. Hold the power button until *Loading startup options* -> **Options**
+   -> Continue -> your user + password -> menu bar **Utilities -> Terminal**:
+   `csrutil disable`, then reboot. Verify with `csrutil status`.
+2. `sudo systemextensionsctl developer on`
+3. `xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager -configuration Debug build`
+4. **Move the built app to `/Applications` before launching.**
+   `OSSystemExtensionManager` refuses to activate an extension whose containing
+   app lives elsewhere, and the error it gives is unhelpful.
+5. Launch it, trigger activation, approve in
+   **System Settings -> General -> Login Items & Extensions** (macOS 26 moved this
+   out of Security & Privacy).
+6. `systemextensionsctl list` -> expect `activated enabled`.
+   `activated waiting for user` means the approval did not land.
+7. Watch the logs in a second terminal while testing:
+   `log stream --predicate 'subsystem == "com.ntfs-tool.fskit"' --level debug`
+8. `diskutil unmount /dev/diskNsM` to release Apple's automount, then mount ours:
+   `mount -t ntfs_tool /dev/diskNsM /tmp/m`.
+9. `ls /tmp/m`, browse in Finder, then `cp ~/foo.txt /tmp/m/` to exercise the
+   write callbacks.
+10. Re-enable SIP when done (same Recovery procedure, `csrutil enable`).
 
-If anything fails, paste the Console.app output (filter to subsystem `com.ntfs-tool.fskit`) — the failure mode tells us exactly which callback is mis-wired.
+**`FSName` is `ntfs_tool`, deliberately not `ntfs`.** Apple's own driver at
+`/System/Library/Filesystems/ntfs.fs` claims `ntfs`, and a collision makes it
+ambiguous which driver actually mounted a volume — the very question this gate
+exists to answer. A distinct name selects ours explicitly and makes `mount`
+output unambiguous.
+
+**Correction:** earlier revisions of this document told you to run
+`fskit_admin probe`. **That binary does not exist on macOS 26.1** (verified —
+not in `/usr/bin` or `/usr/sbin`). Ignore any instruction referencing it. The
+exact FSKit mount invocation on macOS 26 is unconfirmed; step 8 is the starting
+point, and `mount | grep diskN` will show which driver actually took the volume.
+
+Use a scratch stick. This code path has never executed, so expect the first run
+to fail somewhere — most likely candidates are entitlement rejection under free
+signing, the activation-from-`/Applications` requirement, or callback
+sequencing.
 
 ### 2. Windows `chkdsk` round-trip — ✅ DONE (2026-08-04, v0.7.4)
 

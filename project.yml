@@ -80,12 +80,18 @@ targets:
       properties:
         CFBundlePackageType: "XPC!"
         LSMinimumSystemVersion: "15.4"
-        FSShortName: "NTFS (Phase 2)"
+        FSShortName: "NTFS (ntfs-tool)"
         EXAppExtensionAttributes:
           EXExtensionPointIdentifier: com.apple.fskit.fsmodule
         FSPersonalities:
           NTFS:
-            FSName: ntfs
+            # Deliberately NOT "ntfs": Apple ships its own NTFS driver at
+            # /System/Library/Filesystems/ntfs.fs claiming that name, so a
+            # collision makes it ambiguous which driver macOS picked for a
+            # volume -- the exact question FSKit mount validation must answer.
+            # A distinct name lets `mount -t ntfs_tool` select ours explicitly
+            # and makes `mount` output say unambiguously which one mounted it.
+            FSName: ntfs_tool
             FSSubType: 0
             FSFormatSubType: 0
     settings:
