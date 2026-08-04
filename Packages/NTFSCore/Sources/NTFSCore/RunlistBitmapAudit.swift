@@ -607,4 +607,173 @@ extension Volume {
         }
         return dataAttr.value.nonResidentExtents
     }
+
+    // MARK: - Reverse audit: allocated clusters that nothing references
+
+    /// A contiguous run of clusters marked allocated in `$Bitmap` that no
+    /// attribute on the volume references.
+    public struct LeakedRange: Sendable, Equatable {
+        public let startLCN: UInt64
+        public let clusterCount: UInt64
+        public init(startLCN: UInt64, clusterCount: UInt64) {
+            self.startLCN = startLCN
+            self.clusterCount = clusterCount
+        }
+    }
+
+    /// Result of the reverse ($Bitmap → files) audit.
+    public struct BitmapLeakAudit: Sendable, Equatable {
+        /// Clusters with their bit set in `$Bitmap`.
+        public let allocatedInBitmap: UInt64
+        /// Clusters referenced by at least one non-resident attribute.
+        public let referencedByAttributes: UInt64
+        /// Allocated but referenced by nothing — leaked space.
+        public let leakedClusters: UInt64
+        /// Records whose attributes could not be read (audit gaps, not leaks).
+        public let unreadableRecords: [UInt64]
+        /// Largest leaked runs first — where the leak lives usually names the
+        /// culprit (MFT zone, index lane, or file-data region).
+        public let largestLeakedRanges: [LeakedRange]
+
+        public var isClean: Bool { leakedClusters == 0 && unreadableRecords.isEmpty }
+
+        public init(
+            allocatedInBitmap: UInt64,
+            referencedByAttributes: UInt64,
+            leakedClusters: UInt64,
+            unreadableRecords: [UInt64],
+            largestLeakedRanges: [LeakedRange]
+        ) {
+            self.allocatedInBitmap = allocatedInBitmap
+            self.referencedByAttributes = referencedByAttributes
+            self.leakedClusters = leakedClusters
+            self.unreadableRecords = unreadableRecords
+            self.largestLeakedRanges = largestLeakedRanges
+        }
+    }
+
+    /// Audit `$Bitmap` in the direction `auditAllDataRunlistsAgainstBitmap`
+    /// cannot see: clusters marked ALLOCATED that **no attribute references**.
+    ///
+    /// The forward audit asks "is every referenced cluster allocated?" and
+    /// catches over-frees, out-of-range runs, and double allocation. It is
+    /// structurally blind to the opposite error — bits set with no owner —
+    /// so a volume can leak space and still audit perfectly clean. Windows
+    /// `chkdsk` computes its own bitmap from the file records and compares,
+    /// which is how it reported "The Volume Bitmap is incorrect" on a volume
+    /// our own `verify --deep` had just passed with zero findings.
+    ///
+    /// Unlike the forward sweep, this one must consider **every non-resident
+    /// attribute**, not just the unnamed `$DATA`: `$INDEX_ALLOCATION` (INDX
+    /// blocks), `$BITMAP:$I30`, named `$DATA` streams and a non-resident
+    /// `$ATTRIBUTE_LIST` all own clusters. Counting only `$DATA` would report
+    /// every directory's index blocks as leaked.
+    ///
+    /// Extension records are swept directly rather than through the base's
+    /// merge seam: each record physically holds its own extents, so walking
+    /// raw records counts every extent exactly once and needs no merging.
+    ///
+    /// Read-only; performs no writes.
+    public func auditBitmapForUnreferencedClusters(
+        maxRecords: UInt64 = 0,
+        rangeSampleLimit: Int = 10
+    ) async throws -> BitmapLeakAudit {
+        let mft = self.mft()
+        let totalClusters = self.totalClusterCount
+        let bm = try await bitmap()
+
+        let mftLogicalRecords = try await self.mftLogicalRecordCount(bound: maxRecords)
+
+        let wordCount = Int((totalClusters + 63) / 64)
+        var referenced = [UInt64](repeating: 0, count: wordCount)
+        var referencedCount: UInt64 = 0
+        var unreadableRecords: [UInt64] = []
+
+        var n: UInt64 = 0
+        while n < mftLogicalRecords {
+            defer { n &+= 1 }
+            guard let record = try? await mft.record(at: n) else {
+                unreadableRecords.append(n)
+                continue
+            }
+            guard record.isInUse else { continue }
+            guard let attrs = try? record.attributes() else {
+                unreadableRecords.append(n)
+                continue
+            }
+            for attr in attrs {
+                guard let extents = attr.value.nonResidentExtents else { continue }
+                for extent in extents {
+                    guard let startLCN = extent.startLCN else { continue }   // sparse
+                    var i: UInt64 = 0
+                    while i < extent.clusterCount {
+                        let lcn = startLCN &+ i
+                        i &+= 1
+                        guard lcn < totalClusters else { continue }
+                        let word = Int(lcn / 64)
+                        let bit = UInt64(1) << UInt64(lcn % 64)
+                        if (referenced[word] & bit) == 0 {
+                            referenced[word] |= bit
+                            referencedCount &+= 1
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sweep the volume comparing $Bitmap against the referenced set,
+        // coalescing leaks into contiguous ranges as we go.
+        var leaked: UInt64 = 0
+        var ranges: [LeakedRange] = []
+        var runStart: UInt64? = nil
+        var lcn: UInt64 = 0
+        while lcn < totalClusters {
+            let word = Int(lcn / 64)
+            let bit = UInt64(1) << UInt64(lcn % 64)
+            let isReferenced = (referenced[word] & bit) != 0
+            let isAllocated = bm.isAllocated(cluster: lcn)
+            if isAllocated && !isReferenced {
+                leaked &+= 1
+                if runStart == nil { runStart = lcn }
+            } else if let start = runStart {
+                ranges.append(LeakedRange(startLCN: start, clusterCount: lcn - start))
+                runStart = nil
+            }
+            lcn &+= 1
+        }
+        if let start = runStart {
+            ranges.append(LeakedRange(startLCN: start, clusterCount: totalClusters - start))
+        }
+
+        let largest = ranges
+            .sorted { $0.clusterCount > $1.clusterCount }
+            .prefix(rangeSampleLimit)
+
+        return BitmapLeakAudit(
+            allocatedInBitmap: bm.allocatedClusterCount,
+            referencedByAttributes: referencedCount,
+            leakedClusters: leaked,
+            unreadableRecords: unreadableRecords,
+            largestLeakedRanges: Array(largest)
+        )
+    }
+
+    /// Logical `$MFT` record count inferred from record 0's `$DATA` realSize,
+    /// optionally bounded by `bound` (0 = unbounded). Shared by both audits.
+    private func mftLogicalRecordCount(bound: UInt64) async throws -> UInt64 {
+        let mft = self.mft()
+        guard let r0 = try? await mft.record(at: 0),
+              let attrs = try? r0.attributes(),
+              let dataAttr = attrs.first(where: { $0.type == .data && $0.nameOrEmpty == "" })
+        else {
+            return bound == 0 ? 4096 : bound
+        }
+        let realSize: UInt64
+        switch dataAttr.value {
+        case let .resident(b, _):                     realSize = UInt64(b.count)
+        case let .nonResident(_, _, _, _, _, r, _, _): realSize = r
+        }
+        let inferred = realSize / UInt64(self.mftRecordSizeBytes)
+        return bound == 0 ? inferred : min(bound, inferred)
+    }
 }

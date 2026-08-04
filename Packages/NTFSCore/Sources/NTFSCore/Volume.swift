@@ -5451,6 +5451,9 @@ public actor Volume {
             }
         }
 
+        // Clusters allocated for this write but not yet referenced by any
+        // committed attribute. Released on any failure before commit.
+        var pendingExtents: [Extent] = []
         let newDataAttr: Data
         if totalSize <= UInt64(Self.residentDataThreshold) {
             // Small file — collect chunks and use resident path. The cap is
@@ -5483,12 +5486,29 @@ public actor Volume {
             let clustersNeeded = (totalSize + clusterBytes - 1) / clusterBytes
             let extents = try await allocateClustersFragmented(count: clustersNeeded)
             let allocatedSize = clustersNeeded * clusterBytes
+            // These clusters are allocated in $Bitmap but not yet referenced by
+            // any attribute. If the stream fails we must release them —
+            // otherwise they are leaked: allocated with no owner, which is
+            // precisely what Windows reports as "The Volume Bitmap is
+            // incorrect". Observed on hardware as a single contiguous
+            // 2,564-cluster run, exactly one corpus file's size.
+            //
+            // A power-loss crash in this window genuinely cannot self-heal
+            // (that is chkdsk's job, and the doc comment above says so) — but
+            // an ordinary thrown error can and must.
+            pendingExtents = extents
 
-            try await streamChunksAcrossExtents(
-                extents: extents,
-                totalSize: totalSize,
-                nextChunk: nextChunk
-            )
+            do {
+                try await streamChunksAcrossExtents(
+                    extents: extents,
+                    totalSize: totalSize,
+                    nextChunk: nextChunk
+                )
+            } catch {
+                await releaseUncommittedExtents(pendingExtents)
+                pendingExtents = []
+                throw error
+            }
 
             newDataAttr = serializeNonResidentDataAttribute(
                 attrID: dataAttr.header.attributeID,
@@ -5522,23 +5542,54 @@ public actor Volume {
         } catch NTFSError.unsupportedFeature(let desc)
             where isOverflowDescription(desc)
                 && overflowingAttributeType(from: desc) == AttributeType.data.rawValue {
-            try await migrateDataAttributeOnOverflow(
-                baseRecordNumber: recordNumber,
-                newDataAttributeBytes: newDataAttr
-            )
+            do {
+                try await migrateDataAttributeOnOverflow(
+                    baseRecordNumber: recordNumber,
+                    newDataAttributeBytes: newDataAttr
+                )
+            } catch {
+                // Migration failed, so nothing references these clusters.
+                await releaseUncommittedExtents(pendingExtents)
+                throw error
+            }
+            // Committed: the extension record now owns the runlist.
+            pendingExtents = []
             try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
             try? await bumpMTimeOnWrite(recordNumber: recordNumber)
             return
+        } catch {
+            await releaseUncommittedExtents(pendingExtents)
+            throw error
         }
         let newUsedSize = locateEndMarker(in: newRecordBytes, fromOffset: Int(record.firstAttributeOffset))
         guard let newUsedSize = newUsedSize else {
+            await releaseUncommittedExtents(pendingExtents)
             throw NTFSError.corruptOnDisk(description: "writeFile: rewritten record has no end marker")
         }
         var updatedBytes = newRecordBytes
         MFTRecord.writeU32LE(into: &updatedBytes, at: 24, value: MFTRecord.align8UsedSize(newUsedSize + 4))
-        try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+        do {
+            try await mft.writeRawRecord(at: recordNumber, postFixupBytes: updatedBytes)
+        } catch {
+            await releaseUncommittedExtents(pendingExtents)
+            throw error
+        }
+        // Committed — the record now references these clusters.
+        pendingExtents = []
         try? await refreshParentI30Size(recordNumber: recordNumber, newRealSize: totalSize)
         try? await bumpMTimeOnWrite(recordNumber: recordNumber)
+    }
+
+    /// Release clusters that were allocated for a write that never committed.
+    ///
+    /// Best-effort and non-throwing: it runs on an error path, and failing to
+    /// free must not mask the original error. A missed free degrades to the
+    /// pre-existing behaviour (leaked clusters, recoverable by chkdsk) rather
+    /// than to corruption — nothing references these clusters.
+    private func releaseUncommittedExtents(_ extents: [Extent]) async {
+        for extent in extents where extent.startLCN != nil {
+            try? await freeClusters(extent)
+        }
     }
 
     /// Streaming write from a host file path. Convenience wrapper around
