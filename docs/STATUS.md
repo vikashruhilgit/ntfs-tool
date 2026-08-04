@@ -191,71 +191,87 @@ The first 6 are the strong correctness signals. The last 3 are physical-world te
 
 These are the items the automated work simply can't reach. Each one is a single concrete action.
 
-### 1. FSKit mount validation on the M4 (the only gate left)
+### 1. FSKit mount validation — BLOCKED BY AN APPLE BUG (2026-08-04)
 
-**Why it matters:** the FSKit extension is structurally complete and builds
-clean, but has **never been loaded by macOS's FSKit runtime**. The first run is
-the first real test of Info.plist / entitlements / `FSPersonalities`
-registration, whether macOS picks our extension over Apple's driver, whether
-Finder drag-and-drop works, and whether the callback contract holds.
+**Not our code. Third-party FSKit extensions are broken on macOS 26.** The
+`fskitd` daemon rejects connections from unprivileged clients, so no
+third-party module can mount -- **Apple's own FSKitSample fails identically**
+on these builds. Confirmed broken on macOS 26.1 (25B78) and 26.2 (25C56).
 
-**Verified on this machine (2026-08-04):** macOS **26.1**, Xcode **26.1.1**,
-SIP **enabled**, and `systemextensionsctl developer` refuses to run
-("cannot be used if System Integrity Protection is enabled"). So Path A really
-does require the reboot — there is no way around it from a running system.
+Verified on this machine (macOS **26.1**, build **25B78**) -- the log signature
+is the documented one, repeating on every mount attempt:
 
-| Path | Cost |
-|---|---|
-| **SIP-off + developer mode** | ~15 min, reversible |
-| **Apple Developer Program FSKit entitlement** (`com.apple.developer.fskit.fsmodule` is restricted) | $99/yr + 2-14 day wait, no SIP change |
+```
+fskitd: [com.apple.FSKit:default] Incomming connection, entitled 0
+fskitd: [com.apple.FSKit:default] Hello FSClient! entitlement no
+```
 
-**Steps (Path A):**
-1. Shut down. Hold the power button until *Loading startup options* -> **Options**
-   -> Continue -> your user + password -> menu bar **Utilities -> Terminal**:
-   `csrutil disable`, then reboot. Verify with `csrutil status`.
-2. `sudo systemextensionsctl developer on`
-3. `xcodebuild -project NTFSMountManager.xcodeproj -scheme NTFSMountManager -configuration Debug build`
-4. **Move the built app to `/Applications` before launching.**
-   `OSSystemExtensionManager` refuses to activate an extension whose containing
-   app lives elsewhere, and the error it gives is unhelpful.
-5. Launch it, trigger activation, approve in
-   **System Settings -> General -> Login Items & Extensions** (macOS 26 moved this
-   out of Security & Privacy).
-6. `systemextensionsctl list` -> expect `activated enabled`.
-   `activated waiting for user` means the approval did not land.
-7. **Plug in a scratch NTFS USB stick** and find it:
-   `diskutil list external physical`. Note the identifier (e.g. `/dev/disk6s1`);
-   it can change on every replug, so re-check rather than reusing an old one.
-8. Watch the logs in a second terminal, and leave this running for the rest of
-   the test — it is the only view into which callback failed:
-   `log stream --predicate 'subsystem == "com.ntfs-tool.fskit"' --level debug`
-9. Release Apple's automount and create a mount point:
-   `diskutil unmount /dev/diskNsM` then `sudo mkdir -p /tmp/m`.
-10. Mount with OUR driver: `sudo mount -t ntfs_tool /dev/diskNsM /tmp/m`.
-    Then check who actually took it: `mount | grep diskN` — the filesystem type
-    in that line tells you whether ours or Apple's driver won.
-11. `ls /tmp/m`, browse in Finder, then `cp ~/foo.txt /tmp/m/` to exercise the
-    write callbacks.
-12. `sudo umount /tmp/m` and eject: `diskutil eject /dev/diskN`.
-13. Re-enable SIP when done (same Recovery procedure, `csrutil enable`).
+Symptom chain: `mount -F -t ntfs_tool ...` reports
+`Module com.ntfs-tool.NTFSMountManager.NTFSFileSystem is disabled!`, and the
+**System Settings > General > Login Items & Extensions > File System
+Extensions toggle does nothing** -- it will not stay enabled.
 
-**`FSName` is `ntfs_tool`, deliberately not `ntfs`.** Apple's own driver at
-`/System/Library/Filesystems/ntfs.fs` claims `ntfs`, and a collision makes it
-ambiguous which driver actually mounted a volume — the very question this gate
-exists to answer. A distinct name selects ours explicitly and makes `mount`
-output unambiguous.
+Others have already tried and failed with: Developer ID signing, notarization,
+hardened runtime, FSKit entitlements, disabling library validation, and manual
+plist enablement. Related radars: **FB18230524** ("System NTFS driver blocking
+FSKit" -- this project's exact scenario) and FB17772372 (probing, partly fixed
+in 15.6 beta). Apple DTS, July 2025: *"more bugs have been found so you're
+going to need to wait for more fixes."*
 
-**Correction:** earlier revisions of this document told you to run
-`fskit_admin probe`. **That binary does not exist on macOS 26.1** (verified —
-not in `/usr/bin` or `/usr/sbin`). Ignore any instruction referencing it. The
-exact FSKit mount invocation on macOS 26 is unconfirmed; **step 10** is the
-starting point, and the `mount | grep diskN` check in that step will show which
-driver actually took the volume.
+**Do not spend time on this gate until Apple ships a fix.** Re-test on each
+macOS update by attempting the mount and grepping for `entitlement no`.
 
-Use a scratch stick. This code path has never executed, so expect the first run
-to fail somewhere — most likely candidates are entitlement rejection under free
-signing, the activation-from-`/Applications` requirement, or callback
-sequencing.
+**SIP-off and `amfi_get_out_of_my_way=1` are NOT required and do not help.**
+Both were tried here against a wrong theory and made no difference; the
+failure is identical with full security enabled. Do not weaken the machine for
+this. Revert with `sudo nvram -d boot-args` and `csrutil enable` (Recovery).
+
+#### What this gate DID establish (real bugs, now fixed)
+
+Three genuine packaging defects were found and fixed before hitting the Apple
+wall. They are prerequisites for the gate ever passing, so they are worth
+keeping straight:
+
+1. **The extension was packaged as a `system-extension`.** FSKit modules are
+   ExtensionKit **app extensions**: `.appex` in `Contents/Extensions`,
+   discovered on install, never activated via `OSSystemExtensionManager`.
+   Built the old way, activation failed with *"Extension not found in App
+   bundle"* -- accurate, since macOS was looking for a SYSX-style extension.
+2. **`FSPersonalities` / `FSShortName` were at the top level of Info.plist.**
+   FSKit reads them from **inside** `EXAppExtensionAttributes`. At top level
+   the module advertises no personalities at all.
+3. **`FSShortName` and `FSName` were swapped.** `FSShortName` is the
+   `mount -t` **type token** (Apple uses `exfat` / `msdos` / `ftp`);
+   `FSName` is the user-visible personality name (`ExFAT`, `MS-DOS (FAT)`).
+   Ours had `FSShortName: "NTFS (ntfs-tool)"` -- spaces and parentheses,
+   unusable as a type token. Fixing this is what moved the error from a
+   generic *"Unable to invoke task"* to FSKit naming our module directly,
+   which is how we know name resolution now works.
+
+#### Mechanics worth keeping (for when Apple fixes it)
+
+- Mount with **`mount -F -t <FSShortName> <device> <mountpoint>`**. The `-F`
+  flag is required: `man mount` says it "Forces the file system type be
+  considered as an FSModule delivered using FSKit". Plain `-t` uses the legacy
+  `/Library/Filesystems/<type>.fs` path and fails with "No such file or
+  directory". Apple's sample passes the bare device name (`disk18`, not
+  `/dev/disk18`).
+- Install the app to `/Applications` and verify registration with
+  `pluginkit -m -v -p com.apple.fskit.fsmodule` -- ours should appear beside
+  Apple's exfat/msdos/ftp modules.
+- Keep exactly ONE registration. A rebuild re-registers the DerivedData copy,
+  which produces duplicate rows in System Settings and ambiguity about which
+  bundle loaded. Drop extras with `pluginkit -r <path-to-appex>`.
+- `pluginkit -e use` sets PlugInKit's flag, **not** FSKit's enablement. The
+  System Settings toggle is the real gate.
+- FSKit extensions are **per-user**: enabling as one user leaves them disabled
+  for another.
+- **Correction:** earlier revisions of this document told you to run
+  `fskit_admin probe`. That binary does not exist on macOS 26.1.
+
+Sources: <https://github.com/andrewgazelka/loaf/issues/1>,
+<https://github.com/KhaosT/FSKitSample>,
+<https://developer.apple.com/forums/thread/808594>
 
 ### 2. Windows `chkdsk` round-trip — ✅ DONE (2026-08-04, v0.7.4)
 
