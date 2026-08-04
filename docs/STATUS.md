@@ -248,8 +248,9 @@ output unambiguous.
 **Correction:** earlier revisions of this document told you to run
 `fskit_admin probe`. **That binary does not exist on macOS 26.1** (verified —
 not in `/usr/bin` or `/usr/sbin`). Ignore any instruction referencing it. The
-exact FSKit mount invocation on macOS 26 is unconfirmed; step 8 is the starting
-point, and `mount | grep diskN` will show which driver actually took the volume.
+exact FSKit mount invocation on macOS 26 is unconfirmed; **step 10** is the
+starting point, and the `mount | grep diskN` check in that step will show which
+driver actually took the volume.
 
 Use a scratch stick. This code path has never executed, so expect the first run
 to fail somewhere — most likely candidates are entitlement rejection under free
