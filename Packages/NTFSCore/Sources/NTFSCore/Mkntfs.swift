@@ -954,7 +954,11 @@ public enum Mkntfs {
         var bytes = Data()
         var prevLCN: Int64 = 0
         for extent in extents {
-            let lengthBytes = encodeUnsignedLE(extent.clusterCount)
+            // Signed-minimal, NOT unsigned-minimal: Windows decodes the run
+            // length as signed, so a top byte with bit 7 set reads negative
+            // and chkdsk rejects the attribute. See the matching comment in
+            // `Volume.encodeRunlist`.
+            let lengthBytes = encodeSignedLE(Int64(extent.clusterCount))
             if let startLCN = extent.startLCN {
                 let delta = Int64(startLCN) - prevLCN
                 let offsetBytes = encodeSignedLE(delta)
@@ -971,14 +975,6 @@ public enum Mkntfs {
         }
         bytes.append(0)
         return bytes
-    }
-
-    static func encodeUnsignedLE(_ value: UInt64) -> Data {
-        if value == 0 { return Data([0]) }
-        var v = value
-        var bytes: [UInt8] = []
-        while v != 0 { bytes.append(UInt8(v & 0xFF)); v >>= 8 }
-        return Data(bytes)
     }
 
     static func encodeSignedLE(_ value: Int64) -> Data {

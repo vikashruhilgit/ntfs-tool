@@ -997,6 +997,130 @@ final class MultiExtensionIndexAllocationTests: XCTestCase {
         }
     }
 
+    // MARK: - v0.7.4: canonical attribute order on the MULTI-EXTENSION rebuild path
+
+    /// Windows `chkdsk` requires the attributes *within* an MFT record to be
+    /// stored in ascending `(type, name UTF-16, startingVCN)` order and
+    /// reports "Attribute records for file record segment N are unsorted"
+    /// when they are not.
+    ///
+    /// `DataMigrationTests.testMigratedBaseRecordAttributesAreCanonicallySorted`
+    /// covers the FIRST migration only — it drives `buildAttributeMigration`,
+    /// the call site that *creates* the `$ATTRIBUTE_LIST`. This test covers
+    /// the OTHER `AttributeMigration.composeAttributeStream` call site:
+    /// `buildAdditionalExtensionForAttribute`, the multi-extension rebuild
+    /// that lifts an EXISTING `$ATTRIBUTE_LIST` out of the stream, grows its
+    /// body by one entry, and splices it back in.
+    ///
+    /// If that second splice ever regresses to a tail-append, the rebuilt
+    /// `$ATTRIBUTE_LIST` (0x20) lands after `$FILE_NAME` (0x30) — exactly the
+    /// inversion chkdsk flagged on hardware. Our own reader iterates
+    /// attributes order-agnostically, so neither `verify --deep` nor any
+    /// read-back test would notice; only a real `chkdsk` would. Hence this
+    /// dedicated invariant assertion.
+    func testMultiExtensionRebuiltBaseAttributesAreCanonicallySorted() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+        try await volume.growMFTDataByClusters(64)
+        try await volume.growMFTDataByClusters(64)
+
+        let driven = try await driveToMultiExtension(volume: volume)
+        guard driven.didSplit else {
+            throw XCTSkip("""
+                Could not produce the multi-extension shape on this fixture \
+                (single-extent migrant; the splitter requires >= 2 extents), so \
+                `buildAdditionalExtensionForAttribute` never rebuilt the base's \
+                attribute stream — there is no sort invariant to assert.
+                """)
+        }
+
+        // Re-read from DISK so we assert the persisted byte order, not an
+        // in-memory view.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let record = try await reopen.mft().record(at: 5)
+        let attrs = try record.attributes()
+
+        // Precondition A: the base still carries a resident $ATTRIBUTE_LIST.
+        guard let attrListAttr = attrs.first(where: {
+            $0.rawType == AttributeType.attributeList.rawValue
+        }) else {
+            XCTFail("precondition: base 5 must carry a $ATTRIBUTE_LIST for this test to mean anything")
+            return
+        }
+        guard case let .resident(listBytes, _) = attrListAttr.value else {
+            XCTFail("precondition: base 5's $ATTRIBUTE_LIST went non-resident — unexpected on small.img")
+            return
+        }
+
+        // Precondition B: the list carries TWO 0xA0:$I30 entries. This is what
+        // proves the record was rebuilt by `buildAdditionalExtensionForAttribute`
+        // (the second call site) and not merely left as the first migration
+        // wrote it — without this the test would pass on the already-covered
+        // `buildAttributeMigration` output and assert nothing new.
+        let i30Entries = try AttributeListEntry.parseAll(in: listBytes)
+            .filter { $0.attributeType == AttributeType.indexAllocation.rawValue && $0.name == "$I30" }
+        XCTAssertEqual(
+            i30Entries.count, 2,
+            "precondition: base 5's $ATTRIBUTE_LIST must carry two 0xA0:$I30 entries, proving the multi-extension rebuild path ran; got \(i30Entries.count)"
+        )
+        guard i30Entries.count == 2 else { return }
+
+        // Canonical sort key per attribute, in STORED order. Deliberately
+        // hand-rolled rather than reusing `AttributeMigration.attributeSortsBefore`
+        // — checking the writer against its own comparator would mask a
+        // comparator bug (PR #26's documented lesson).
+        struct SortKey {
+            let type: UInt32
+            let name: [UInt16]
+            let startingVCN: UInt64
+        }
+        let keys: [SortKey] = attrs.map { a in
+            var vcn: UInt64 = 0
+            if case let .nonResident(startingVCN, _, _, _, _, _, _, _) = a.value {
+                vcn = startingVCN
+            }
+            return SortKey(type: a.rawType, name: Array(a.nameOrEmpty.utf16), startingVCN: vcn)
+        }
+        let rendered = attrs.map {
+            "0x\(String($0.rawType, radix: 16, uppercase: true)):'\($0.nameOrEmpty)'"
+        }
+        XCTAssertGreaterThan(keys.count, 1, "base 5 should hold several attributes")
+
+        for i in 1..<max(keys.count, 1) {
+            let prev = keys[i - 1], cur = keys[i]
+            let ordered: Bool
+            if prev.type != cur.type {
+                ordered = prev.type < cur.type
+            } else if prev.name != cur.name {
+                ordered = prev.name.lexicographicallyPrecedes(cur.name)
+            } else {
+                ordered = prev.startingVCN <= cur.startingVCN
+            }
+            XCTAssertTrue(
+                ordered,
+                """
+                attributes must be stored ascending by (type, name, startingVCN); \
+                index \(i - 1) -> \(i) is inverted. Stored order: \(rendered)
+                """
+            )
+        }
+
+        // $ATTRIBUTE_LIST (0x20) specifically must precede $FILE_NAME (0x30) —
+        // the exact inversion a tail-append reintroduces.
+        let types = attrs.map(\.rawType)
+        if let listIdx = types.firstIndex(of: AttributeType.attributeList.rawValue),
+           let nameIdx = types.firstIndex(of: AttributeType.fileName.rawValue) {
+            XCTAssertLessThan(
+                listIdx, nameIdx,
+                "$ATTRIBUTE_LIST (0x20) must be stored before $FILE_NAME (0x30) after the multi-extension rebuild; stored order: \(rendered)"
+            )
+        } else {
+            XCTFail("base 5 must hold both $ATTRIBUTE_LIST and $FILE_NAME; stored order: \(rendered)")
+        }
+    }
+
     // MARK: - AC-7: verify --deep returns clean on multi-extension shape
 
     /// AC-7 positive assertion: once a directory has migrated to the

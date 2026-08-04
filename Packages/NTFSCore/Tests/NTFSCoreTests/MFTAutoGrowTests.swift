@@ -189,4 +189,138 @@ final class MFTAutoGrowTests: XCTestCase {
         let readBack = try await v2.readFile(at: target)
         XCTAssertEqual(readBack, payload, "content must survive MFT growth + reopen")
     }
+
+    // MARK: - 4. Mid-transaction growth: headroom reserved at transaction entry
+
+    /// Consume every free, already-materialized `$MFT` slot, leaving the MFT
+    /// with zero usable headroom without growing it.
+    ///
+    /// NOTE: this marks `$MFT.$BITMAP` bits without writing records behind
+    /// them — an artificial state, but exactly the *allocator* state that
+    /// occurs naturally the instant before a growth boundary is crossed,
+    /// which is what this test needs to pin down deterministically.
+    private func exhaustMaterializedMFTSlots(_ volume: Volume) async throws -> Int {
+        var taken = 0
+        while (try? await volume.allocateMFTRecord(allowGrowth: false)) != nil {
+            taken += 1
+            if taken > 100_000 { break }
+        }
+        return taken
+    }
+
+    /// The hardware abort: `$MFT` growth is disabled at the two migration
+    /// allocation sites, so when a migration — rather than `createFile` — is
+    /// the caller that crosses a 256-record growth boundary, the whole copy
+    /// dies with:
+    ///
+    ///   "MFT slot N is free in $MFT.$BITMAP but past $MFT.$DATA's
+    ///    allocatedSize; allocateMFTRecord(allowGrowth:false) —
+    ///    mid-transaction growth is disabled"
+    ///
+    /// Seen on an 11,500-file copy that aborted at file 8,180, while an
+    /// earlier identical run crossed ~62 boundaries without colliding. The fix
+    /// reserves headroom at transaction entry, where growing is safe.
+    func testMigrationDoesNotAbortWhenMFTIsAtItsGrowthBoundary() async throws {
+        let (volume, _) = try await tightMFTVolume(sizeMiB: 32, mftRecords: 64)
+
+        // Put the MFT exactly at its growth boundary: no materialized slot
+        // left, so the NEXT allocation must grow.
+        let consumed = try await exhaustMaterializedMFTSlots(volume)
+        XCTAssertGreaterThan(consumed, 0, "expected to consume at least one free MFT slot")
+
+        // (a) The failure mode itself, at its true site. This is what the two
+        //     migration callsites do, and what killed the hardware copy: a
+        //     mid-transaction allocation that is not permitted to grow.
+        //     Two shapes of the same condition, depending on whether
+        //     $MFT.$BITMAP happens to track bits beyond $MFT.$DATA's
+        //     allocatedSize: `unsupportedFeature("...mid-transaction growth
+        //     is disabled")` when a free bit exists past $DATA (the shape the
+        //     hardware hit), `outOfSpace` when the tracked range is exactly
+        //     full. Either way the allocation cannot proceed without growing.
+        do {
+            _ = try await volume.allocateMFTRecord(allowGrowth: false)
+            XCTFail("expected mid-transaction allocation to fail with no materialized headroom")
+        } catch let error as NTFSError {
+            switch error {
+            case let .unsupportedFeature(description):
+                XCTAssertTrue(
+                    description.contains("mid-transaction growth is disabled"),
+                    "expected the hardware abort message; got: \(description)"
+                )
+            case .outOfSpace:
+                break
+            default:
+                XCTFail("expected unsupportedFeature or outOfSpace, got \(error)")
+            }
+        }
+
+        // (b) Reserving headroom at transaction entry — where growing IS
+        //     safe — makes the same allocation succeed.
+        let allocatedBefore = try await mftAllocatedRecords(volume)
+        try await volume.ensureMFTHeadroom()
+        let allocatedAfter = try await mftAllocatedRecords(volume)
+        XCTAssertGreaterThan(
+            allocatedAfter, allocatedBefore,
+            "ensureMFTHeadroom must grow $MFT when no materialized slot is free"
+        )
+
+        let slot = try await volume.allocateMFTRecord(allowGrowth: false)
+        XCTAssertGreaterThanOrEqual(
+            slot, MFT.firstUserRecord,
+            "post-headroom mid-transaction allocation must succeed"
+        )
+    }
+
+    /// End-to-end: with the MFT sitting exactly at its growth boundary, a
+    /// `writeFile` must reserve headroom at entry rather than carrying the
+    /// risk into its transaction — and must still write correct bytes.
+    func testWriteFileReservesHeadroomAtTransactionEntry() async throws {
+        let (volume, _) = try await tightMFTVolume(sizeMiB: 32, mftRecords: 64)
+        let victim = try await volume.createFile(named: "boundary.bin", inDirectory: 5)
+        _ = try await exhaustMaterializedMFTSlots(volume)
+        let allocatedBefore = try await mftAllocatedRecords(volume)
+
+        let total = 300 * 1024
+        var payload = Data(count: total)
+        for i in 0..<total { payload[i] = UInt8((i &* 23 &+ 5) & 0xFF) }
+        var cursor = 0
+        try await volume.writeFile(at: victim, totalSize: UInt64(total)) {
+            if cursor >= total { return Data() }
+            let take = min(1 << 16, total - cursor)
+            defer { cursor += take }
+            return payload.subdata(in: cursor..<(cursor + take))
+        }
+
+        let allocatedAfter = try await mftAllocatedRecords(volume)
+        XCTAssertGreaterThan(
+            allocatedAfter, allocatedBefore,
+            "writeFile should have grown $MFT at entry, leaving headroom for a mid-write migration"
+        )
+        let readBack = try await volume.readFile(at: victim)
+        XCTAssertEqual(readBack, payload, "content must survive a growth-boundary write")
+    }
+
+    /// The invariant behind the fix: after `createFile` returns, a subsequent
+    /// mid-transaction allocation always finds a materialized free slot.
+    func testCreateFileLeavesMaterializedMFTHeadroom() async throws {
+        let (volume, _) = try await tightMFTVolume(sizeMiB: 32, mftRecords: 16)
+
+        // Walk well past several 256-record growth boundaries.
+        for i in 0..<40 {
+            _ = try await volume.createFile(named: "f\(i).bin", inDirectory: 5)
+
+            let allocated = try await mftAllocatedRecords(volume)
+            let bm = try await volume.mftBitmap()
+            var free = 0
+            var n = MFT.firstUserRecord
+            while n < min(bm.clusterCount, allocated) {
+                if !bm.isAllocated(cluster: n) { free += 1 }
+                n += 1
+            }
+            XCTAssertGreaterThanOrEqual(
+                free, 1,
+                "after createFile #\(i) there must be materialized headroom for a migration to allocate into"
+            )
+        }
+    }
 }

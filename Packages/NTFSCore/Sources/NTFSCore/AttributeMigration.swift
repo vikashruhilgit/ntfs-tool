@@ -206,15 +206,18 @@ public enum AttributeMigration {
         )
 
         // Compose the new base attribute stream: every existing attribute EXCEPT
-        // the migrant, then the new $ATTRIBUTE_LIST, then the end marker.
+        // the migrant, with the new $ATTRIBUTE_LIST spliced in at its canonical
+        // sorted position (type 0x20 — after $STANDARD_INFORMATION, before
+        // $FILE_NAME), then the end marker.
         let attrsStart = Int(firstAttrOffset)
-        var newAttrs = Data()
-        for (idx, attr) in scan.enumerated() where idx != migrantIndex {
-            newAttrs.append(baseRecordBytes[
-                (baseRecordBytes.startIndex + attr.start)..<(baseRecordBytes.startIndex + attr.start + attr.length)
-            ])
-        }
-        newAttrs.append(attrListBytes)
+        let newAttrs = composeAttributeStream(
+            recordBytes: baseRecordBytes,
+            surviving: scan.enumerated().filter { $0.offset != migrantIndex }.map(\.element),
+            insertBytes: attrListBytes,
+            insertType: AttributeType.attributeList.rawValue,
+            insertName: "",
+            insertStartingVCN: 0
+        )
 
         // Verify the new stream fits with room for the end marker (4 bytes).
         let newUsedSize = attrsStart + newAttrs.count + 4
@@ -441,19 +444,21 @@ public enum AttributeMigration {
         )
 
         // Compose the new base attribute stream: every existing attribute
-        // EXCEPT the old $ATTRIBUTE_LIST, then the rebuilt one, then the end
-        // marker. Preserves the (attribute-stream-order) layout of every
-        // non-$ATTRIBUTE_LIST attribute; appends the new $ATTRIBUTE_LIST at
-        // the tail (its byte position within the stream doesn't matter for
-        // correctness; the contents do).
+        // EXCEPT the old $ATTRIBUTE_LIST, with the rebuilt one spliced back in
+        // at its canonical sorted position, then the end marker. Preserves the
+        // stream order of every non-$ATTRIBUTE_LIST attribute.
+        //
+        // The byte position DOES matter: NTFS requires ascending
+        // (type, name, startingVCN) within a record, and chkdsk enforces it.
         let attrsStart = firstAttrOffset
-        var newAttrs = Data()
-        for (idx, attr) in scan.enumerated() where idx != attrListIdx {
-            newAttrs.append(baseRecordBytes[
-                (baseRecordBytes.startIndex + attr.start)..<(baseRecordBytes.startIndex + attr.start + attr.length)
-            ])
-        }
-        newAttrs.append(newAttrListBytes)
+        let newAttrs = composeAttributeStream(
+            recordBytes: baseRecordBytes,
+            surviving: scan.enumerated().filter { $0.offset != attrListIdx }.map(\.element),
+            insertBytes: newAttrListBytes,
+            insertType: AttributeType.attributeList.rawValue,
+            insertName: "",
+            insertStartingVCN: 0
+        )
 
         let newUsedSize = attrsStart + newAttrs.count + 4
         guard newUsedSize <= recordSize else {
@@ -541,6 +546,64 @@ public enum AttributeMigration {
         let name: String          // "" if unnamed
         let nonResident: Bool
         let startingVCN: UInt64   // 0 for resident; first VCN for non-resident
+    }
+
+    // MARK: — Canonical attribute ordering within a record
+
+    /// NTFS orders the attributes *within* an MFT record ascending by
+    /// `(type code, name UTF-16 binary, startingVCN)` — the same key the
+    /// `$ATTRIBUTE_LIST` body uses. Windows `chkdsk` enforces this and
+    /// reports "Attribute records for file record segment N are unsorted"
+    /// when it's violated.
+    ///
+    /// Both migration builders previously *appended* the `$ATTRIBUTE_LIST`
+    /// (type 0x20) to the end of the stream, landing it after `$FILE_NAME`
+    /// (0x30) — on the belief, stated in a since-corrected comment, that
+    /// stream position didn't matter as long as the body contents were
+    /// sorted. A real `chkdsk /f` run on a 15,997-record volume flagged
+    /// every migrated base record. Our own reader is order-agnostic, so
+    /// nothing on this side ever noticed.
+    static func attributeSortsBefore(
+        lhsType: UInt32, lhsName: String, lhsStartingVCN: UInt64,
+        rhsType: UInt32, rhsName: String, rhsStartingVCN: UInt64
+    ) -> Bool {
+        if lhsType != rhsType { return lhsType < rhsType }
+        let ln = Array(lhsName.utf16), rn = Array(rhsName.utf16)
+        if ln.lexicographicallyPrecedes(rn) { return true }
+        if rn.lexicographicallyPrecedes(ln) { return false }
+        return lhsStartingVCN < rhsStartingVCN
+    }
+
+    /// Rebuild a record's attribute stream from `surviving` (kept in their
+    /// existing relative order, which is already canonical) with
+    /// `insertBytes` spliced in at its sorted position rather than appended.
+    static func composeAttributeStream(
+        recordBytes: Data,
+        surviving: [ScannedAttribute],
+        insertBytes: Data,
+        insertType: UInt32,
+        insertName: String,
+        insertStartingVCN: UInt64
+    ) -> Data {
+        var out = Data()
+        var inserted = false
+        for attr in surviving {
+            if !inserted,
+               attributeSortsBefore(
+                   lhsType: insertType, lhsName: insertName, lhsStartingVCN: insertStartingVCN,
+                   rhsType: attr.type, rhsName: attr.name, rhsStartingVCN: attr.startingVCN
+               ) {
+                out.append(insertBytes)
+                inserted = true
+            }
+            out.append(recordBytes[
+                (recordBytes.startIndex + attr.start)..<(recordBytes.startIndex + attr.start + attr.length)
+            ])
+        }
+        // Sorts after everything that survived (e.g. a record holding only
+        // $STANDARD_INFORMATION) — the tail IS the canonical position.
+        if !inserted { out.append(insertBytes) }
+        return out
     }
 
     static func scanAttributes(

@@ -365,4 +365,138 @@ final class DataMigrationTests: XCTestCase {
             "unsupported-type migration attempt must NOT leak an MFT slot (guard runs pre-allocation)"
         )
     }
+
+    // MARK: - v0.7.4: chkdsk "attribute records are unsorted"
+
+    /// Windows `chkdsk` requires the attributes *within* an MFT record to
+    /// appear in ascending `(type, name, startingVCN)` order. Both migration
+    /// builders used to append the new `$ATTRIBUTE_LIST` (type 0x20) to the
+    /// end of the stream, placing it after `$FILE_NAME` (0x30).
+    ///
+    /// A read-only `chkdsk` on a 15,997-record hardware volume flagged
+    /// "Attribute records for file record segment N are unsorted" on every
+    /// migrated base record — while our own `verify --deep` passed the same
+    /// volume clean, because our reader iterates attributes without caring
+    /// about order. This asserts the invariant our reader can't feel.
+    func testMigratedBaseRecordAttributesAreCanonicallySorted() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        let (rn, _) = try await driveDataOverflow(volume: volume, named: "sorted-attrs.bin")
+
+        // Re-read from disk so we assert the persisted byte order, not an
+        // in-memory view.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let record = try await reopen.mft().record(at: rn)
+        let attrs = try record.attributes()
+
+        XCTAssertTrue(
+            attrs.contains { $0.rawType == AttributeType.attributeList.rawValue },
+            "precondition: record \(rn) must be migrated for this test to mean anything"
+        )
+
+        let types = attrs.map(\.rawType)
+        XCTAssertEqual(
+            types, types.sorted(),
+            "attributes must be stored in ascending type order; got \(types.map { String(format: "0x%02X", $0) })"
+        )
+
+        // $ATTRIBUTE_LIST (0x20) specifically must precede $FILE_NAME (0x30) —
+        // the exact inversion chkdsk flagged.
+        if let listIdx = types.firstIndex(of: AttributeType.attributeList.rawValue),
+           let nameIdx = types.firstIndex(of: AttributeType.fileName.rawValue) {
+            XCTAssertLessThan(
+                listIdx, nameIdx,
+                "$ATTRIBUTE_LIST (0x20) must be stored before $FILE_NAME (0x30)"
+            )
+        }
+    }
+
+    // MARK: - v0.7.4: every public read entry point handles a migrated file
+
+    /// Regression guard for the hardware-found bug where `readFileSlice`
+    /// rejected any record carrying an `$ATTRIBUTE_LIST` outright, while
+    /// `readFile` resolved it correctly. The two paths disagreed, so a
+    /// migrated file was readable whole but not streamable — breaking
+    /// `ntfsctl cat`, `ntfsctl cp --from-volume`, and the FSKit extension's
+    /// kernel read callback, all of which stream.
+    ///
+    /// The pre-existing `readFileSlice` tests all used small non-migrated
+    /// files, so nothing covered the migrated shape on the streaming path.
+    /// This test asserts the two entry points agree on the SAME migrated
+    /// record: any future divergence fails here rather than on a USB stick.
+    func testMigratedFileReadsBackThroughEveryReadEntryPoint() async throws {
+        guard fixtureExists("small.img") else { throw XCTSkip("fixture missing") }
+        let path = try MutableFixture.scopedCopy("small.img", testCase: self)
+        let device = try FileHandleBlockDevice(openingFileForUpdateAt: path)
+        let volume = try await Volume(device: device)
+
+        let (rn, total) = try await driveDataOverflow(volume: volume, named: "slice-migrated.bin")
+
+        // Precondition: this really is the migrated shape. Without this the
+        // test could pass green against a non-migrated file and prove nothing.
+        let baseAttrs = try await volume.mft().record(at: rn).attributes()
+        XCTAssertTrue(
+            baseAttrs.contains { $0.rawType == AttributeType.attributeList.rawValue },
+            "fixture precondition: record \(rn) must carry $ATTRIBUTE_LIST for this to test the migrated path"
+        )
+
+        // Read back from a fresh reopen so we exercise the on-disk shape.
+        let reopen = try await Volume(device: FileHandleBlockDevice(openingFileAt: path))
+        let whole = try await reopen.readFile(at: rn)
+        XCTAssertEqual(UInt64(whole.count), total, "readFile length mismatch on migrated file")
+
+        // (a) Chunked streaming reassembly must equal the whole-file read.
+        // 64 KiB chunks cross extent boundaries repeatedly on the swiss-cheese
+        // bitmap, so this walks the merged runlist rather than one extent.
+        var assembled = Data()
+        var offset: UInt64 = 0
+        while offset < total {
+            let chunk = try await reopen.readFileSlice(
+                at: rn, offset: offset, length: 1 << 16
+            )
+            XCTAssertFalse(
+                chunk.isEmpty,
+                "readFileSlice returned empty at offset \(offset) of \(total) — streaming stalled"
+            )
+            assembled.append(chunk)
+            offset += UInt64(chunk.count)
+        }
+        XCTAssertEqual(
+            UInt64(assembled.count), total,
+            "streamed reassembly length \(assembled.count) != readFile length \(total)"
+        )
+        let mismatch = firstContentMismatch(in: assembled)
+        XCTAssertNil(mismatch, "streamed reassembly diverges at byte \(mismatch ?? -1)")
+
+        // (b) Windowed reads must agree with the same window of readFile,
+        // including a non-cluster-aligned straddle and the final partial
+        // cluster (the tail is deliberately 17 bytes short of aligned).
+        let wholeBase = whole.startIndex
+        let windows: [(UInt64, Int)] = [
+            (0, 10),                       // head
+            (4095, 4098),                  // straddles a cluster boundary
+            (total / 2 + 7, 1 << 15),      // unaligned mid-file span
+            (total - 17, 17),              // exact tail
+            (total - 1, 64),               // tail, over-requested
+        ]
+        for (off, len) in windows {
+            let slice = try await reopen.readFileSlice(at: rn, offset: off, length: len)
+            let expectedEnd = min(off &+ UInt64(len), total)
+            let expected = whole.subdata(
+                in: (wholeBase + Int(off))..<(wholeBase + Int(expectedEnd))
+            )
+            XCTAssertEqual(
+                slice, expected,
+                "readFileSlice(offset: \(off), length: \(len)) disagrees with readFile's same window"
+            )
+        }
+
+        // (c) Past-EOF is empty, not an error — the FSKit read callback
+        // relies on this to terminate.
+        let pastEOF = try await reopen.readFileSlice(at: rn, offset: total, length: 4096)
+        XCTAssertTrue(pastEOF.isEmpty, "read at EOF must return empty, got \(pastEOF.count) bytes")
+    }
 }

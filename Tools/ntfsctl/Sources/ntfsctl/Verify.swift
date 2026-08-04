@@ -189,6 +189,7 @@ struct Verify: AsyncParsableCommand {
         var deepOutOfRange: UInt64 = 0
         var deepDoubleAllocated: UInt64 = 0
         var deepUnreadable = 0
+        var deepLeaked: UInt64 = 0
         if deep {
             let audit = try await volume.auditAllDataRunlistsAgainstBitmap(maxRecords: maxRecords)
             deepFreeButReferenced = audit.freeButReferencedClusters
@@ -224,12 +225,36 @@ struct Verify: AsyncParsableCommand {
             // `unreadableRecords` is a genuine record we couldn't audit and
             // cannot vouch for, so it correctly fails the run.
             deepFailed = !audit.isClean
+
+            // Reverse direction: clusters marked ALLOCATED that no attribute
+            // references. The forward audit above is structurally blind to
+            // this — it only asks whether referenced clusters are allocated —
+            // so a leaking volume passes it while Windows chkdsk reports
+            // "The Volume Bitmap is incorrect".
+            let leak = try await volume.auditBitmapForUnreferencedClusters(maxRecords: maxRecords)
+            deepLeaked = leak.leakedClusters
+            print("$Bitmap reverse audit (allocated but unreferenced):")
+            print("  Allocated in $Bitmap:         \(leak.allocatedInBitmap)")
+            print("  Referenced by attributes:     \(leak.referencedByAttributes)")
+            print("  Leaked clusters:              \(leak.leakedClusters)")
+            if leak.leakedClusters > 0 {
+                let bytes = leak.leakedClusters * UInt64(volume.bytesPerCluster)
+                print("  Leaked bytes:                 \(bytes)")
+                print("  Largest leaked ranges:")
+                for r in leak.largestLeakedRanges {
+                    print("    LCN \(r.startLCN)..<\(r.startLCN + r.clusterCount)  (\(r.clusterCount) clusters)")
+                }
+            }
+            if !leak.unreadableRecords.isEmpty {
+                print("  Unreadable records:           \(leak.unreadableRecords.count)")
+            }
+            deepFailed = deepFailed || !leak.isClean
         }
 
         if plainFailed || deepFailed {
             var reason = "\(errorCount) parse, \(orphans.count) orphan, \(leakedExtensions.count) leaked-extension, \(dangling.count) dangling, \(unreachableEnumerationErrors.count) enum errors"
             if deepFailed {
-                reason += " — deep audit: \(deepFreeButReferenced) free-but-referenced, \(deepOutOfRange) out-of-range, \(deepDoubleAllocated) double-allocated cluster(s), \(deepUnreadable) unreadable record(s)"
+                reason += " — deep audit: \(deepFreeButReferenced) free-but-referenced, \(deepOutOfRange) out-of-range, \(deepDoubleAllocated) double-allocated, \(deepLeaked) leaked cluster(s), \(deepUnreadable) unreadable record(s)"
             }
             print("\nVerify FAILED — \(reason). Suggest running ntfsfix or chkdsk /f.")
             throw ExitCode(1)
